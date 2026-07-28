@@ -1,0 +1,976 @@
+#!/usr/bin/env python3
+"""kilix-voiced — the one process that owns the microphone and the speakers.
+
+Kilix's tab-bar buttons and the two TUIs are clients; this daemon is where a
+read-aloud request becomes audio and a dictation request becomes text.  It
+exists because the audio device has to have exactly one owner: half-duplex is
+only enforceable if one process decides what is speaking and what is listening,
+which is the policy ``voicelib.arbiter`` holds on its behalf.
+
+Wire protocol: line-delimited JSON over ``<session>/control.sock``, an
+``AF_UNIX``/``SOCK_SEQPACKET`` socket in a directory only this user can enter.
+One request per connection, one reply, then the connection closes — a client
+that holds a connection open cannot stall anybody else's request.  Every
+accepted connection is checked with ``SO_PEERCRED``.
+
+    {"op":"speak","text":"…"}        -> {"ok":true,"id":"","chunks":3}
+    {"op":"stop-speech"}             -> {"ok":true,"id":"","stopped":true}
+    {"op":"dictate","sock":"…"}      -> {"ok":true,"id":"","turn":"listen-1"}
+    {"op":"stop-dictation"}          -> {"ok":true,"id":"","stopped":true}
+    {"op":"status"}                  -> {"ok":true,"id":"","status":{…}}
+
+Dictation results go to the caller's socket as datagrams — ``{"partial":…}``
+while the person is still speaking, one ``{"final":…}`` at the end, or
+``{"error":…}`` — never back down the control connection, which has already
+been answered and closed.
+
+Nothing here is configured privately: every knob comes from the shared Kilix
+settings document, re-read before each turn so a change made in ``kilix-tts``
+applies to the next thing spoken.  Point ``GPU_TERMINAL_SETTINGS_FILE`` at
+another document to move all of it at once.  ``--config`` (or
+``KILIX_VOICE_CONFIG``) layers a JSON file over the result, which is how the
+test suite injects fake capture and playback commands and a recogniser that
+recognises nothing, on a machine with no audio at all:
+
+    {"audio": {"capture_cmd": ["cat", "fixture.raw"],
+               "play_cmd":    ["cat"]},
+     "stt":   {"engine": "null"},
+     "daemon": {"idle_seconds": 5}}
+
+The daemon runs in the foreground and logs to stderr; whoever starts it decides
+whether that is a terminal, a log file, or /dev/null.  Spoken and recognised
+text is never logged — it is the user's, and stderr is not private.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import selectors
+import signal
+import socket
+import stat
+import struct
+import sys
+import threading
+import time
+from collections.abc import Callable
+
+# A checkout runs as ./kilix-voiced and an install is usually a symlink into
+# ~/.local/bin, so the package is looked for next to the *resolved* script.
+_HERE = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from voicelib import (  # noqa: E402  (the import follows the path bootstrap)
+    __version__, audio, events, paths, protocol, settings, stt as stt_lib,
+    tts as tts_lib, util)
+from voicelib.arbiter import Arbiter, ArbiterError  # noqa: E402
+from voicelib.vad import Vad  # noqa: E402
+
+ENV_CONFIG = "KILIX_VOICE_CONFIG"
+
+# Nothing in flight for this long and the daemon exits: it is started on demand
+# by the terminal, and a voice session nobody is using should not keep a
+# process — or an audio device — reserved.
+IDLE_SECONDS = 300.0
+
+LISTEN_BACKLOG = 8
+ACCEPT_POLL_S = 1.0          # also the resolution of the idle timer
+REQUEST_TIMEOUT_S = 2.0      # a peer that connects and then says nothing
+DATAGRAM_TIMEOUT_S = 1.0     # a dictation receiver that stopped reading
+SPEECH_POLL_S = 0.05         # how often a speech turn notices a cancellation
+CAPTURE_POLL_S = 0.2
+JOIN_TIMEOUT_S = 5.0
+
+# One control request is one datagram. The ceiling is what stops a client from
+# making the daemon hold a scrollback-sized allocation per connection.
+MAX_REQUEST_BYTES = 1 << 20
+
+TtsEngine = tts_lib.NullTts | tts_lib.EspeakTts
+SttEngine = stt_lib.NullStt | stt_lib.VoskStt
+
+# Recognised text is inserted into a PTY, so this is the one place that decides
+# what may reach it (DESIGN.md safety rule 3): C0 controls, DEL, the 8-bit C1
+# introducers a latin-1 PTY would read as CSI/OSC, and lone surrogates. They
+# become a space rather than nothing so that word boundaries survive, and the
+# split/join afterwards drops any trailing newline the recogniser produced.
+# Nothing downstream may add one back: dictation never presses Enter.
+_UNSAFE_FOR_PTY = re.compile("[\x00-\x1f\x7f\x80-\x9f\ud800-\udfff]")
+
+# struct ucred: pid_t, uid_t, gid_t.
+_UCRED = struct.Struct("iII")
+
+# The kitty fork creates the dictation socket, so its type is its choice. All
+# three preserve the message: SEQPACKET and DGRAM by construction, STREAM
+# because every datagram is one newline-terminated JSON line.
+_DICTATION_TYPES = (socket.SOCK_SEQPACKET, socket.SOCK_DGRAM,
+                    socket.SOCK_STREAM)
+
+
+class DaemonError(RuntimeError):
+    """The daemon cannot serve a request; the message says what to do."""
+
+
+def clean_for_injection(text: str) -> str:
+    """Return recognised text that is safe to type into a terminal."""
+    return " ".join(_UNSAFE_FOR_PTY.sub(" ", str(text)).split())
+
+
+def _stamp() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+class _SpeechTurn:
+    """One read-aloud turn: its clips, its thread, and its cancel flag."""
+
+    def __init__(self, turn_id: str, chunks: list[str],
+                 engine: TtsEngine) -> None:
+        self.id = turn_id
+        self.chunks = chunks
+        self.engine = engine
+        self.cancel = threading.Event()
+        self.thread: threading.Thread | None = None
+
+
+class _DictationTurn:
+    """One dictation turn: the socket it delivers to, and its stop flag."""
+
+    def __init__(self, turn_id: str, receiver: socket.socket) -> None:
+        self.id = turn_id
+        self.receiver = receiver
+        self.stop = threading.Event()
+        self.thread: threading.Thread | None = None
+
+
+def _load_overrides(path: str) -> dict:
+    """Return the JSON config layered over the shared settings."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = handle.read()
+    except OSError as error:
+        raise DaemonError(
+            f"cannot read the daemon config {path}: {error}. Point --config "
+            f"(or {ENV_CONFIG}) at a readable JSON file, or drop it to use the "
+            "shared Kilix settings alone.") from error
+    try:
+        data = json.loads(raw)
+    except ValueError as error:
+        raise DaemonError(
+            f"{path} is not valid JSON: {error}. It must hold a single "
+            'object, for example {"audio": {"play_cmd": ["cat"]}}.') from error
+    if not isinstance(data, dict):
+        raise DaemonError(
+            f"{path} must contain a JSON object, got {type(data).__name__}. "
+            'Wrap the settings, for example {"daemon": {"idle_seconds": 30}}.')
+    return data
+
+
+def _merge(base: dict, extra: dict) -> dict:
+    """Return ``base`` with ``extra`` merged into it, dict by dict."""
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            _merge(base[key], value)
+        else:
+            base[key] = value
+    return base
+
+
+def _connect_dictation(path: str) -> socket.socket:
+    """Connect to the dictation socket the kitty fork created for a pane."""
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        raise DaemonError(
+            f"the dictation socket {path} is not there: {error}. It is created "
+            "by the kitty fork as <session>/dictate-<pane>.sock before it asks "
+            "for dictation; start dictation from the terminal rather than by "
+            "hand.") from error
+    if not stat.S_ISSOCK(info.st_mode):
+        raise DaemonError(
+            f"{path} is not a socket. Dictation is delivered to the socket the "
+            "kitty fork creates for the pane; remove whatever is at that path "
+            "and start dictation again.")
+    failures = []
+    for kind in _DICTATION_TYPES:
+        endpoint = socket.socket(socket.AF_UNIX, kind)
+        try:
+            endpoint.settimeout(DATAGRAM_TIMEOUT_S)
+            endpoint.connect(path)
+            return endpoint
+        except OSError as error:
+            failures.append(f"{kind.name}: {error}")
+            endpoint.close()
+    raise DaemonError(
+        f"cannot connect to the dictation socket {path} "
+        f"({'; '.join(failures)}). The pane that asked for dictation has "
+        "probably gone away — start dictation again from a live pane.")
+
+
+class Daemon:
+    """The control socket, the request dispatch, and the two kinds of turn."""
+
+    def __init__(self, *, config_path: str | None = None,
+                 idle_seconds: float | None = None,
+                 verbose: bool = False) -> None:
+        self._overrides = _load_overrides(config_path) if config_path else {}
+        self._verbose = verbose
+        # One config object for the whole process, refreshed in place before
+        # each turn: a Player built at the first speak request then reads the
+        # device the settings name now rather than the one they named then.
+        self._cfg: dict = {}
+        self._refresh_config()
+        if idle_seconds is None:
+            idle_seconds = float(
+                util.cfg_get(self._cfg, "daemon.idle_seconds", IDLE_SECONDS))
+        self._idle_seconds = idle_seconds
+        self._session_dir = paths.session_dir()
+        self._socket_path = paths.control_socket()
+        # Lock ordering: this lock is always taken before the arbiter's and
+        # before the Player's, never the other way round. The barge-in hook
+        # runs inside the arbiter's lock on a thread that already holds this
+        # one, which is why it is an RLock.
+        self._lock = threading.RLock()
+        self._arbiter = Arbiter(self._session_dir,
+                                cancel_speech=self._cancel_speech)
+        self._player: audio.Player | None = None
+        self._speech: _SpeechTurn | None = None
+        self._dictation: _DictationTurn | None = None
+        self._turns = 0
+        self._socket: socket.socket | None = None
+        self._socket_ino: int | None = None
+        self._wake_r = -1
+        self._wake_w = -1
+        self._stopping = threading.Event()
+        self._started_at = time.monotonic()
+        self._last_activity = self._started_at
+
+    # -- logging ------------------------------------------------------------
+
+    def _warn(self, message: str) -> None:
+        """Report a failure on stderr. Never carries spoken or heard text."""
+        print(f"kilix-voiced {_stamp()}: {message}", file=sys.stderr,
+              flush=True)
+
+    def _debug(self, message: str) -> None:
+        if self._verbose:
+            self._warn(message)
+
+    # -- configuration ------------------------------------------------------
+
+    def _refresh_config(self) -> None:
+        """Re-read the shared settings into the live config object."""
+        fresh: dict = {
+            "audio": {
+                "rate": audio.DEFAULT_RATE,
+                "frame_ms": audio.DEFAULT_FRAME_MS,
+                "device_in": settings.device_in(),
+                "device_out": settings.device_out(),
+            },
+            "vad": {"silence_ms": settings.stt_silence_ms()},
+            "stt": {
+                "engine": settings.stt_engine(),
+                "model": settings.stt_model(),
+                "max_seconds": settings.stt_max_seconds(),
+            },
+            "tts": {},
+            "daemon": {"idle_seconds": IDLE_SECONDS},
+        }
+        _merge(fresh, self._overrides)
+        # Replaced in place rather than rebound: the engines hold a reference
+        # to this dict and read it per clip.
+        self._cfg.clear()
+        self._cfg.update(fresh)
+
+    # -- lifecycle ----------------------------------------------------------
+
+    def run(self) -> int:
+        """Own the session, serve until idle or signalled, then clean up."""
+        # Before the socket: a second daemon must never unlink the control
+        # socket a live one is serving.
+        self._arbiter.acquire_session()
+        try:
+            self._bind()
+            self._install_signals()
+            self._debug(f"listening on {self._socket_path}")
+            self._serve()
+        finally:
+            self._shutdown()
+        return 0
+
+    def _bind(self) -> None:
+        """Create the control socket, private to this user."""
+        if not hasattr(socket, "SO_PEERCRED"):
+            raise DaemonError(
+                "this platform has no SO_PEERCRED, so the daemon cannot prove "
+                "who is on the other end of a connection. kilix-voiced runs on "
+                "Linux; there is no safe way to serve voice here.")
+        self._clear_stale_socket()
+        endpoint = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        # bind() applies the umask and there is no way to fix the mode up on
+        # the descriptor afterwards, so the mode is narrowed for the call
+        # itself. No worker threads exist yet, which is what makes touching a
+        # process-wide umask safe here.
+        previous = os.umask(0o177)
+        try:
+            endpoint.bind(self._socket_path)
+        except OSError as error:
+            endpoint.close()
+            raise DaemonError(
+                f"cannot bind the control socket {self._socket_path}: "
+                f"{error}. Check that {self._session_dir} exists and is "
+                "writable, or point KILIX_SESSION_HOME at a directory that is."
+            ) from error
+        finally:
+            os.umask(previous)
+        try:
+            os.chmod(self._socket_path, paths.SOCKET_MODE)
+            self._socket_ino = os.stat(self._socket_path).st_ino
+            endpoint.listen(LISTEN_BACKLOG)
+            endpoint.setblocking(False)
+        except OSError as error:
+            endpoint.close()
+            raise DaemonError(
+                f"cannot prepare the control socket {self._socket_path}: "
+                f"{error}. Remove that file and start kilix-voiced again."
+            ) from error
+        self._socket = endpoint
+
+    def _clear_stale_socket(self) -> None:
+        """Remove a socket a killed daemon left behind, or explain what is."""
+        try:
+            info = os.lstat(self._socket_path)
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise DaemonError(
+                f"cannot inspect {self._socket_path}: {error}. Check the "
+                "permissions on the session directory.") from error
+        if not stat.S_ISSOCK(info.st_mode):
+            raise DaemonError(
+                f"{self._socket_path} exists and is not a socket. Remove it "
+                "and start kilix-voiced again; that path belongs to the "
+                "daemon's control socket.")
+        # We hold the session lock, so nothing live is serving this one.
+        try:
+            os.unlink(self._socket_path)
+        except OSError as error:
+            raise DaemonError(
+                f"cannot remove the stale control socket {self._socket_path}: "
+                f"{error}. Delete it by hand and start kilix-voiced again."
+            ) from error
+
+    def _install_signals(self) -> None:
+        """Ask for a clean shutdown on the usual stop signals."""
+        self._wake_r, self._wake_w = os.pipe()
+        os.set_blocking(self._wake_r, False)
+        os.set_blocking(self._wake_w, False)
+        # The handler only sets a flag — it must not write to stderr, which the
+        # main thread may be holding the lock for — and the byte the interpreter
+        # writes to the wakeup pipe is what gets select() out of its timeout.
+        # Cleanup therefore runs on the accept loop, not in a signal handler.
+        signal.set_wakeup_fd(self._wake_w)
+        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(number, self._on_signal)
+
+    def _on_signal(self, _signum: int, _frame: object) -> None:
+        self._stopping.set()
+
+    def _serve(self) -> None:
+        with selectors.DefaultSelector() as selector:
+            selector.register(self._socket, selectors.EVENT_READ)
+            selector.register(self._wake_r, selectors.EVENT_READ)
+            while not self._stopping.is_set():
+                for key, _mask in selector.select(timeout=ACCEPT_POLL_S):
+                    if key.fileobj is self._socket:
+                        self._accept_one()
+                    else:
+                        self._drain_wakeups()
+                self._check_idle()
+
+    def _drain_wakeups(self) -> None:
+        try:
+            os.read(self._wake_r, 4096)
+        except OSError:
+            pass  # nothing buffered, or the pipe is closing under us
+
+    def _check_idle(self) -> None:
+        if self._idle_seconds <= 0:
+            return
+        if self._busy():
+            self._last_activity = time.monotonic()
+            return
+        if time.monotonic() - self._last_activity >= self._idle_seconds:
+            self._debug(f"idle for {self._idle_seconds:.0f}s: exiting")
+            self._stopping.set()
+
+    def _busy(self) -> bool:
+        with self._lock:
+            for turn in (self._speech, self._dictation):
+                if turn is not None and turn.thread is not None \
+                        and turn.thread.is_alive():
+                    return True
+            return self._arbiter.speaking or self._arbiter.listening
+
+    def _touch(self) -> None:
+        with self._lock:
+            self._last_activity = time.monotonic()
+
+    def _shutdown(self) -> None:
+        """Stop every turn, close the socket, and give up the session."""
+        self._stopping.set()
+        with self._lock:
+            speech, dictation = self._speech, self._dictation
+            player = self._player
+        if dictation is not None:
+            dictation.stop.set()
+        if speech is not None:
+            speech.cancel.set()
+        if player is not None:
+            player.close()
+        for turn in (speech, dictation):
+            if turn is not None and turn.thread is not None:
+                turn.thread.join(timeout=JOIN_TIMEOUT_S)
+        if self._socket is not None:
+            self._socket.close()
+            self._socket = None
+        try:
+            # Only our own socket: a successor that has already bound this path
+            # must keep its own.
+            if self._socket_ino is not None and \
+                    os.stat(self._socket_path).st_ino == self._socket_ino:
+                os.unlink(self._socket_path)
+        except OSError:
+            pass
+        if self._wake_w >= 0:
+            signal.set_wakeup_fd(-1)
+            os.close(self._wake_w)
+            os.close(self._wake_r)
+            self._wake_w = self._wake_r = -1
+        self._arbiter.release()
+
+    # -- connections --------------------------------------------------------
+
+    def _peer_uid(self, conn: socket.socket) -> int:
+        """Return the uid of the process on the other end of ``conn``."""
+        try:
+            raw = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                  _UCRED.size)
+        except OSError as error:
+            raise DaemonError(
+                f"cannot read the peer's credentials: {error}. Refusing the "
+                "connection; kilix-voiced only serves connections it can "
+                "attribute to a user.") from error
+        _pid, uid, _gid = _UCRED.unpack(raw)
+        return uid
+
+    def _accept_one(self) -> None:
+        try:
+            conn, _address = self._socket.accept()
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError as error:
+            if not self._stopping.is_set():
+                self._warn(f"cannot accept a connection: {error}")
+            return
+        with conn:
+            conn.settimeout(REQUEST_TIMEOUT_S)
+            reply = self._answer(conn)
+            if reply is None:
+                return
+            try:
+                conn.send(protocol.encode(reply))
+            except OSError as error:
+                self._debug(f"client left before the reply: {error}")
+
+    def _answer(self, conn: socket.socket) -> dict | None:
+        """Return the reply for one connection, or None to just hang up."""
+        # The session directory is 0700, so the kernel already refuses a
+        # connect() from another user — but a mode that slips, a directory
+        # restored from a backup, or a session home pointed somewhere shared
+        # would silently turn this daemon into a service that reads other
+        # people's text aloud and hands them the microphone. The uid is the
+        # only fact that ties a request to a person, so it is checked on every
+        # connection rather than assumed from the filesystem.
+        try:
+            uid = self._peer_uid(conn)
+        except DaemonError as error:
+            self._warn(str(error))
+            return None
+        if uid != os.geteuid():
+            self._warn(f"refused a connection from uid {uid}")
+            return protocol.reply_error(
+                f"this kilix-voiced serves uid {os.geteuid()} only, and you "
+                f"are uid {uid}. Start your own daemon: voice sessions are per "
+                "user and are never shared.")
+        try:
+            raw = conn.recv(MAX_REQUEST_BYTES + 1)
+        except socket.timeout:
+            self._debug("a client connected and sent nothing")
+            return None
+        except OSError as error:
+            self._debug(f"client vanished before sending: {error}")
+            return None
+        if not raw:
+            return None
+        if len(raw) > MAX_REQUEST_BYTES:
+            return protocol.reply_error(
+                f"the request is larger than {MAX_REQUEST_BYTES} bytes. Read a "
+                f"smaller extent by lowering {settings.KEY_TTS_MAX_CHARS}, or "
+                "send the text as several speak requests.")
+        return self._dispatch(raw)
+
+    def _dispatch(self, raw: bytes) -> dict:
+        try:
+            request = protocol.validate_request(protocol.decode(raw),
+                                                self._session_dir)
+        except protocol.ProtocolError as error:
+            return protocol.reply_error(str(error))
+        self._touch()
+        handlers: dict[str, Callable[[dict], dict]] = {
+            protocol.OP_SPEAK: self._op_speak,
+            protocol.OP_STOP_SPEECH: self._op_stop_speech,
+            protocol.OP_DICTATE: self._op_dictate,
+            protocol.OP_STOP_DICTATION: self._op_stop_dictation,
+            protocol.OP_STATUS: self._op_status,
+        }
+        try:
+            return handlers[request["op"]](request)
+        except (DaemonError, ArbiterError, audio.AudioError, tts_lib.TtsError,
+                stt_lib.SttError, settings.SettingsError,
+                paths.PathError) as error:
+            return protocol.reply_error(str(error))
+        except Exception as error:  # a handler bug must not take the daemon
+            self._warn(f"unhandled failure in {request['op']}: {error!r}")
+            return protocol.reply_error(
+                f"kilix-voiced could not handle {request['op']}: {error}. "
+                "This is a bug — the daemon is still running, and its stderr "
+                "has the details.")
+
+    def _next_turn_id(self, kind: str) -> str:
+        with self._lock:
+            self._turns += 1
+            return f"{kind}-{self._turns}"
+
+    # -- speak --------------------------------------------------------------
+
+    def _op_speak(self, request: dict) -> dict:
+        self._refresh_config()
+        engine = tts_lib.make_tts(self._cfg)
+        if isinstance(engine, tts_lib.EspeakTts):
+            # A PATH lookup that launches nothing: better to answer "no
+            # synthesiser, install this" now than to accept the request and
+            # fail where only the daemon's stderr can see it.
+            tts_lib.build_synth_cmd(self._cfg, voice=engine.voice,
+                                    rate=engine.rate)
+        chunks = self._speech_chunks(request["text"])
+        if not chunks:
+            # A pane of nothing but box drawing conditions down to nothing;
+            # silence is the right rendering of that, not a failure.
+            return protocol.reply_ok(request["id"], chunks=0)
+        turn = _SpeechTurn(self._next_turn_id("speak"), chunks, engine)
+        turn.thread = threading.Thread(
+            target=self._run_speech, args=(turn,),
+            name=f"kilix-voice-{turn.id}", daemon=True)
+        with self._lock:
+            self._cancel_speech()          # a new read replaces the old one
+            self._arbiter.begin_speech(turn.id)
+            self._speech = turn
+            self._start(turn.thread, self._cancel_speech)
+        return protocol.reply_ok(request["id"], turn=turn.id,
+                                 chunks=len(chunks))
+
+    def _speech_chunks(self, text: str) -> list[str]:
+        """Condition pane text and split it into clips worth synthesising."""
+        conditioned = tts_lib.condition_text(
+            text, max_chars=settings.tts_max_chars())
+        chunker = tts_lib.SentenceChunker()
+        chunks = chunker.feed(conditioned)
+        tail = chunker.flush()
+        if tail:
+            chunks.append(tail)
+        return chunks
+
+    def _op_stop_speech(self, request: dict) -> dict:
+        with self._lock:
+            stopped = self._speech is not None
+            self._cancel_speech()
+        return protocol.reply_ok(request["id"], stopped=stopped)
+
+    def _cancel_speech(self) -> None:
+        """Silence the speakers now. Also the arbiter's barge-in hook."""
+        with self._lock:
+            turn, self._speech = self._speech, None
+            player = self._player
+        if turn is not None:
+            turn.cancel.set()
+            self._arbiter.end_speech(turn.id)
+        if player is not None:
+            # Kills the sink outright rather than draining it: barge-in has to
+            # land inside ~100 ms, not at the end of the current sentence.
+            player.stop()
+
+    def _get_player(self) -> audio.Player:
+        with self._lock:
+            if self._player is None:
+                self._player = audio.Player(self._cfg)
+            return self._player
+
+    def _run_speech(self, turn: _SpeechTurn) -> None:
+        """Synthesise and play one turn, one clip ahead of the speakers."""
+        try:
+            player = self._get_player()
+            # The next clip is synthesised while the current one plays: enough
+            # to hide synthesis latency between sentences, and never more than
+            # two clips of audio held for what could be a whole scrollback.
+            pending = self._synth(turn, turn.chunks[0])
+            index = 1
+            while pending is not None and not turn.cancel.is_set():
+                pcm, rate = pending
+                pending = None
+                if not self._play_if_current(turn, player, pcm, rate):
+                    break
+                if index < len(turn.chunks):
+                    pending = self._synth(turn, turn.chunks[index])
+                    index += 1
+                if not self._await_clip(turn, player):
+                    break
+            if player.error:
+                self._warn(player.error)
+        except tts_lib.TtsError as error:
+            self._warn(f"read-aloud stopped: {error}")
+        except Exception as error:  # a worker thread must not die silently
+            self._warn(f"read-aloud failed: {error!r}")
+        finally:
+            with self._lock:
+                if self._speech is turn:
+                    self._speech = None
+            self._arbiter.end_speech(turn.id)
+            self._touch()
+
+    def _synth(self, turn: _SpeechTurn,
+               chunk: str) -> tuple[bytes, int] | None:
+        """Synthesise one clip, unless the turn was cancelled meanwhile."""
+        if turn.cancel.is_set():
+            return None
+        return turn.engine.synth(chunk)
+
+    def _play_if_current(self, turn: _SpeechTurn, player: audio.Player,
+                         pcm: bytes, rate: int) -> bool:
+        """Queue a clip unless this turn was cancelled or already replaced."""
+        with self._lock:
+            if turn.cancel.is_set() or self._speech is not turn:
+                return False
+            player.play(pcm, rate)
+            return True
+
+    def _await_clip(self, turn: _SpeechTurn, player: audio.Player) -> bool:
+        """Wait out the queued clip; False when the turn was cancelled."""
+        while player.playing:
+            if turn.cancel.wait(SPEECH_POLL_S):
+                return False
+        return not turn.cancel.is_set()
+
+    # -- dictate ------------------------------------------------------------
+
+    def _op_dictate(self, request: dict) -> dict:
+        self._refresh_config()
+        engine = str(util.cfg_get(self._cfg, "stt.engine", "")).strip().lower()
+        if engine == stt_lib.ENGINE_OFF:
+            raise DaemonError(
+                f"dictation is switched off ({settings.KEY_STT_ENGINE}=off), "
+                "so the microphone is not opened. Set "
+                f"{settings.KEY_STT_ENGINE}={stt_lib.ENGINE_VOSK} in the "
+                "shared settings, or in kilix-stt, to enable it.")
+        if self._arbiter.listening:
+            raise DaemonError(
+                "dictation is already running. Send stop-dictation first; one "
+                "turn owns the microphone at a time.")
+        # Connected here rather than in the worker so that an unreachable
+        # socket is answered on this connection: the turn's own socket is the
+        # only channel it has, and a caller told "ok" would wait for a
+        # datagram that can never arrive. Nothing has been claimed yet, so a
+        # failure leaves read-aloud playing.
+        receiver = _connect_dictation(request["sock"])
+        turn = _DictationTurn(self._next_turn_id("listen"), receiver)
+        turn.thread = threading.Thread(
+            target=self._run_dictation, args=(turn,),
+            name=f"kilix-voice-{turn.id}", daemon=True)
+        try:
+            with self._lock:
+                # Taking the microphone cancels read-aloud on the way in.
+                self._arbiter.begin_listen(turn.id)
+                self._dictation = turn
+                self._start(turn.thread, lambda: self._clear_dictation(turn))
+        except BaseException:
+            receiver.close()
+            raise
+        return protocol.reply_ok(request["id"], turn=turn.id)
+
+    def _start(self, thread: threading.Thread,
+               undo: Callable[[], None]) -> None:
+        """Start a turn's thread, giving the claim back if the OS refuses one.
+
+        The claim is recorded before the thread runs, and only that thread's
+        own exit path ever releases it — so a thread that never started would
+        leave the session speaking or listening for ever, which also stops the
+        idle timer from ever firing.
+        """
+        try:
+            thread.start()
+        except RuntimeError as error:
+            undo()
+            raise DaemonError(
+                f"cannot start a voice worker thread: {error}. This machine "
+                "is out of threads or memory; close some processes and try "
+                "again.") from error
+
+    def _clear_dictation(self, turn: _DictationTurn) -> None:
+        """Give the microphone back if ``turn`` still holds it."""
+        with self._lock:
+            if self._dictation is turn:
+                self._dictation = None
+        self._arbiter.end_listen(turn.id)
+
+    def _op_stop_dictation(self, request: dict) -> dict:
+        with self._lock:
+            turn = self._dictation
+        if turn is not None:
+            turn.stop.set()
+        return protocol.reply_ok(request["id"], stopped=turn is not None)
+
+    def _run_dictation(self, turn: _DictationTurn) -> None:
+        """Record one turn, stream partials, and deliver the final text."""
+        try:
+            self._dictate(turn)
+        except (DaemonError, audio.AudioError, stt_lib.SttError,
+                paths.PathError, OSError, ValueError) as error:
+            self._send(turn.receiver, protocol.dictation_error(str(error)))
+        except Exception as error:  # a worker thread must not die silently
+            self._warn(f"dictation failed: {error!r}")
+            self._send(turn.receiver, protocol.dictation_error(
+                f"dictation failed unexpectedly: {error}. Try again; the "
+                "daemon's stderr has the details."))
+        finally:
+            turn.receiver.close()
+            self._clear_dictation(turn)
+            self._touch()
+
+    def _dictate(self, turn: _DictationTurn) -> None:
+        """Run one whole turn: capture, recognise, deliver."""
+        capture = audio.MicCapture(self._cfg)
+        engine = stt_lib.make_stt(self._cfg, capture.rate)
+        try:
+            capture.start()
+            engine.start_utterance()
+            heard = self._record(turn, capture, engine)
+            # The microphone closes the moment the turn ends, before anything
+            # is recognised or delivered: click-to-talk means the recorder is
+            # not still running while the last words are being turned into
+            # text. stop() is idempotent, so the guard below repeats it.
+            capture.stop()
+            text = clean_for_injection(engine.end_utterance())
+            if not heard and not text:
+                raise DaemonError(
+                    "no audio arrived from the microphone. Check that one is "
+                    "connected and that PulseAudio or PipeWire is running "
+                    "(`pactl info`), or set KILIX_VOICE_DEVICE_IN to a source "
+                    "listed by `pactl list sources short`.")
+            # No trailing newline is added here or anywhere downstream:
+            # dictation never presses Enter (DESIGN.md safety rule 2).
+            self._send(turn.receiver, protocol.dictation_final(text))
+        finally:
+            capture.stop()
+            engine.close()
+
+    def _record(self, turn: _DictationTurn, capture: audio.MicCapture,
+                engine: SttEngine) -> bool:
+        """Feed the recogniser until the turn ends; True if audio arrived."""
+        detector = Vad(self._cfg)
+        max_seconds = float(util.cfg_get(self._cfg, "stt.max_seconds",
+                                         settings.stt_max_seconds()))
+        silence_s = float(util.cfg_get(self._cfg, "vad.silence_ms", 900)) / 1000
+        # MicCapture.read() reports a timeout and an ended stream the same way,
+        # so a stream that stops arriving for longer than the silence window
+        # ends the turn: a recorder that exited, a fixture that ran out and a
+        # device that wedged all mean the same thing to a listener.
+        stall_s = silence_s + 1.0
+        partials = engine.supports_partials
+        deadline = time.monotonic() + max_seconds
+        last_audio = time.monotonic()
+        heard = False
+        speaking = False
+        while not turn.stop.is_set() and not self._stopping.is_set():
+            if time.monotonic() >= deadline:
+                self._debug(f"{turn.id}: hit the {max_seconds:.0f}s ceiling")
+                break
+            asked = time.monotonic()
+            frame = capture.read(timeout=CAPTURE_POLL_S)
+            if frame is None:
+                if capture.error:
+                    raise DaemonError(capture.error)
+                if time.monotonic() - last_audio > stall_s:
+                    break
+                # A read that returned no frame *and* took no time is an ended
+                # stream rather than a timeout, and asking again immediately
+                # would spin a core until the stall window closes. Waiting on
+                # the stop flag keeps the turn cancellable meanwhile.
+                turn.stop.wait(max(0.0, CAPTURE_POLL_S
+                                   - (time.monotonic() - asked)))
+                continue
+            last_audio = time.monotonic()
+            heard = True
+            event = detector.feed(frame)
+            text = engine.feed(frame)
+            if partials and text is not None:
+                if not self._send(turn.receiver, protocol.dictation_partial(
+                        clean_for_injection(text))):
+                    break
+            if event == events.VAD_SPEECH_START:
+                speaking = True
+            elif event == events.VAD_SPEECH_END and speaking:
+                break
+        return heard
+
+    def _send(self, receiver: socket.socket, message: dict) -> bool:
+        """Send one dictation datagram; False when the receiver has gone."""
+        try:
+            receiver.send(protocol.encode(message))
+            return True
+        except OSError as error:
+            # The message itself is never logged: it is what the user said.
+            self._warn(f"the dictation receiver stopped listening: {error}")
+            return False
+
+    # -- status -------------------------------------------------------------
+
+    def _op_status(self, request: dict) -> dict:
+        self._refresh_config()
+        now = time.monotonic()
+        with self._lock:
+            idle = now - self._last_activity
+        payload = {
+            "version": __version__,
+            "pid": os.getpid(),
+            "session": self._session_dir,
+            "socket": self._socket_path,
+            "uptime": round(now - self._started_at, 1),
+            "idle": round(idle, 1),
+            "idle_limit": self._idle_seconds,
+            "speaking": self._arbiter.speaking,
+            "listening": self._arbiter.listening,
+            "chrome_speak": settings.enabled(settings.KEY_SPEAK),
+            "chrome_dictate": settings.enabled(settings.KEY_DICTATE),
+            "tts": self._tts_status(),
+            "stt": self._stt_status(),
+            "capture": self._tool_status(audio.build_capture_cmd),
+            "playback": self._tool_status(
+                lambda cfg: audio.build_play_cmd(
+                    cfg, tts_lib.ESPEAK_SAMPLE_RATE)),
+        }
+        return protocol.reply_ok(request["id"], status=payload)
+
+    def _tts_status(self) -> dict:
+        """Report read-aloud without launching anything."""
+        engine = settings.tts_engine()
+        if engine == "off":
+            return {"engine": engine, "available": False, "detail": (
+                "read-aloud is switched off. Set "
+                f"{settings.KEY_TTS_ENGINE}=espeak to enable it.")}
+        voice = settings.tts_voice()
+        try:
+            command = tts_lib.build_synth_cmd(self._cfg, voice=voice,
+                                              rate=settings.tts_rate())
+        except tts_lib.TtsError as error:
+            return {"engine": engine, "available": False, "voice": voice,
+                    "detail": str(error)}
+        detail = command[0]
+        if engine == "mbrola":
+            detail += (f"; the mb-{voice} voice is tried first and falls back "
+                       "to plain espeak when it is not installed")
+        return {"engine": engine, "available": True, "voice": voice,
+                "detail": detail}
+
+    def _stt_status(self) -> dict:
+        """Report dictation without loading a model."""
+        engine = settings.stt_engine()
+        model_id = settings.stt_model()
+        if engine == stt_lib.ENGINE_OFF:
+            return {"engine": engine, "model": model_id, "available": False,
+                    "detail": ("dictation is switched off. Set "
+                               f"{settings.KEY_STT_ENGINE}="
+                               f"{stt_lib.ENGINE_VOSK} to enable it.")}
+        if engine == stt_lib.ENGINE_VIBEVOICE:
+            return {"engine": engine, "model": model_id, "available": False,
+                    "detail": (f"{settings.KEY_STT_ENGINE}="
+                               f"{stt_lib.ENGINE_VIBEVOICE} is not implemented "
+                               "in this release; it arrives in a later phase. "
+                               f"Set it to {stt_lib.ENGINE_VOSK} for local "
+                               "recognition now.")}
+        library = os.environ.get(stt_lib.ENV_LIBRARY) or paths.libvosk_path()
+        if os.path.isdir(library):
+            library = os.path.join(library, stt_lib.LIBRARY_BASENAME)
+        model = os.environ.get(stt_lib.ENV_MODEL)
+        if not model:
+            try:
+                model = paths.model_dir(model_id)
+            except paths.PathError as error:
+                return {"engine": engine, "model": model_id,
+                        "available": False, "detail": str(error)}
+        missing = []
+        if not os.path.isfile(library):
+            missing.append(f"the vosk library is not at {library}")
+        if not os.path.isdir(model):
+            missing.append(f"the {model_id} model is not at {model}")
+        status = {"engine": engine, "model": model_id, "library": library,
+                  "model_path": model, "available": not missing}
+        status["detail"] = (
+            f"{'; '.join(missing)}. Install them with Kilix's pinned voice "
+            f"installer, or set {stt_lib.ENV_LIBRARY} / {stt_lib.ENV_MODEL} to "
+            "copies you already have. Read-aloud does not need them."
+            if missing else "the library and the model are both present")
+        return status
+
+    def _tool_status(self, build: Callable[[dict], list[str]]) -> dict:
+        """Report whether a capture or playback tool could be run."""
+        try:
+            command = build(self._cfg)
+        except audio.AudioError as error:
+            return {"available": False, "detail": str(error)}
+        return {"available": True, "detail": " ".join(command)}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="kilix-voiced",
+        description="Own the microphone and the speakers for one Kilix voice "
+                    "session.")
+    parser.add_argument(
+        "--config", metavar="PATH", default=os.environ.get(ENV_CONFIG) or None,
+        help="JSON overrides layered over the shared Kilix settings "
+             f"(default: ${ENV_CONFIG}).")
+    parser.add_argument(
+        "--idle-seconds", type=float, metavar="N", default=None,
+        help=f"exit after N seconds with nothing in flight (default "
+             f"{IDLE_SECONDS:.0f}; 0 keeps the daemon running).")
+    parser.add_argument("--verbose", action="store_true",
+                        help="log lifecycle events to stderr.")
+    parser.add_argument("--version", action="version",
+                        version=f"kilix-voiced {__version__}")
+    args = parser.parse_args(argv)
+    try:
+        daemon = Daemon(config_path=args.config,
+                        idle_seconds=args.idle_seconds, verbose=args.verbose)
+        return daemon.run()
+    except (DaemonError, ArbiterError, audio.AudioError,
+            settings.SettingsError, paths.PathError) as error:
+        print(f"kilix-voiced: {error}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

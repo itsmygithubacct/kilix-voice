@@ -1,0 +1,932 @@
+#!/usr/bin/env python3
+"""kilix-tts — read-aloud settings for Kilix, as a screen and as a CLI.
+
+Everything this screen edits lives in the shared GPU Terminal settings file, and
+everything it tests goes through ``kilix-voiced``.  Both halves of that matter:
+the tab-bar speaking-head button reads the same file, so the two can never
+disagree about what "read this" means, and a test phrase travels the same
+route — daemon, arbiter, engine, sink — that a real read takes, so a test that
+sounds right proves the real path rather than a private shortcut.
+
+Nothing here synthesises audio and nothing here opens a device.  A machine with
+no daemon running and no ``espeak-ng`` installed still opens the screen, still
+saves settings, and says in the status block what is missing and what to install
+rather than failing to start.
+
+As a CLI, for scripts and for terminals that cannot run curses:
+
+    kilix-tts --print
+    kilix-tts --status
+    kilix-tts --set wpm=200 --set voice=en-gb
+"""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import os
+import signal
+import socket
+import subprocess
+import sys
+from collections.abc import Callable
+from typing import NamedTuple
+
+# A checkout runs as ./kilix-tts and an install is usually a symlink into
+# ~/.local/bin, so the package is looked for next to the *resolved* script.
+_HERE = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+from voicelib import (  # noqa: E402  (the import follows the path bootstrap)
+    __version__, audio, paths, protocol, settings, tts as tts_lib, util)
+
+# A reply is a status payload at most, and the daemon answers a read as soon as
+# it is queued rather than when it finishes speaking, so neither of these has to
+# accommodate the length of what is being read.
+MAX_REPLY_BYTES = 1 << 16
+CONTROL_TIMEOUT_S = 5.0
+# The status probe runs while somebody is looking at the screen, so it gives up
+# sooner: a wedged daemon should degrade the status block, not the whole UI.
+PROBE_TIMEOUT_S = 2.0
+# Filling a picker is a convenience; a helper that hangs must not hold the
+# screen shut behind it.
+DISCOVERY_TIMEOUT_S = 3.0
+
+TOGGLE = "toggle"      # a boolean setting, drawn [x] / [ ]
+CHOICE = "choice"      # a fixed vocabulary from settings.SPEC
+TOKEN = "token"        # a free-form name: cycled from a picker, or typed
+
+# The union of the alphabets settings.py accepts for a voice and for a device
+# token. Typing is filtered to these so an obvious mistake never reaches the
+# file; the file's own patterns stay the authority, and report a rejected value
+# at save time with the exact rule it broke.
+_TOKEN_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:+-")
+
+# Offered when no engine is installed to list its own voices, so the picker is
+# still usable on a machine being set up before espeak-ng arrives.
+FALLBACK_VOICES = ("en-us", "en-gb", "en", "de", "es", "fr", "it", "pt", "ru")
+
+_ON_WORDS = ("1", "on", "yes", "true", "enable", "enabled")
+_OFF_WORDS = ("0", "off", "no", "false", "disable", "disabled")
+
+
+class VoiceToolError(RuntimeError):
+    """kilix-tts cannot do what was asked; the message says what to do."""
+
+
+# --------------------------------------------------------------------------
+# The settings this screen owns
+# --------------------------------------------------------------------------
+
+
+class Field(NamedTuple):
+    """One editable setting: which shared key it is, and how it is changed."""
+
+    key: str
+    label: str
+    kind: str
+    limit: int = 0          # TOKEN fields: the longest value worth typing
+
+
+class Action(NamedTuple):
+    """One thing the Test section can do. Actions edit nothing."""
+
+    key: str
+    label: str
+
+
+class Section(NamedTuple):
+    """One tab: its items, and the one-line summary drawn above them."""
+
+    name: str
+    items: tuple[Field | Action, ...]
+    summary: Callable[[dict], str]
+
+
+def _read_aloud_summary(values: dict) -> str:
+    button = "button on" if values[settings.KEY_SPEAK] else "button off"
+    return (f"Read-aloud: {button} · {values[settings.KEY_TTS_ENGINE]} · "
+            f"{values[settings.KEY_TTS_VOICE]} · "
+            f"{values[settings.KEY_TTS_RATE]} wpm")
+
+
+def _reading_summary(values: dict) -> str:
+    budget = values[settings.KEY_TTS_MAX_CHARS]
+    limit = ("no character limit" if budget == "unlimited"
+             else f"at most {budget} characters")
+    return f"Reading: {values[settings.KEY_TTS_EXTENT]} · {limit}"
+
+
+def _output_summary(values: dict) -> str:
+    device = values[settings.KEY_DEVICE_OUT]
+    return "Output: " + ("the system default sink"
+                         if device == "default" else device)
+
+
+def _test_summary(_values: dict) -> str:
+    return "Test: Enter runs the selected action, through kilix-voiced"
+
+
+ACTIONS = (
+    Action("speak", "Speak a test phrase through kilix-voiced"),
+    Action("stop", "Stop speaking now"),
+    Action("refresh", "Re-check the daemon, the engine and the sink"),
+)
+
+SECTIONS = (
+    Section("Read-aloud", (
+        Field(settings.KEY_SPEAK,
+              "Speaking-head button in the tab bar", TOGGLE),
+        Field(settings.KEY_TTS_ENGINE,
+              "Engine (espeak · mbrola voices · off)", CHOICE),
+        Field(settings.KEY_TTS_VOICE,
+              "Voice (espeak name; mbrola reads it as mb-<voice>)", TOKEN, 32),
+        Field(settings.KEY_TTS_RATE,
+              "Speaking rate (words per minute)", CHOICE),
+    ), _read_aloud_summary),
+    Section("Reading", (
+        Field(settings.KEY_TTS_EXTENT,
+              'Extent — what "read this" means', CHOICE),
+        Field(settings.KEY_TTS_MAX_CHARS,
+              "Characters read at most (unlimited reads it all)", CHOICE),
+    ), _reading_summary),
+    Section("Output", (
+        Field(settings.KEY_DEVICE_OUT,
+              "Playback device (PulseAudio sink, or default)", TOKEN, 128),
+    ), _output_summary),
+    Section("Test", ACTIONS, _test_summary),
+)
+
+TEST_SECTION_INDEX = len(SECTIONS) - 1
+
+FIELDS = tuple(item for section in SECTIONS for item in section.items
+               if isinstance(item, Field))
+
+
+# --------------------------------------------------------------------------
+# Talking to kilix-voiced
+# --------------------------------------------------------------------------
+
+
+def control(request: dict, timeout: float = CONTROL_TIMEOUT_S) -> dict:
+    """Send one request to the daemon and return its reply.
+
+    One request, one reply, one connection: the daemon answers and hangs up, so
+    a screen somebody is reading never holds the control socket open against
+    the pane that actually wants to speak.
+    """
+    path = paths.control_socket()
+    endpoint = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        endpoint.settimeout(timeout)
+        try:
+            endpoint.connect(path)
+        except FileNotFoundError as error:
+            raise VoiceToolError(
+                f"kilix-voiced is not running: there is no control socket at "
+                f"{path}. Start it with `kilix-voiced &`, or press Kilix's "
+                "speaking-head button, which starts it on demand.") from error
+        except ConnectionRefusedError as error:
+            raise VoiceToolError(
+                f"the control socket {path} is stale — nothing is listening on "
+                "it. Start kilix-voiced again; it clears a stale socket at "
+                "startup.") from error
+        except PermissionError as error:
+            raise VoiceToolError(
+                f"you are not allowed to reach {path}: {error}. A voice session "
+                "belongs to one user; run kilix-voiced as yourself, or point "
+                "KILIX_SESSION_HOME at a directory you own.") from error
+        except OSError as error:
+            raise VoiceToolError(
+                f"cannot reach kilix-voiced on {path}: {error}. Check that the "
+                "session directory exists and that the daemon serving it is "
+                "this version, or point KILIX_SESSION_HOME at a shorter path "
+                "you own — a unix socket path is limited to about 100 "
+                "characters.") from error
+        try:
+            endpoint.send(protocol.encode(request))
+            raw = endpoint.recv(MAX_REPLY_BYTES)
+        except TimeoutError as error:
+            raise VoiceToolError(
+                f"kilix-voiced did not answer within {timeout:.0f} seconds. It "
+                "may be stuck on an audio device: check `pactl info`, or stop "
+                "the daemon and start it again.") from error
+        except OSError as error:
+            raise VoiceToolError(
+                f"kilix-voiced closed the connection: {error}. Its stderr says "
+                "why it refused the request.") from error
+    finally:
+        endpoint.close()
+    if not raw:
+        raise VoiceToolError(
+            "kilix-voiced accepted the connection and closed it without "
+            "replying. It only serves the user it runs as — check its stderr, "
+            "and that it is your own daemon.")
+    try:
+        reply = protocol.decode(raw)
+    except protocol.ProtocolError as error:
+        raise VoiceToolError(
+            f"kilix-voiced sent a reply this version cannot read ({error}). "
+            "Check that kilix-tts and kilix-voiced come from the same "
+            "installation.") from error
+    if not reply.get("ok"):
+        raise VoiceToolError(str(reply.get("error") or (
+            "kilix-voiced refused the request without saying why. Its stderr "
+            "has the details.")))
+    return reply
+
+
+class Status(NamedTuple):
+    """What can actually happen right now, and why not when it cannot."""
+
+    daemon_ok: bool
+    daemon_detail: str
+    engine_ok: bool
+    engine_detail: str
+    output_ok: bool
+    output_detail: str
+
+
+def _one_line(text: object) -> str:
+    """Flatten a message so it occupies exactly one row, or one printed line."""
+    return " ".join(str(text).split())
+
+
+def _playback_cfg() -> dict:
+    """Return the audio config the sink probe should be judged against."""
+    return {"audio": {"device_out": settings.device_out()}}
+
+
+def _local_engine() -> tuple[bool, str]:
+    """Report synthesis from this machine, launching nothing.
+
+    Used when the daemon cannot be reached; when it can, its own answer is
+    preferred because it is the process that would run the engine.
+    """
+    engine = settings.tts_engine()
+    if engine == "off":
+        return False, (f"read-aloud is switched off. Set the engine to espeak "
+                       f"here, or {settings.KEY_TTS_ENGINE}=espeak in "
+                       f"{paths.settings_file()}, to enable it.")
+    voice = settings.tts_voice()
+    try:
+        command = tts_lib.build_synth_cmd(None, voice=voice,
+                                          rate=settings.tts_rate())
+    except tts_lib.TtsError as error:
+        return False, _one_line(error)
+    detail = f"{engine} · {voice} · {command[0]}"
+    if engine == "mbrola":
+        detail += (f" (mb-{voice} is tried first and falls back to plain "
+                   "espeak when it is not installed)")
+    return True, detail
+
+
+def _local_output() -> tuple[bool, str]:
+    """Report playback from this machine, launching nothing."""
+    try:
+        command = audio.build_play_cmd(_playback_cfg(),
+                                       tts_lib.ESPEAK_SAMPLE_RATE)
+    except audio.AudioError as error:
+        return False, _one_line(error)
+    return True, " ".join(command)
+
+
+def _reported(payload: dict, name: str) -> tuple[bool, str]:
+    """Return one sub-report from the daemon's status payload."""
+    part = payload.get(name)
+    if not isinstance(part, dict):
+        return False, (f"kilix-voiced sent no {name} status. Check that it and "
+                       "kilix-tts come from the same installation.")
+    return bool(part.get("available")), _one_line(part.get("detail") or "")
+
+
+def _local_status(daemon_ok: bool, daemon_detail: str) -> Status:
+    """Report from this machine, for when the daemon cannot report for itself."""
+    engine_ok, engine_detail = _local_engine()
+    output_ok, output_detail = _local_output()
+    return Status(daemon_ok, daemon_detail, engine_ok, engine_detail,
+                  output_ok, output_detail)
+
+
+def probe(timeout: float = PROBE_TIMEOUT_S) -> Status:
+    """Ask the daemon what it can do; fall back to inspecting this machine."""
+    try:
+        reply = control({"op": protocol.OP_STATUS, "id": "kilix-tts"}, timeout)
+    except VoiceToolError as error:
+        return _local_status(False, _one_line(error))
+    payload = reply.get("status")
+    if not isinstance(payload, dict):
+        return _local_status(True, (
+            "running, but it sent no status payload. Check that kilix-tts and "
+            "kilix-voiced come from the same installation."))
+    detail = (f"running · pid {payload.get('pid')} · up "
+              f"{payload.get('uptime')}s · idle {payload.get('idle')}s")
+    if payload.get("speaking"):
+        detail += " · speaking"
+    if payload.get("listening"):
+        detail += " · listening"
+    engine_ok, engine_detail = _reported(payload, "tts")
+    tts_part = payload.get("tts")
+    if engine_ok and isinstance(tts_part, dict):
+        # The engine's own name and voice, so the line reads the same whether
+        # it came from the daemon or from the fallback probe above.
+        engine_detail = _one_line(
+            f"{tts_part.get('engine')} · {tts_part.get('voice')} · "
+            f"{engine_detail}")
+    output_ok, output_detail = _reported(payload, "playback")
+    return Status(True, detail, engine_ok, engine_detail, output_ok,
+                  output_detail)
+
+
+def test_phrase() -> str:
+    """Return a phrase that says back the settings it is being read with."""
+    return (f"Kilix read-aloud test. This is the {settings.tts_voice()} voice "
+            f"at {settings.tts_rate()} words per minute.")
+
+
+def speak_test() -> str:
+    """Ask the daemon to read the test phrase; return what happened."""
+    reply = control({"op": protocol.OP_SPEAK, "text": test_phrase(),
+                     "id": "kilix-tts"})
+    chunks = reply.get("chunks") or 0
+    if not chunks:
+        return ("kilix-voiced had nothing to say: the phrase conditioned down "
+                "to nothing.")
+    return (f"Speaking {chunks} clip{'' if chunks == 1 else 's'} — "
+            "\"Stop speaking now\" cuts it short.")
+
+
+def stop_speech() -> str:
+    """Ask the daemon to silence the speakers; return what happened."""
+    reply = control({"op": protocol.OP_STOP_SPEECH, "id": "kilix-tts"})
+    return "Stopped." if reply.get("stopped") else "Nothing was speaking."
+
+
+# --------------------------------------------------------------------------
+# Pickers for the free-form fields
+# --------------------------------------------------------------------------
+
+
+def _is_token(text: str) -> bool:
+    return bool(text) and len(text) <= 128 and set(text) <= _TOKEN_CHARS
+
+
+def _tool_output(command: list[str]) -> str | None:
+    """Return a helper's stdout, or None when it is missing or unhappy.
+
+    Discovery only fills in a picker, so anything that goes wrong leaves the
+    built-in list in place instead of becoming an error somebody has to clear.
+    """
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL,
+                                capture_output=True,
+                                timeout=DISCOVERY_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.decode("utf-8", "replace")
+
+
+def discover_voices() -> tuple[str, ...]:
+    """Return the voices the installed engine offers, or the built-in list.
+
+    ``espeak-ng --voices`` prints a table whose second column is the name to
+    pass to ``-v``; it opens no audio device, which is why a settings screen may
+    run it.
+    """
+    binary = tts_lib.espeak_binary()
+    text = _tool_output([binary, "--voices"]) if binary else None
+    found = {parts[1] for parts in
+             (line.split() for line in (text or "").splitlines()[1:])
+             if len(parts) >= 2 and _is_token(parts[1])}
+    return tuple(sorted(found)) or FALLBACK_VOICES
+
+
+def discover_sinks() -> tuple[str, ...]:
+    """Return "default" plus the sinks `pactl list sinks short` reports."""
+    binary = util.which("pactl")
+    text = _tool_output([binary, "list", "sinks", "short"]) if binary else None
+    found = []
+    for line in (text or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and _is_token(parts[1]):
+            found.append(parts[1])
+    return (audio.DEFAULT_DEVICE,) + tuple(dict.fromkeys(found))
+
+
+def _choices(field: Field, discovered: dict[str, tuple[str, ...]],
+             current: str) -> tuple[str, ...]:
+    """Return what cycling this field offers, current value included.
+
+    A value the file already holds always stays reachable: a voice this engine
+    does not list, or a sink that is unplugged today, must not disappear from
+    the screen the moment somebody presses Space past it.
+    """
+    if field.kind == CHOICE:
+        return settings.SPEC[field.key][1] or (current,)
+    offered = discovered.get(field.key, ())
+    return offered if current in offered else (current,) + offered
+
+
+def _cycled(choices: tuple[str, ...], current: str, step: int) -> str:
+    """Return the next (or previous) value in ``choices``."""
+    if not choices:
+        return current
+    try:
+        index = choices.index(current)
+    except ValueError:
+        return choices[0] if step > 0 else choices[-1]
+    return choices[(index + step) % len(choices)]
+
+
+def _default_value(field: Field) -> object:
+    default = settings.SPEC[field.key][0]
+    return settings.truthy(default) if field.kind == TOGGLE else default
+
+
+def _short_name(key: str) -> str:
+    """Return the friendly name --set accepts for a settings key."""
+    return key.removeprefix("KILIX_VOICE_").removeprefix("KILIX_").lower()
+
+
+# --------------------------------------------------------------------------
+# Drawing
+# --------------------------------------------------------------------------
+
+
+def _put(stdscr, row: int, column: int, text: str,
+         attr: int = curses.A_NORMAL) -> None:
+    """Draw one line, clipped to the window.
+
+    A terminal too small for a line simply loses it: this screen reports what a
+    machine can do, and it has to keep working on the two-row pane somebody
+    split off to look at it.
+    """
+    height, width = stdscr.getmaxyx()
+    if not 0 <= row < height or column >= width - 1:
+        return
+    try:
+        stdscr.addnstr(row, column, text, max(0, width - column - 1), attr)
+    except curses.error:
+        pass
+
+
+def _draw_tabs(stdscr, width: int, active: int) -> None:
+    column = 2
+    for index, section in enumerate(SECTIONS):
+        label = f" {index + 1} {section.name} "
+        if column >= width - 1:
+            break
+        attr = (curses.A_REVERSE | curses.A_BOLD
+                if index == active else curses.A_DIM)
+        _put(stdscr, 3, column, label, attr)
+        column += len(label) + 1
+
+
+def _marker(item: Field | Action, values: dict) -> str:
+    if isinstance(item, Action):
+        return "[>]"
+    if item.kind == TOGGLE:
+        return "[x]" if values[item.key] else "[ ]"
+    return f"[{str(values[item.key]):^9}]"
+
+
+def _status_lines(status: Status,
+                  last_error: str) -> list[tuple[str, str, bool]]:
+    """Return the status block, most urgent first.
+
+    A window too short for all of it keeps the head of this list, so the thing
+    that just went wrong is the line that survives.
+    """
+    lines = [("Daemon", status.daemon_detail, status.daemon_ok),
+             ("Engine", status.engine_detail, status.engine_ok),
+             ("Output", status.output_detail, status.output_ok)]
+    if last_error:
+        lines.insert(0, ("Error", last_error, False))
+    return lines
+
+
+def _draw(stdscr, values: dict, dirty: int, status: Status, last_error: str,
+          section_index: int, selected: int, message: str) -> None:
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    title = "Kilix read-aloud" + (f" — {dirty} unsaved" if dirty else "")
+    _put(stdscr, 0, 2, title, curses.A_BOLD)
+    _put(stdscr, 1, 2, paths.settings_file(), curses.A_DIM)
+    _draw_tabs(stdscr, width, section_index)
+
+    section = SECTIONS[section_index]
+    _put(stdscr, 4, 2, section.summary(values), curses.A_BOLD)
+
+    # Only as much of the status block as fits above the list is kept, and the
+    # list keeps at least two rows: a short window loses status, not settings.
+    lines = _status_lines(status, last_error)[:max(0, height - 9)]
+    available = max(1, height - 7 - len(lines))
+    items = section.items
+    scroll = min(max(0, selected - available + 1),
+                 max(0, len(items) - available))
+    for offset, item in enumerate(items[scroll:scroll + available]):
+        attr = (curses.A_REVERSE if scroll + offset == selected
+                else curses.A_NORMAL)
+        _put(stdscr, 5 + offset, 2,
+             f" {_marker(item, values)} {item.label}", attr)
+
+    first = height - 2 - len(lines)
+    for offset, (label, detail, healthy) in enumerate(lines):
+        _put(stdscr, first + offset, 2, f"{label:<8} {detail}",
+             curses.A_DIM if healthy else curses.A_BOLD)
+
+    more = []
+    if scroll:
+        more.append("↑ more")
+    if scroll + available < len(items):
+        more.append("↓ more")
+    help_text = ("←/→ section · ↑/↓ move · Enter run · s save · r refresh · "
+                 "q quit" if section_index == TEST_SECTION_INDEX else
+                 "←/→ section · ↑/↓ move · Space change · ⌫ back · e type · "
+                 "d defaults · s save · q quit")
+    footer = message or " · ".join((*more, help_text))
+    _put(stdscr, height - 2, 1, footer,
+         curses.A_BOLD if message else curses.A_DIM)
+    stdscr.refresh()
+
+
+def _edit(stdscr, field: Field, current: str) -> str | None:
+    """Type a value for a free-form field; None when it was cancelled.
+
+    Only characters the shared settings file accepts in a name are taken, so a
+    slip of the keyboard is refused as it happens rather than at save time.
+    """
+    text = current
+    prompt = _short_name(field.key)
+    try:
+        curses.curs_set(1)
+    except curses.error:
+        pass
+    try:
+        while True:
+            height, width = stdscr.getmaxyx()
+            line = f"{prompt} = {text}_   (Enter accepts · Esc cancels)"
+            _put(stdscr, height - 2, 1, line.ljust(max(0, width - 2)),
+                 curses.A_BOLD)
+            stdscr.refresh()
+            key = stdscr.getch()
+            if key in (curses.KEY_ENTER, 10, 13):
+                return text.strip()
+            if key == 27:
+                return None
+            if key in (curses.KEY_BACKSPACE, 127, 8):
+                text = text[:-1]
+            elif (32 <= key < 127 and len(text) < field.limit
+                    and chr(key) in _TOKEN_CHARS):
+                text += chr(key)
+    finally:
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+
+
+# --------------------------------------------------------------------------
+# The screen
+# --------------------------------------------------------------------------
+
+
+def _load_values() -> dict[str, object]:
+    """Return the validated settings this screen edits."""
+    return {field.key: (settings.enabled(field.key) if field.kind == TOGGLE
+                        else settings.value(field.key))
+            for field in FIELDS}
+
+
+def _notify_running_kilix() -> None:
+    """Tell the terminal that owns this pane to re-read the shared settings.
+
+    Kilix redraws its chrome on SIGUSR1, which is how the speaking-head button
+    appears or disappears without restarting the terminal.
+    """
+    raw_pid = os.environ.get("KITTY_PID", "")
+    if raw_pid.isdigit():
+        try:
+            os.kill(int(raw_pid), signal.SIGUSR1)
+        except OSError:
+            pass
+
+
+def _run_action(action: Action, dirty: int) -> tuple[str, str]:
+    """Run one Test-section action; return (message, error)."""
+    if action.key == "refresh":
+        return "Re-checked the daemon, the engine and the sink.", ""
+    if action.key == "speak" and dirty:
+        # Stopping is always allowed: it takes no settings with it, and a test
+        # somebody wants silenced must not wait for a save.
+        return ("Save first (s): kilix-voiced reads the settings file, not "
+                "this list."), ""
+    try:
+        return (speak_test() if action.key == "speak" else stop_speech()), ""
+    except VoiceToolError as error:
+        return "That did not work — see the Error line.", _one_line(error)
+
+
+def _run_tui(stdscr, initial_section: int | None = None) -> int:
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    stdscr.keypad(True)
+    values = _load_values()
+    original = dict(values)
+    discovered = {settings.KEY_TTS_VOICE: discover_voices(),
+                  settings.KEY_DEVICE_OUT: discover_sinks()}
+    status = probe()
+    section_index = initial_section or 0
+    selected = [0] * len(SECTIONS)
+    message = ""
+    last_error = ""
+    discard_armed = False
+
+    while True:
+        section = SECTIONS[section_index]
+        items = section.items
+        testing = section_index == TEST_SECTION_INDEX
+        item_index = min(selected[section_index], len(items) - 1)
+        selected[section_index] = item_index
+        item = items[item_index]
+        dirty = sum(values[key] != original[key] for key in values)
+        _draw(stdscr, values, dirty, status, last_error, section_index,
+              item_index, message)
+        message = ""
+        key = stdscr.getch()
+        if key not in (ord("q"), ord("Q"), 27):
+            discard_armed = False
+
+        if key in (curses.KEY_UP, ord("k"), ord("K")):
+            selected[section_index] = (item_index - 1) % len(items)
+        elif key in (curses.KEY_DOWN, ord("j"), ord("J")):
+            selected[section_index] = (item_index + 1) % len(items)
+        elif key in (curses.KEY_LEFT, ord("h"), ord("H"),
+                     getattr(curses, "KEY_BTAB", -1)):
+            section_index = (section_index - 1) % len(SECTIONS)
+        elif key in (curses.KEY_RIGHT, ord("l"), ord("L"), ord("\t")):
+            section_index = (section_index + 1) % len(SECTIONS)
+        elif ord("1") <= key <= ord(str(len(SECTIONS))):
+            section_index = key - ord("1")
+        elif key == curses.KEY_HOME:
+            selected[section_index] = 0
+        elif key == curses.KEY_END:
+            selected[section_index] = len(items) - 1
+        elif key in (ord(" "), curses.KEY_ENTER, 10, 13):
+            if testing:
+                message, last_error = _run_action(item, dirty)
+                status = probe()
+            elif item.kind == TOGGLE:
+                values[item.key] = not values[item.key]
+            else:
+                values[item.key] = _cycled(
+                    _choices(item, discovered, str(values[item.key])),
+                    str(values[item.key]), 1)
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            if not testing and item.kind != TOGGLE:
+                values[item.key] = _cycled(
+                    _choices(item, discovered, str(values[item.key])),
+                    str(values[item.key]), -1)
+        elif key in (ord("e"), ord("E")):
+            if testing or item.kind != TOKEN:
+                message = "That setting has fixed values; Space changes it."
+            else:
+                typed = _edit(stdscr, item, str(values[item.key]))
+                if typed is None:
+                    message = "Left unchanged."
+                elif not typed:
+                    message = (f"{_short_name(item.key)} cannot be empty; use "
+                               "'default' for the system default.")
+                else:
+                    values[item.key] = typed
+        elif key in (ord("d"), ord("D")):
+            if testing:
+                message = "Tests have nothing to reset."
+            else:
+                for field in items:
+                    values[field.key] = _default_value(field)
+                message = f"{section.name} reset to defaults — s saves."
+        elif key in (ord("r"), ord("R")):
+            status = probe()
+            message = "Re-checked the daemon, the engine and the sink."
+        elif key in (ord("s"), ord("S")):
+            changes = {name: staged for name, staged in values.items()
+                       if original[name] != staged}
+            if not changes:
+                message = "No changes to save."
+            else:
+                try:
+                    path = settings.update(changes)
+                except settings.SettingsError as error:
+                    message = "Could not save — see the Error line."
+                    last_error = _one_line(error)
+                else:
+                    original = dict(values)
+                    _notify_running_kilix()
+                    last_error = ""
+                    status = probe()
+                    message = (f"Saved to {path}. kilix-voiced re-reads it "
+                               "before the next read.")
+        elif key in (ord("q"), ord("Q"), 27):
+            if values != original and not discard_armed:
+                message = "Unsaved changes: s saves; q again discards."
+                discard_armed = True
+                continue
+            return 0
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
+_ALIASES: dict[str, tuple[str, ...]] = {
+    settings.KEY_SPEAK: ("speak", "chrome_speak", "button", "speak_button"),
+    settings.KEY_TTS_ENGINE: ("engine", "tts_engine", "tts"),
+    settings.KEY_TTS_VOICE: ("voice", "tts_voice"),
+    settings.KEY_TTS_RATE: ("rate", "tts_rate", "wpm", "speed"),
+    settings.KEY_TTS_EXTENT: ("extent", "tts_extent", "read", "read_extent"),
+    settings.KEY_TTS_MAX_CHARS: ("max_chars", "tts_max_chars", "chars",
+                                 "budget"),
+    settings.KEY_DEVICE_OUT: ("device_out", "output", "out", "sink", "device"),
+}
+
+# Friendlier spellings for the fixed vocabularies, so a caller who writes what
+# the setting means gets what it is called rather than an error.
+_SPELLINGS: dict[str, dict[str, str]] = {
+    settings.KEY_TTS_ENGINE: {"espeak-ng": "espeak", "ng": "espeak",
+                              "mb": "mbrola", "none": "off", "silent": "off"},
+    settings.KEY_TTS_EXTENT: {"visible": "screen", "pane": "screen",
+                              "history": "scrollback", "buffer": "scrollback",
+                              "sel": "selection"},
+    settings.KEY_TTS_MAX_CHARS: {"none": "unlimited", "off": "unlimited",
+                                 "all": "unlimited", "everything": "unlimited"},
+}
+
+CONTROL_NAMES = {alias: key for key, aliases in _ALIASES.items()
+                 for alias in (key.lower(), *aliases)}
+
+
+def _name_list() -> str:
+    return ", ".join(sorted(name for name in CONTROL_NAMES
+                            if not name.startswith("kilix_")))
+
+
+def _canonical(key: str, text: str) -> str:
+    """Return the vocabulary spelling of a value written by hand."""
+    if key == settings.KEY_TTS_RATE:
+        text = text.removesuffix("wpm").strip()
+    elif key == settings.KEY_TTS_MAX_CHARS:
+        text = text.removesuffix("characters").removesuffix("chars").strip()
+        if text.endswith("k") and text[:-1].isdigit():
+            text = str(int(text[:-1]) * 1000)
+    return _SPELLINGS.get(key, {}).get(text, text)
+
+
+def _parse_value(key: str, raw: str) -> object:
+    text = raw.strip()
+    if key in settings.BOOL_KEYS:
+        if text.lower() in _ON_WORDS:
+            return True
+        if text.lower() in _OFF_WORDS:
+            return False
+        raise argparse.ArgumentTypeError(
+            f"{_short_name(key)} must be on or off (also accepted: "
+            f"{', '.join(_ON_WORDS + _OFF_WORDS)}) — got {text!r}")
+    choices = settings.SPEC[key][1]
+    if choices is None:
+        # A name, not a vocabulary: settings.update() holds it to the alphabet
+        # the shared file accepts and says which one it broke.
+        if not text:
+            raise argparse.ArgumentTypeError(
+                f"{_short_name(key)} needs a value; use 'default' for the "
+                "system default")
+        return text
+    value = _canonical(key, text.lower())
+    if value not in choices:
+        raise argparse.ArgumentTypeError(
+            f"{_short_name(key)} must be one of: {', '.join(choices)} — got "
+            f"{text!r}")
+    return value
+
+
+def _parse_assignment(value: str) -> tuple[str, object]:
+    try:
+        name, raw = value.split("=", 1)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"expected NAME=VALUE, for example wpm=200; names: {_name_list()}"
+        ) from error
+    key = CONTROL_NAMES.get(name.strip().lower().replace("-", "_"))
+    if key is None:
+        raise argparse.ArgumentTypeError(
+            f"unknown setting {name.strip()!r}; choose one of: {_name_list()}")
+    return key, _parse_value(key, raw)
+
+
+def _section_aliases() -> dict[str, int]:
+    """Map section names to indices, derived from the sections themselves."""
+    extra = {"Read-aloud": ("speech", "voice", "engine"),
+             "Reading": ("extent", "text"),
+             "Output": ("device", "sink", "audio"),
+             "Test": ("tests", "try")}
+    aliases: dict[str, int] = {}
+    for index, section in enumerate(SECTIONS):
+        canonical = section.name.lower()
+        aliases[canonical] = index
+        aliases[canonical.replace("-", "")] = index
+        for alias in extra.get(section.name, ()):
+            aliases[alias] = index
+    return aliases
+
+
+SECTION_ALIASES = _section_aliases()
+
+
+def _parse_section(value: str) -> int:
+    index = SECTION_ALIASES.get(value.strip().lower())
+    if index is None:
+        raise argparse.ArgumentTypeError(
+            "unknown section; choose one of: "
+            + ", ".join(section.name.lower() for section in SECTIONS))
+    return index
+
+
+def _print_settings() -> None:
+    print(f"settings_file={paths.settings_file()}")
+    print(f"{settings.KEY_SPEAK}="
+          f"{'on' if settings.enabled(settings.KEY_SPEAK) else 'off'}")
+    for field in FIELDS:
+        if field.kind != TOGGLE:
+            print(f"{field.key}={settings.value(field.key)}")
+
+
+def _print_status() -> None:
+    status = probe()
+    print(f"settings_file={paths.settings_file()}")
+    print(f"control_socket={paths.control_socket()}")
+    print(f"daemon={'running' if status.daemon_ok else 'stopped'}")
+    print(f"daemon_detail={status.daemon_detail}")
+    print(f"engine={settings.tts_engine()}")
+    print(f"engine_available={'yes' if status.engine_ok else 'no'}")
+    print(f"engine_detail={status.engine_detail}")
+    print(f"output_available={'yes' if status.output_ok else 'no'}")
+    print(f"output_detail={status.output_detail}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="kilix-tts",
+        description="Configure Kilix read-aloud, and test it through "
+                    "kilix-voiced.")
+    parser.add_argument("--print", action="store_true", dest="show",
+                        help="print the effective read-aloud settings")
+    parser.add_argument("--status", action="store_true",
+                        help="print what kilix-voiced and this machine can do")
+    parser.add_argument("--set", action="append", default=[],
+                        type=_parse_assignment, metavar="NAME=VALUE",
+                        help="set one setting, for example wpm=200, "
+                             "voice=en-gb, engine=off")
+    parser.add_argument("--section", type=_parse_section,
+                        metavar="|".join(section.name.lower()
+                                         for section in SECTIONS),
+                        help="open the interactive screen on this section")
+    parser.add_argument("--version", action="version",
+                        version=f"kilix-tts {__version__}")
+    args = parser.parse_args(argv)
+
+    changes = dict(args.set)
+    if changes:
+        try:
+            settings.update(changes)
+        except settings.SettingsError as error:
+            parser.exit(1, f"kilix-tts: {error}\n")
+        _notify_running_kilix()
+    if args.show:
+        _print_settings()
+    if args.status:
+        _print_status()
+    if changes or args.show or args.status:
+        return 0
+
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        parser.error("the interactive screen needs a terminal; use --print, "
+                     "--status, or --set NAME=VALUE")
+    try:
+        return curses.wrapper(_run_tui, args.section)
+    except curses.error as error:
+        parser.exit(1, f"kilix-tts: this terminal will not run a curses "
+                       f"screen ({error}). Use --print, --status or --set "
+                       f"instead.\n")
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
