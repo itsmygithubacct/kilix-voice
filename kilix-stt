@@ -52,7 +52,8 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from voicelib import (  # noqa: E402  (the import follows the path bootstrap)
-    __version__, audio, events, paths, protocol, settings, stt as stt_lib)
+    __version__, audio, events, paths, protocol, settings, stt as stt_lib,
+    tui_shell)
 from voicelib.vad import Vad  # noqa: E402
 
 
@@ -807,14 +808,14 @@ class Layout(NamedTuple):
 
 
 def layout_for(height: int) -> Layout:
-    """Return the row budget for ``height``; a short terminal drops chrome.
+    """Return the body budget below the canonical four-row Kilix shell.
 
     Everything is derived from the height rather than assumed, because a Kilix
     pane is often eight rows tall and a settings screen that raises there is
     worse than one that shows less.
     """
-    help_row = height - 2 if height >= 6 else -1
-    status_row = height - 3 if height >= 9 else -1
+    help_row = height - 1 if height > 0 else -1
+    status_row = 3 if height >= 4 else -1
     if height >= 22:
         detail_rows = 4
     elif height >= 18:
@@ -825,16 +826,12 @@ def layout_for(height: int) -> Layout:
         detail_rows = 1
     else:
         detail_rows = 0
-    footer = min(row for row in (status_row, help_row, height) if row >= 0)
-    detail_top = footer - detail_rows
-    if height >= 10:
-        path_row, tabs_row, summary_row, body_top = 1, 3, 4, 6
-    elif height >= 6:
-        path_row, tabs_row, summary_row, body_top = -1, 1, -1, 2
-    else:
-        path_row, tabs_row, summary_row, body_top = -1, -1, -1, 1
-    return Layout(path_row, tabs_row, summary_row, body_top,
-                  max(1, detail_top - body_top), detail_top, detail_rows,
+    body_top = 4
+    body_bottom = max(body_top, height - 1)
+    detail_rows = min(detail_rows, max(0, body_bottom - body_top))
+    detail_top = body_bottom - detail_rows
+    return Layout(-1, 1, 3, body_top,
+                  max(0, detail_top - body_top), detail_top, detail_rows,
                   status_row, help_row)
 
 
@@ -947,13 +944,21 @@ class Ui:
         height, width = self._screen.getmaxyx()
         rows = layout_for(height)
         dirty = self._dirty
-        title = f"Kilix Dictation {__version__}"
+        summary = self._message or self._summary()
         if dirty:
-            title += f" {self._glyphs.dot} {dirty} unsaved"
-        self._put(0, 2, title, curses.A_BOLD)
-        self._put(rows.path_row, 2, tilde(paths.settings_file()), curses.A_DIM)
-        self._draw_tabs(rows.tabs_row, width)
-        self._put(rows.summary_row, 2, self._summary(), curses.A_BOLD)
+            summary += (
+                f" {self._glyphs.dot} {dirty} unsaved "
+                f"change{'s' if dirty != 1 else ''}"
+            )
+        tui_shell.draw(
+            self._screen,
+            title="Kilix Voice · Dictation",
+            sections=SECTIONS,
+            active=self._section,
+            summary=summary,
+            footer=self._footer_text(),
+            summary_role="accent" if self._message or dirty else "muted",
+        )
         if self._section == SECTION_DICTATION:
             self._draw_controls(rows, width)
         elif self._section == SECTION_MICROPHONE:
@@ -961,19 +966,7 @@ class Ui:
         else:
             self._draw_models(rows, width)
         self._draw_detail(rows)
-        self._draw_footer(rows, dirty)
         self._screen.refresh()
-
-    def _draw_tabs(self, row: int, width: int) -> None:
-        column = 2
-        for index, name in enumerate(SECTIONS):
-            label = f" {index + 1} {name} "
-            if column >= width - 1:
-                break
-            attr = (curses.A_REVERSE | curses.A_BOLD
-                    if index == self._section else curses.A_DIM)
-            self._put(row, column, label, attr)
-            column += len(label) + 1
 
     def _summary(self) -> str:
         report = self._diagnostics
@@ -999,7 +992,7 @@ class Ui:
                      max(0, len(lines) - rows.body_rows))
         for offset, (text, attr) in enumerate(
                 lines[scroll:scroll + rows.body_rows]):
-            self._put(rows.body_top + offset, 2, text, attr)
+            self._put(rows.body_top + offset, 1, text, attr)
 
     def _draw_controls(self, rows: Layout, width: int) -> None:
         selected = self._selected[SECTION_DICTATION]
@@ -1008,9 +1001,11 @@ class Ui:
             shown = self._fit(
                 shown_value(control.key, self._values[control.key]), 18,
                 tail=control.key == settings.KEY_DEVICE_IN)
-            line = f" [{shown:^18}] {control.label}"
-            attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
-            lines.append((line.ljust(max(0, width - 4)), attr))
+            marker = "▶" if index == selected else " "
+            line = f"{marker} [{shown:^18}] {control.label}"
+            attr = (tui_shell.attr("selected")
+                    if index == selected else curses.A_NORMAL)
+            lines.append((line.ljust(max(0, width - 2)), attr))
         self._draw_rows(rows, lines, selected)
 
     def _draw_models(self, rows: Layout, width: int) -> None:
@@ -1019,27 +1014,32 @@ class Ui:
         lines = []
         for index, spec in enumerate(MODELS):
             installed = os.path.isdir(paths.model_dir(spec.catalog_id))
-            line = (f" [{'x' if spec.catalog_id == active else ' '}] "
+            marker = "▶" if index == selected else " "
+            line = (f"{marker} "
+                    f"[{'x' if spec.catalog_id == active else ' '}] "
                     f"{spec.catalog_id:<21} {spec.engine:<10} "
                     f"{human_bytes(spec.size):>9}  "
                     f"{'installed' if installed else 'not installed'}")
-            attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
-            lines.append((line.ljust(max(0, width - 4)), attr))
+            attr = (tui_shell.attr("selected")
+                    if index == selected else curses.A_NORMAL)
+            lines.append((line.ljust(max(0, width - 2)), attr))
         self._draw_rows(rows, lines, selected)
 
     def _draw_microphone(self, rows: Layout, width: int) -> None:
         report = self._diagnostics
         mic = self._mic
-        speaking = curses.A_BOLD if mic and mic.speaking else curses.A_DIM
+        speaking = tui_shell.attr(
+            "accent" if mic and mic.speaking else "muted")
         device = self._values[settings.KEY_DEVICE_IN]
         header = [(f"Source   {device}", curses.A_NORMAL)]
         note = self._device_note(device)
         if note:
-            header.append((f"         {note}", curses.A_DIM))
+            header.append((f"         {note}", tui_shell.attr("muted")))
         header.append((f"Capture  {report.capture}",
                        curses.A_NORMAL if report.capture_ok
-                       else curses.A_BOLD))
-        header.append((f"Owner    {self._daemon_line()}", curses.A_DIM))
+                       else tui_shell.attr("alert")))
+        header.append(
+            (f"Owner    {self._daemon_line()}", tui_shell.attr("muted")))
 
         bar_width = max(8, min(48, width - 28))
         level = mic.level if mic else 0.0
@@ -1049,7 +1049,8 @@ class Ui:
         dot = self._glyphs.dot
         meter = [
             (f"[{self._bar(bar_width, level, gate)}] {db_text(level)}",
-             curses.A_BOLD if mic and mic.speaking else curses.A_NORMAL),
+             tui_shell.attr("accent")
+             if mic and mic.speaking else curses.A_NORMAL),
             (f"state {state:<8} gate {db_text(gate)}   "
              f"floor {db_text(mic.floor if mic else 0.0)}   "
              f"peak {db_text(mic.peak if mic else 0.0)}", speaking),
@@ -1057,7 +1058,7 @@ class Ui:
               f"clipped {mic.clipped} {dot} opened {mic.turns} {dot} "
               f"{mic.elapsed:.1f} s of {mic.limit:.0f} s") if mic else
              "no capture yet: Space opens the microphone for a test. Nothing "
-             "is recognised or recorded.", curses.A_DIM),
+             "is recognised or recorded.", tui_shell.attr("muted")),
         ]
         # The meter is the reason for this tab, so a short pane loses the
         # context lines above it rather than the readings themselves.
@@ -1166,14 +1167,15 @@ class Ui:
             if len(folded) >= rows.detail_rows:
                 break
         for offset, line in enumerate(folded[:rows.detail_rows]):
-            self._put(rows.detail_top + offset, 3, line, curses.A_DIM)
+            self._put(
+                rows.detail_top + offset,
+                2,
+                line,
+                tui_shell.attr("muted"),
+            )
 
-    def _draw_footer(self, rows: Layout, dirty: int) -> None:
-        status = (f"{dirty} unsaved change{'s' if dirty != 1 else ''} "
-                  f"{self._glyphs.dot} s saves"
-                  if dirty else "All changes saved")
-        self._put(rows.status_row, 2, status,
-                  curses.A_BOLD if dirty else curses.A_DIM)
+    def _footer_text(self) -> str:
+        """Return the one quiet footer used by the shared shell."""
         glyphs = self._glyphs
         if self._section == SECTION_MICROPHONE:
             action = "stop" if self._live else "start"
@@ -1190,8 +1192,7 @@ class Ui:
                          f"{glyphs.up}/{glyphs.down} move {glyphs.dot} Space "
                          f"change {glyphs.dot} Backspace back {glyphs.dot} "
                          f"s save {glyphs.dot} r rescan {glyphs.dot} q quit")
-        self._put(rows.help_row, 1, self._message or help_text,
-                  curses.A_BOLD if self._message else curses.A_DIM)
+        return help_text
 
     # -- actions ------------------------------------------------------------
 

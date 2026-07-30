@@ -39,7 +39,8 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 from voicelib import (  # noqa: E402  (the import follows the path bootstrap)
-    __version__, audio, paths, protocol, settings, tts as tts_lib, util)
+    __version__, audio, paths, protocol, settings, tts as tts_lib, tui_shell,
+    util)
 
 # A reply is a status payload at most, and the daemon answers a read as soon as
 # it is queued rather than when it finishes speaking, so neither of these has to
@@ -474,18 +475,6 @@ def _put(stdscr, row: int, column: int, text: str,
         pass
 
 
-def _draw_tabs(stdscr, width: int, active: int) -> None:
-    column = 2
-    for index, section in enumerate(SECTIONS):
-        label = f" {index + 1} {section.name} "
-        if column >= width - 1:
-            break
-        attr = (curses.A_REVERSE | curses.A_BOLD
-                if index == active else curses.A_DIM)
-        _put(stdscr, 3, column, label, attr)
-        column += len(label) + 1
-
-
 def _marker(item: Field | Action, values: dict) -> str:
     if isinstance(item, Action):
         return "[>]"
@@ -513,32 +502,18 @@ def _draw(stdscr, values: dict, dirty: int, status: Status, last_error: str,
           section_index: int, selected: int, message: str) -> None:
     stdscr.erase()
     height, width = stdscr.getmaxyx()
-    title = "Kilix read-aloud" + (f" — {dirty} unsaved" if dirty else "")
-    _put(stdscr, 0, 2, title, curses.A_BOLD)
-    _put(stdscr, 1, 2, paths.settings_file(), curses.A_DIM)
-    _draw_tabs(stdscr, width, section_index)
-
     section = SECTIONS[section_index]
-    _put(stdscr, 4, 2, section.summary(values), curses.A_BOLD)
-
-    # Only as much of the status block as fits above the list is kept, and the
-    # list keeps at least two rows: a short window loses status, not settings.
-    lines = _status_lines(status, last_error)[:max(0, height - 9)]
-    available = max(1, height - 7 - len(lines))
+    body_height = max(0, height - 5)
+    lines = _status_lines(status, last_error)[:max(0, body_height - 2)]
+    gap = 1 if lines and body_height > len(lines) else 0
+    available = max(0, body_height - len(lines) - gap)
     items = section.items
     scroll = min(max(0, selected - available + 1),
-                 max(0, len(items) - available))
-    for offset, item in enumerate(items[scroll:scroll + available]):
-        attr = (curses.A_REVERSE if scroll + offset == selected
-                else curses.A_NORMAL)
-        _put(stdscr, 5 + offset, 2,
-             f" {_marker(item, values)} {item.label}", attr)
+                 max(0, len(items) - available)) if available else 0
 
-    first = height - 2 - len(lines)
-    for offset, (label, detail, healthy) in enumerate(lines):
-        _put(stdscr, first + offset, 2, f"{label:<8} {detail}",
-             curses.A_DIM if healthy else curses.A_BOLD)
-
+    summary = message or section.summary(values)
+    if dirty:
+        summary += f" · {dirty} unsaved"
     more = []
     if scroll:
         more.append("↑ more")
@@ -548,9 +523,39 @@ def _draw(stdscr, values: dict, dirty: int, status: Status, last_error: str,
                  "q quit" if section_index == TEST_SECTION_INDEX else
                  "←/→ section · ↑/↓ move · Space change · ⌫ back · e type · "
                  "d defaults · s save · q quit")
-    footer = message or " · ".join((*more, help_text))
-    _put(stdscr, height - 2, 1, footer,
-         curses.A_BOLD if message else curses.A_DIM)
+    footer = " · ".join((*more, help_text))
+    body = tui_shell.draw(
+        stdscr,
+        title="Kilix Voice · Read Aloud",
+        sections=[item.name for item in SECTIONS],
+        active=section_index,
+        summary=summary,
+        footer=footer,
+        summary_role="accent" if message or dirty else "muted",
+    )
+
+    for offset, item in enumerate(items[scroll:scroll + available]):
+        index = scroll + offset
+        marker = "▶" if index == selected else " "
+        text = f"{marker} {_marker(item, values)} {item.label}"
+        _put(
+            stdscr,
+            body.top + offset,
+            body.left,
+            text.ljust(body.width),
+            tui_shell.attr("selected")
+            if index == selected else curses.A_NORMAL,
+        )
+
+    first = body.bottom - len(lines)
+    for offset, (label, detail, healthy) in enumerate(lines):
+        _put(
+            stdscr,
+            first + offset,
+            body.left,
+            f"{label:<8} {detail}",
+            tui_shell.attr("muted" if healthy else "alert"),
+        )
     stdscr.refresh()
 
 
@@ -570,7 +575,7 @@ def _edit(stdscr, field: Field, current: str) -> str | None:
         while True:
             height, width = stdscr.getmaxyx()
             line = f"{prompt} = {text}_   (Enter accepts · Esc cancels)"
-            _put(stdscr, height - 2, 1, line.ljust(max(0, width - 2)),
+            _put(stdscr, height - 1, 1, line.ljust(max(0, width - 2)),
                  curses.A_BOLD)
             stdscr.refresh()
             key = stdscr.getch()
