@@ -78,6 +78,8 @@ source checkout or an ambient `PYTHONPATH`.
 
 ## Release history
 
+- **0.1.2** — expose asynchronous synthesis/playback failures through daemon
+  status so detached read-aloud errors remain visible in Kilix.
 - **0.1.1** — make installed runtimes self-contained by packaging `voicelib`
   and add an install-path execution regression test.
 - **0.1.0** — initial local read-aloud and click-to-talk dictation engine.

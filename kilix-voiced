@@ -250,6 +250,13 @@ class Daemon:
         self._stopping = threading.Event()
         self._started_at = time.monotonic()
         self._last_activity = self._started_at
+        # Speech is asynchronous: the request has already been acknowledged by
+        # the time synthesis or playback can fail.  Keep the latest failure in
+        # status so the Kilix chrome can surface it instead of leaving the only
+        # explanation on this detached process's stderr.  The serial lets a
+        # polling client show each failure exactly once.
+        self._speech_error = ""
+        self._speech_error_serial = 0
 
     # -- logging ------------------------------------------------------------
 
@@ -261,6 +268,17 @@ class Daemon:
     def _debug(self, message: str) -> None:
         if self._verbose:
             self._warn(message)
+
+    def _report_speech_failure(self, turn: _SpeechTurn, message: str) -> None:
+        """Publish one current-turn failure without retaining spoken text."""
+        with self._lock:
+            # A cancelled/replaced turn must not turn the new request red when
+            # its worker finally unwinds.
+            if self._speech is not turn or turn.cancel.is_set():
+                return
+            self._speech_error = message
+            self._speech_error_serial += 1
+        self._warn(message)
 
     # -- configuration ------------------------------------------------------
 
@@ -580,6 +598,7 @@ class Daemon:
             name=f"kilix-voice-{turn.id}", daemon=True)
         with self._lock:
             self._cancel_speech()          # a new read replaces the old one
+            self._speech_error = ""
             self._arbiter.begin_speech(turn.id)
             self._speech = turn
             self._start(turn.thread, self._cancel_speech)
@@ -642,11 +661,13 @@ class Daemon:
                 if not self._await_clip(turn, player):
                     break
             if player.error:
-                self._warn(player.error)
+                self._report_speech_failure(turn, player.error)
         except tts_lib.TtsError as error:
-            self._warn(f"read-aloud stopped: {error}")
+            self._report_speech_failure(
+                turn, f"read-aloud stopped: {error}")
         except Exception as error:  # a worker thread must not die silently
-            self._warn(f"read-aloud failed: {error!r}")
+            self._report_speech_failure(
+                turn, f"read-aloud failed: {error!r}")
         finally:
             with self._lock:
                 if self._speech is turn:
@@ -855,6 +876,8 @@ class Daemon:
         now = time.monotonic()
         with self._lock:
             idle = now - self._last_activity
+            speech_error = self._speech_error
+            speech_error_serial = self._speech_error_serial
         payload = {
             "version": __version__,
             "pid": os.getpid(),
@@ -865,6 +888,8 @@ class Daemon:
             "idle_limit": self._idle_seconds,
             "speaking": self._arbiter.speaking,
             "listening": self._arbiter.listening,
+            "speech_error": speech_error,
+            "speech_error_serial": speech_error_serial,
             "chrome_speak": settings.enabled(settings.KEY_SPEAK),
             "chrome_dictate": settings.enabled(settings.KEY_DICTATE),
             "tts": self._tts_status(),

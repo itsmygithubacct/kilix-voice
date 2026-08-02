@@ -173,6 +173,8 @@ class DaemonTestCase(unittest.TestCase):
         self.assertEqual(status["socket"], self.control)
         self.assertFalse(status["speaking"])
         self.assertFalse(status["listening"])
+        self.assertEqual(status["speech_error"], "")
+        self.assertEqual(status["speech_error_serial"], 0)
 
     def test_status_reports_every_missing_dependency(self) -> None:
         status = self.request({"op": "status"})["status"]
@@ -186,6 +188,50 @@ class DaemonTestCase(unittest.TestCase):
         self.assertIn("espeak", status["tts"]["detail"])
         self.assertIn("parec", status["capture"]["detail"])
         self.assertIn("pacat", status["playback"]["detail"])
+
+    def test_async_playback_failure_remains_visible_in_status(self) -> None:
+        """A detached daemon must not hide a sink failure on stderr only."""
+        synthesiser = pathlib.Path(self.nowhere) / "espeak-ng"
+        synthesiser.write_text(
+            f"#!{sys.executable}\n"
+            "import io, sys, wave\n"
+            "output = io.BytesIO()\n"
+            "with wave.open(output, 'wb') as wav:\n"
+            "    wav.setnchannels(1)\n"
+            "    wav.setsampwidth(2)\n"
+            "    wav.setframerate(22050)\n"
+            "    wav.writeframes(b'\\x01\\x00' * 4000)\n"
+            "sys.stdout.buffer.write(output.getvalue())\n",
+            encoding="utf-8",
+        )
+        synthesiser.chmod(0o755)
+        sink = pathlib.Path(self.nowhere) / "pacat"
+        sink.write_text(f"#!{sys.executable}\nraise SystemExit(23)\n",
+                        encoding="utf-8")
+        sink.chmod(0o755)
+
+        accepted = self.request({"op": "speak", "text": "test phrase"})
+        self.assertTrue(accepted["ok"], accepted)
+
+        deadline = time.monotonic() + REPLY_TIMEOUT_S
+        status = {}
+        while time.monotonic() < deadline:
+            status = self.request({"op": "status"})["status"]
+            if status["speech_error_serial"]:
+                break
+            time.sleep(POLL_S)
+        self.assertEqual(status["speech_error_serial"], 1, status)
+        self.assertIn("playback command", status["speech_error"])
+        self.assertIn("status 23", status["speech_error"])
+        self.assertFalse(status["speaking"], status)
+
+        # A later request clears the stale message before its worker runs; an
+        # old failure must not be reported as the result of a new click.
+        accepted = self.request({"op": "speak", "text": "another phrase"})
+        self.assertTrue(accepted["ok"], accepted)
+        status = self.request({"op": "status"})["status"]
+        self.assertEqual(status["speech_error"], "", status)
+        self.assertEqual(status["speech_error_serial"], 1, status)
 
     def test_status_names_the_missing_library_and_model(self) -> None:
         status = self.request({"op": "status"})["status"]
