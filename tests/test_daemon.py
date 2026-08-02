@@ -227,9 +227,20 @@ class DaemonTestCase(unittest.TestCase):
 
         # A later request clears the stale message before its worker runs; an
         # old failure must not be reported as the result of a new click.
+        sink.write_text(
+            f"#!{sys.executable}\nimport sys\nsys.stdin.buffer.read()\n",
+            encoding="utf-8",
+        )
+        sink.chmod(0o755)
         accepted = self.request({"op": "speak", "text": "another phrase"})
         self.assertTrue(accepted["ok"], accepted)
-        status = self.request({"op": "status"})["status"]
+        deadline = time.monotonic() + REPLY_TIMEOUT_S
+        while time.monotonic() < deadline:
+            status = self.request({"op": "status"})["status"]
+            if not status["speaking"]:
+                break
+            time.sleep(POLL_S)
+        self.assertFalse(status["speaking"], status)
         self.assertEqual(status["speech_error"], "", status)
         self.assertEqual(status["speech_error_serial"], 1, status)
 

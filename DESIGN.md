@@ -152,6 +152,10 @@ def validate_request(msg: dict, session_dir: str) -> dict
 
 Replies: `{"ok": true, "id": ...}` or `{"ok": false, "error": "..."}`.
 Dictation datagrams: `{"partial": str}`, `{"final": str}`, `{"error": str}`.
+Status carries `speech_error` plus a monotonically increasing
+`speech_error_serial`, because synthesis and playback finish after the speak
+request's connection has closed. A client polls those fields while speaking
+and can therefore show each detached worker failure exactly once.
 
 ### voicelib/audio.py
 
