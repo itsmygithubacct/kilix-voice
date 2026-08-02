@@ -71,6 +71,17 @@ Both TUIs also work as plain CLIs:
 ./kilix-stt --set stt_submit=confirm
 ```
 
+`make install PREFIX=/path` creates a self-contained runtime: the three
+commands land in `bin/`, while their exact `voicelib` package and `VERSION`
+land in `lib/kilix-voice/`. Installed commands therefore do not depend on the
+source checkout or an ambient `PYTHONPATH`.
+
+## Release history
+
+- **0.1.1** — make installed runtimes self-contained by packaging `voicelib`
+  and add an install-path execution regression test.
+- **0.1.0** — initial local read-aloud and click-to-talk dictation engine.
+
 ## Settings
 
 Kilix Voice does not have its own configuration file. It reads and writes the

@@ -32,11 +32,15 @@ import sys
 from collections.abc import Callable
 from typing import NamedTuple
 
-# A checkout runs as ./kilix-tts and an install is usually a symlink into
-# ~/.local/bin, so the package is looked for next to the *resolved* script.
+# A checkout runs as ./kilix-tts.  An installed runtime keeps its executable in
+# bin/ and its private Python package in lib/kilix-voice/, so support both
+# layouts without relying on an ambient PYTHONPATH.
 _HERE = os.path.dirname(os.path.realpath(os.path.abspath(__file__)))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+_INSTALLED_LIB = os.path.normpath(
+    os.path.join(_HERE, os.pardir, "lib", "kilix-voice"))
+for _package_root in (_INSTALLED_LIB, _HERE):
+    if _package_root not in sys.path:
+        sys.path.insert(0, _package_root)
 
 from voicelib import (  # noqa: E402  (the import follows the path bootstrap)
     __version__, audio, paths, protocol, settings, tts as tts_lib, tui_shell,
