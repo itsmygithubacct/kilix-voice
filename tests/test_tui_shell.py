@@ -82,6 +82,78 @@ class VoiceShellTests(unittest.TestCase):
 
         self.assert_shell(screen, "Kilix Voice · Read Aloud")
 
+    def test_suspended_source_is_explained_over_the_level_meter(self) -> None:
+        # A suspended source is the steady state of an input nobody records
+        # from, and the truth behind a meter that opens and stays at silence.
+        # The screen must say so instead of showing an unexplained flat bar.
+        module = load_script("kilix-stt", "kilix_stt_suspended_test")
+        ui = self._dictation_ui(module)
+        ui._section = module.SECTION_MICROPHONE
+        ui._pulse = module.PulseState(
+            (module.Source(
+                "alsa_input.pci-0000_00_1f.3.analog-stereo", False,
+                "SUSPENDED"),),
+            "alsa_input.pci-0000_00_1f.3.analog-stereo", "")
+
+        ui._draw()
+
+        text = ui._screen.text()
+        self.assertIn("is suspended", text)
+        self.assertIn("asleep because nothing", text)
+
+    def test_pactl_source_states_are_kept_not_discarded(self) -> None:
+        module = load_script("kilix-stt", "kilix_stt_states_test")
+        listing = (
+            "0\talsa_output.pci-0000_00_1f.3.analog-stereo.monitor\t"
+            "module-alsa-card.c\ts16le 2ch 48000Hz\tIDLE\n"
+            "1\talsa_input.pci-0000_00_1f.3.analog-stereo\t"
+            "module-alsa-card.c\ts16le 2ch 48000Hz\tSUSPENDED\n"
+        )
+
+        def fake_run_tool(argv):
+            if argv[:2] == ["pactl", "list"]:
+                return listing
+            return "Default Source: alsa_input.pci-0000_00_1f.3.analog-stereo\n"
+
+        original = module._run_tool
+        module._run_tool = fake_run_tool
+        try:
+            state = module.pulse_state()
+        finally:
+            module._run_tool = original
+
+        # Real inputs still come first, and each source carries the server's
+        # word for it so the screen can explain a silent meter.
+        self.assertEqual(
+            [source.state for source in state.sources],
+            ["SUSPENDED", "IDLE"])
+        self.assertEqual(state.sources[0].monitor, False)
+        self.assertEqual(state.sources[1].monitor, True)
+
+    def _dictation_ui(self, module):
+        ui = object.__new__(module.Ui)
+        ui._screen = Screen()
+        ui._glyphs = module.UNICODE_GLYPHS
+        ui._section = module.SECTION_DICTATION
+        ui._values = {
+            control.key: (
+                "1" if settings.truthy(settings.SPEC[control.key][0]) else "0"
+            ) if control.key in settings.BOOL_KEYS else str(
+                settings.SPEC[control.key][0]
+            )
+            for control in module.CONTROLS
+        }
+        ui._original = dict(ui._values)
+        ui._selected = [0] * len(module.SECTIONS)
+        ui._message = ""
+        ui._discard_armed = False
+        ui._pulse = module.PulseState((), "", "")
+        ui._daemon = None
+        ui._diagnostics = module.Diagnostics(
+            True, "parec", True, "libvosk", True, "model", "")
+        ui._mic = None
+        return ui
+
     def test_dictation_screen_uses_canonical_shell(self) -> None:
         module = load_script("kilix-stt", "kilix_stt_tui_test")
         ui = object.__new__(module.Ui)

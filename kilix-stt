@@ -214,6 +214,11 @@ class Source(NamedTuple):
 
     name: str
     monitor: bool
+    # The server's word for the source right now: RUNNING, IDLE or SUSPENDED
+    # ("" when the listing did not say). SUSPENDED is worth showing: it is the
+    # normal state of an input nobody is recording from, and the reason a
+    # level meter opened on a source that fails to wake shows only silence.
+    state: str = ""
 
 
 class PulseState(NamedTuple):
@@ -358,7 +363,8 @@ def pulse_state() -> PulseState:
         if not _STORABLE_DEVICE.match(name):
             unusable += 1
             continue
-        sources.append(Source(name, name.endswith(".monitor")))
+        state = fields[4].strip().upper() if len(fields) >= 5 else ""
+        sources.append(Source(name, name.endswith(".monitor"), state))
     default = ""
     info = _run_tool(["pactl", "info"])
     for line in (info or "").splitlines():
@@ -1086,6 +1092,13 @@ class Ui:
             cells[marker] = self._glyphs.gate
         return "".join(cells)
 
+    def _source_state(self, name: str) -> str:
+        """Return the server's state word for ``name``, or ""."""
+        for source in self._pulse.sources:
+            if source.name == name:
+                return source.state
+        return ""
+
     def _device_note(self, device: str) -> str:
         """Return the warning a source deserves, or ""."""
         if self._pulse.note:
@@ -1094,6 +1107,13 @@ class Ui:
         if name.endswith(".monitor"):
             return (f"{name} is a monitor: it records what the speakers are "
                     "playing, not what you say. Choose a real input.")
+        if self._source_state(name) == "SUSPENDED":
+            # The idle-input steady state, not a fault — but it is the truth
+            # behind a meter that opens on this source and stays at silence,
+            # so it belongs on screen instead of an unexplained flat bar.
+            return (f"{name} is suspended (asleep because nothing records "
+                    "from it). The test wakes it; a meter that stays at "
+                    "silence means it did not wake — press r to rescan.")
         if device == "default" and name:
             return f"the system default is {name}"
         return ""
@@ -1265,7 +1285,10 @@ class Ui:
             return
         # Asked again here rather than trusted from startup: the daemon may
         # have taken the microphone for a dictation turn in the meantime, and
-        # this is the moment that decision matters.
+        # this is the moment that decision matters. The source scan too — the
+        # note over the meter must describe the source the test is opening,
+        # not the one seen when the screen was drawn first.
+        self._pulse = pulse_state()
         self._daemon = daemon_status()
         if self._daemon is not None and self._daemon.get("listening"):
             self._message = ("kilix-voiced is dictating right now. Stop that "
