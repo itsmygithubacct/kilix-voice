@@ -10,7 +10,8 @@ Everything runs locally. No audio, text, or transcript ever leaves the machine.
 - `kilix-tts` — read-aloud: engine, voice, speaking rate, how much of the pane
   to read, and a test phrase
 - `kilix-stt` — dictation: input device, model, a live level meter and voice
-  activity readout for working out why it cannot hear you
+  activity readout for working out why it cannot hear you, plus explicit model
+  installation/default selection
 - `kilix-voiced` — the arbiter: one owner of the audio device, half-duplex, so
   opening the microphone stops speech instead of transcribing it
 
@@ -68,8 +69,18 @@ Both TUIs also work as plain CLIs:
 ```bash
 ./kilix-tts --print
 ./kilix-tts --set wpm=200
+./kilix-stt --models
+./kilix-stt --install lgraph-en-us --default lgraph-en-us
 ./kilix-stt --set stt_submit=confirm
 ```
+
+Opening `kilix-stt` only lists local state; it never downloads a model. On the
+Models tab, `i` hands the terminal to Kilix's checksum-pinned lazy installer,
+Enter pairs the selected model with its matching recognizer, and `s` saves the
+default. The catalog is `small-en-us` and `lgraph-en-us` for the runnable Vosk
+engine, plus `vibevoice-asr-bitnet`, whose shared weights are installed through
+Kilix Bonsai. VibeVoice can be installed and selected for forward compatibility,
+but this voice runtime does not yet run it and says so in both TUI and CLI output.
 
 `make install PREFIX=/path` creates a self-contained runtime: the three
 commands land in `bin/`, while their exact `voicelib` package and `VERSION`

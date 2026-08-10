@@ -156,27 +156,7 @@ class VoiceShellTests(unittest.TestCase):
 
     def test_dictation_screen_uses_canonical_shell(self) -> None:
         module = load_script("kilix-stt", "kilix_stt_tui_test")
-        ui = object.__new__(module.Ui)
-        ui._screen = Screen()
-        ui._glyphs = module.UNICODE_GLYPHS
-        ui._section = module.SECTION_DICTATION
-        ui._values = {
-            control.key: (
-                "1" if settings.truthy(settings.SPEC[control.key][0]) else "0"
-            ) if control.key in settings.BOOL_KEYS else str(
-                settings.SPEC[control.key][0]
-            )
-            for control in module.CONTROLS
-        }
-        ui._original = dict(ui._values)
-        ui._selected = [0] * len(module.SECTIONS)
-        ui._message = ""
-        ui._discard_armed = False
-        ui._pulse = module.PulseState((), "", "")
-        ui._daemon = None
-        ui._diagnostics = module.Diagnostics(
-            True, "parec", True, "libvosk", True, "model", "")
-        ui._mic = None
+        ui = self._dictation_ui(module)
 
         ui._draw()
 

@@ -17,14 +17,15 @@ written to disk, and the recorder stops on the same ceiling
 microphone until Space is pressed: starting this program touches no audio
 device, which is what lets it run on a machine that has none.
 
-Models are listed, never fetched.  This release shows each catalog id, its
-engine, its download size and where it belongs, so the download stays with
-Kilix's pinned installer instead of becoming an unattended network transfer
-inside a settings screen.
+Models are listed before they are fetched. An explicit install action hands the
+terminal to Kilix's pinned installer (or to the pinned Bonsai store for its
+shared VibeVoice weights); merely opening this screen never starts a transfer.
 
 It is also a plain CLI, which is what scripts and Kilix's own chrome use:
 
     kilix-stt --print
+    kilix-stt --models
+    kilix-stt --install lgraph-en-us --default lgraph-en-us
     kilix-stt --set device=alsa_input.pci-0000_00_1f.3.analog-stereo
     kilix-stt --set submit=confirm --set max_seconds=60
 """
@@ -38,6 +39,7 @@ import locale
 import math
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -79,12 +81,20 @@ MODELS = (
     ModelSpec("lgraph-en-us", stt_lib.ENGINE_VOSK, 130557655,
               "larger English graph: steadier on long dictation, slower to "
               "load and heavier on memory"),
-    ModelSpec("vibevoice-asr-bitnet", stt_lib.ENGINE_VIBEVOICE, 1695957664,
-              "for the VibeVoice recogniser, which arrives in a later "
-              "release; nothing in this one can run it"),
+    ModelSpec("vibevoice-asr-bitnet", stt_lib.ENGINE_VIBEVOICE, 1705771590,
+              "shared with Kilix Bonsai; its weights can be installed and "
+              "selected here, but this voice runtime cannot run them yet"),
 )
 
 MODEL_BY_ID = {spec.catalog_id: spec for spec in MODELS}
+
+MODEL_REQUIRED_FILES = {
+    stt_lib.ENGINE_VOSK: ("conf/model.conf", "am/final.mdl"),
+    stt_lib.ENGINE_VIBEVOICE: (
+        "vibeasr-lm-i2_s-embed-q6_k.gguf",
+        "vibeasr-vae-encoder-i8_s.gguf",
+    ),
+}
 
 
 class Control(NamedTuple):
@@ -186,11 +196,6 @@ POLL_FRAMES = 128            # frames drained per redraw: ~2.5 s of audio
 # rather than offered and then refused on save.
 _STORABLE_DEVICE = re.compile(r"^[A-Za-z0-9_.:+-]{1,128}$")
 
-# Paths shown inside a copy-pasteable command are quoted only when they need
-# it, so that a leading ~ still expands in the shell the user pastes into.
-_SHELL_SAFE = re.compile(r"^[A-Za-z0-9_@%+=:,./~-]+$")
-
-
 class Glyphs(NamedTuple):
     """Drawing characters, chosen once for the terminal's encoding."""
 
@@ -270,14 +275,6 @@ def tilde(path: str) -> str:
     if home and path.startswith(home + os.sep):
         return "~" + path[len(home):]
     return path
-
-
-def shell_path(path: str) -> str:
-    """Return ``path`` ready to paste into a shell, shortened where safe."""
-    short = tilde(path)
-    if _SHELL_SAFE.match(short):
-        return short
-    return "'" + path.replace("'", "'\\''") + "'"
 
 
 def dbfs(level: float) -> float:
@@ -415,6 +412,23 @@ def model_dir(catalog_id: str) -> str:
     return paths.model_dir(catalog_id)
 
 
+def model_payload_present(spec: ModelSpec, directory: str | None = None) -> bool:
+    """Return whether the files this model's engine needs are non-empty."""
+    target = directory or paths.model_dir(spec.catalog_id)
+    try:
+        if not os.path.isdir(target):
+            return False
+        return all(
+            os.path.isfile(os.path.join(target, relative))
+            and os.path.getsize(os.path.join(target, relative)) > 0
+            for relative in MODEL_REQUIRED_FILES[spec.engine]
+        )
+    except OSError:
+        # Installation publishes paths atomically, but a concurrent repair or
+        # manual removal can still race these two metadata probes.
+        return False
+
+
 def library_path() -> str:
     """Return the libvosk.so this machine would load."""
     candidate = os.environ.get(stt_lib.ENV_LIBRARY) or paths.libvosk_path()
@@ -424,17 +438,63 @@ def library_path() -> str:
     return candidate
 
 
-def install_command(spec: ModelSpec) -> str:
-    """Return the exact command that puts an unpacked model where we look.
+class ModelInstallError(RuntimeError):
+    """A requested model cannot be handed to Kilix's verified installer."""
 
-    kilix-stt downloads nothing: a settings screen is the wrong place for a
-    1.6 GiB unattended transfer, and the fetch belongs to Kilix's pinned
-    installer.  What it can do is name the destination exactly, so a model
-    fetched by any means ends up somewhere dictation will find it.
-    """
-    return (f"mkdir -p {shell_path(paths.models_dir())} && "
-            f"mv UNPACKED-MODEL-DIR "
-            f"{shell_path(paths.model_dir(spec.catalog_id))}")
+
+def kilix_launcher() -> str:
+    """Return the Kilix launcher that owns the pinned download closure."""
+    candidates = []
+    if home := os.environ.get("KILIX_HOME"):
+        candidates.append(os.path.join(home, "kilix"))
+    if installed := shutil.which("kilix"):
+        candidates.append(installed)
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    raise ModelInstallError(
+        "the Kilix launcher could not be found. Run this through `kilix stt`, "
+        "or set KILIX_HOME to the pinned Kilix checkout; kilix-stt will not "
+        "invent an unverified download path.")
+
+
+def model_install_argv(spec: ModelSpec) -> list[str]:
+    """Return the one verified installer command for a catalog entry."""
+    kilix = kilix_launcher()
+    if spec.engine == stt_lib.ENGINE_VIBEVOICE:
+        # Bonsai owns the file-level hashes and writes the exact directory the
+        # voice catalog resolves, so there is one copy of these large weights.
+        return [kilix, "bonsai", "pull", spec.catalog_id]
+    return [kilix, "voice", "install", "--model", spec.catalog_id]
+
+
+def install_command(spec: ModelSpec) -> str:
+    """Return the stable user-facing lazy-install command."""
+    return f"kilix stt --install {spec.catalog_id}"
+
+
+def install_model(spec: ModelSpec, screen=None) -> int:
+    """Run one explicit install, optionally lending it the curses terminal."""
+    argv = model_install_argv(spec)
+    if screen is not None:
+        curses.def_prog_mode()
+        curses.endwin()
+        print(f"\nInstalling {spec.catalog_id} ({human_bytes(spec.size)})…\n")
+    try:
+        status = subprocess.call(argv)
+    except OSError as error:
+        raise ModelInstallError(
+            f"could not run the model installer: {error}") from error
+    finally:
+        if screen is not None:
+            print("\nPress Enter to return to Kilix Voice… ", end="", flush=True)
+            try:
+                input()
+            except (EOFError, KeyboardInterrupt):
+                pass
+            screen.refresh()
+            curses.doupdate()
+    return status
 
 
 def capture_cfg(values: dict[str, str]) -> dict:
@@ -466,7 +526,8 @@ def diagnose(values: dict[str, str]) -> Diagnostics:
     model_id = values[settings.KEY_STT_MODEL]
     try:
         model = model_dir(model_id)
-        model_ok = os.path.isdir(model)
+        spec = MODEL_BY_ID.get(model_id)
+        model_ok = bool(spec and model_payload_present(spec, model))
     except paths.PathError as error:
         model, model_ok = str(error), False
 
@@ -788,15 +849,15 @@ def _print_models() -> None:
     active = settings.stt_model()
     for spec in MODELS:
         target = paths.model_dir(spec.catalog_id)
-        installed = os.path.isdir(target)
+        installed = model_payload_present(spec, target)
+        supported = spec.engine == stt_lib.ENGINE_VOSK
         print(f"model={spec.catalog_id} engine={spec.engine} "
               f"size={spec.size} human={human_bytes(spec.size)} "
               f"installed={'yes' if installed else 'no'} "
+              f"runtime_supported={'yes' if supported else 'no'} "
               f"selected={'yes' if spec.catalog_id == active else 'no'} "
               f"path={target}")
-        # kilix-stt downloads nothing, so the one thing it can offer for a
-        # missing model is exactly where an unpacked one has to end up.
-        if not installed and spec.engine == stt_lib.ENGINE_VOSK:
+        if not installed:
             print(f"install={install_command(spec)}")
 
 
@@ -1023,7 +1084,7 @@ class Ui:
         active = self._values[settings.KEY_STT_MODEL]
         lines = []
         for index, spec in enumerate(MODELS):
-            installed = os.path.isdir(paths.model_dir(spec.catalog_id))
+            installed = model_payload_present(spec)
             marker = "▶" if index == selected else " "
             line = (f"{marker} "
                     f"[{'x' if spec.catalog_id == active else ' '}] "
@@ -1158,7 +1219,7 @@ class Ui:
 
     def _model_line(self, spec: ModelSpec) -> str:
         target = paths.model_dir(spec.catalog_id)
-        if os.path.isdir(target):
+        if model_payload_present(spec, target):
             return f"installed at {tilde(target)}"
         override = os.environ.get(stt_lib.ENV_MODEL)
         if override:
@@ -1169,11 +1230,14 @@ class Ui:
 
     def _install_line(self, spec: ModelSpec) -> str:
         if spec.engine == stt_lib.ENGINE_VIBEVOICE:
-            return ("nothing in this release can load it; the VibeVoice "
-                    "recogniser arrives in a later phase.")
-        if os.path.isdir(paths.model_dir(spec.catalog_id)):
+            if model_payload_present(spec):
+                return ("weights installed; this voice runtime cannot run "
+                        "VibeVoice yet (Kilix Bonsai can transcribe with it).")
+            return (f"i installs the shared Bonsai weights; this voice runtime "
+                    "cannot run them yet.")
+        if model_payload_present(spec):
             return f"or point {stt_lib.ENV_MODEL} at another copy."
-        return install_command(spec)
+        return f"i installs it now · CLI: {install_command(spec)}"
 
     def _draw_detail(self, rows: Layout) -> None:
         """Explain what is selected, wrapped rather than cut off.
@@ -1209,7 +1273,8 @@ class Ui:
         elif self._section == SECTION_MODELS:
             help_text = (f"{glyphs.left}/{glyphs.right} tab {glyphs.dot} "
                          f"{glyphs.up}/{glyphs.down} move {glyphs.dot} Enter "
-                         f"use this model {glyphs.dot} s save {glyphs.dot} "
+                         f"make default {glyphs.dot} i install {glyphs.dot} "
+                         f"s save {glyphs.dot} "
                          "q quit")
         else:
             help_text = (f"{glyphs.left}/{glyphs.right} tab {glyphs.dot} "
@@ -1244,15 +1309,35 @@ class Ui:
     def _use_model(self) -> None:
         spec = MODELS[self._selected[SECTION_MODELS]]
         self._set_value(settings.KEY_STT_MODEL, spec.catalog_id)
-        engine = self._values[settings.KEY_STT_ENGINE]
-        if spec.engine != engine:
-            self._message = (
-                f"{spec.catalog_id} needs {settings.KEY_STT_ENGINE}="
-                f"{spec.engine}, and the recogniser is set to {engine}. "
-                "Change it on the Dictation tab.")
-        elif not os.path.isdir(paths.model_dir(spec.catalog_id)):
-            self._message = (f"{spec.catalog_id} is selected but not "
-                             "installed — the install command is below.")
+        self._set_value(settings.KEY_STT_ENGINE, spec.engine)
+        if not model_payload_present(spec):
+            self._message = (f"{spec.catalog_id} is the pending default but is "
+                             "not installed — press i to install it, then s to "
+                             "save.")
+        elif spec.engine == stt_lib.ENGINE_VIBEVOICE:
+            self._message = (f"{spec.catalog_id} is the pending default. Its "
+                             "weights are installed, but this voice runtime "
+                             "cannot run VibeVoice yet; s still saves the choice.")
+        else:
+            self._message = (f"{spec.catalog_id} and {spec.engine} are the "
+                             "pending defaults; press s to save.")
+
+    def _install_model(self) -> None:
+        spec = MODELS[self._selected[SECTION_MODELS]]
+        try:
+            status = install_model(spec, self._screen)
+        except ModelInstallError as error:
+            self._message = str(error)
+            return
+        self._rescan()
+        if status == 0 and model_payload_present(spec):
+            self._message = (f"Installed or verified {spec.catalog_id}. Enter "
+                             "makes it the default; s saves.")
+        elif status == 0:
+            self._message = (f"The installer completed, but {spec.catalog_id} "
+                             "is not visible at {tilde(paths.model_dir(spec.catalog_id))}.")
+        else:
+            self._message = f"The {spec.catalog_id} installer exited {status}."
 
     def _save(self) -> None:
         changes = {key: value for key, value in self._values.items()
@@ -1362,6 +1447,9 @@ class Ui:
                 self._cycle(-1)
         elif key in (ord("s"), ord("S")):
             self._save()
+        elif key in (ord("i"), ord("I")):
+            if self._section == SECTION_MODELS:
+                self._install_model()
         elif key in (ord("r"), ord("R")):
             self._rescan()
         elif key in (ord("q"), ord("Q"), 27):
@@ -1397,6 +1485,13 @@ def main(argv: list[str] | None = None) -> int:
                              "is missing")
     parser.add_argument("--models", action="store_true",
                         help="print the speech-model catalog")
+    parser.add_argument("--install", choices=tuple(MODEL_BY_ID),
+                        metavar="MODEL",
+                        help="install one model through Kilix's verified lazy "
+                             "installer")
+    parser.add_argument("--default", choices=tuple(MODEL_BY_ID),
+                        dest="default_model", metavar="MODEL",
+                        help="make one model and its matching engine the default")
     parser.add_argument("--set", action="append", default=[], dest="changes",
                         type=_parse_assignment, metavar="KEY=VALUE",
                         help="set one setting, for example submit=confirm "
@@ -1410,20 +1505,32 @@ def main(argv: list[str] | None = None) -> int:
 
     changes = dict(args.changes)
     try:
+        if args.install:
+            status = install_model(MODEL_BY_ID[args.install])
+            if status != 0:
+                return status
+        if args.default_model:
+            spec = MODEL_BY_ID[args.default_model]
+            changes.update({
+                settings.KEY_STT_MODEL: spec.catalog_id,
+                settings.KEY_STT_ENGINE: spec.engine,
+            })
         if changes:
             settings.update(changes)
         if args.show:
             _print_report()
         if args.models:
             _print_models()
-    except (settings.SettingsError, paths.PathError, OSError) as error:
+    except (ModelInstallError, settings.SettingsError, paths.PathError,
+            OSError) as error:
         parser.exit(1, f"kilix-stt: {error}\n")
-    if changes or args.show or args.models:
+    if changes or args.install or args.show or args.models:
         return 0
 
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.error("the interactive screen needs a terminal; use --print, "
-                     "--models, or --set KEY=VALUE")
+                     "--models, --install MODEL, --default MODEL, or --set "
+                     "KEY=VALUE")
     try:
         # curses encodes what it draws with the locale's encoding, so the
         # locale has to be adopted from the environment before initscr.
@@ -1435,7 +1542,8 @@ def main(argv: list[str] | None = None) -> int:
                               glyphs_for_terminal())
     except curses.error as error:
         print(f"kilix-stt: this terminal will not run the settings screen "
-              f"({error}). Use --print, --models, or --set KEY=VALUE instead.",
+              f"({error}). Use --print, --models, --install MODEL, --default "
+              "MODEL, or --set KEY=VALUE instead.",
               file=sys.stderr)
         return 1
     except KeyboardInterrupt:
