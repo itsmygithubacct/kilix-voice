@@ -21,7 +21,7 @@ import json
 import os
 import re
 
-from . import paths, settings
+from . import models, paths, settings
 from .util import cfg_get
 
 DEFAULT_RATE = 16000
@@ -45,9 +45,11 @@ MAX_FEED_BYTES = 1 << 20
 MIN_RATE = 4000
 MAX_RATE = 192000
 
-ENGINE_VOSK = "vosk"
-ENGINE_VIBEVOICE = "vibevoice"
-ENGINE_OFF = "off"
+# Kept as public aliases for callers that already import the recognizer module.
+# The data-only catalog owns the vocabulary from 0.1.3 onward.
+ENGINE_VOSK = models.ENGINE_VOSK
+ENGINE_VIBEVOICE = models.ENGINE_VIBEVOICE
+ENGINE_OFF = models.ENGINE_OFF
 
 # name -> (argtypes, restype).  This is the whole of the C surface kilix-voice
 # uses; nothing else in the library is called.

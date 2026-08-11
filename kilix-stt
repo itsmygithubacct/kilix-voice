@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import array
 import curses
+import json
 import locale
 import math
 import os
@@ -58,43 +59,17 @@ for _package_root in (_INSTALLED_LIB, _HERE):
         sys.path.insert(0, _package_root)
 
 from voicelib import (  # noqa: E402  (the import follows the path bootstrap)
-    __version__, audio, events, paths, protocol, settings, stt as stt_lib,
-    tui_shell)
+    __version__, audio, events, models as model_catalog, paths, protocol,
+    settings, stt as stt_lib, tui_shell)
 from voicelib.vad import Vad  # noqa: E402
 
 
-class ModelSpec(NamedTuple):
-    """One entry in the speech-model catalog."""
-
-    catalog_id: str
-    engine: str
-    size: int          # download size in bytes
-    summary: str
-
-
-# Sizes are the download sizes of the models DESIGN.md names, shown so a model
-# can be chosen before it is fetched rather than after.
-MODELS = (
-    ModelSpec("small-en-us", stt_lib.ENGINE_VOSK, 41205931,
-              "compact English model: the default, and the one that starts "
-              "fastest on a laptop"),
-    ModelSpec("lgraph-en-us", stt_lib.ENGINE_VOSK, 130557655,
-              "larger English graph: steadier on long dictation, slower to "
-              "load and heavier on memory"),
-    ModelSpec("vibevoice-asr-bitnet", stt_lib.ENGINE_VIBEVOICE, 1705771590,
-              "shared with Kilix Bonsai; its weights can be installed and "
-              "selected here, but this voice runtime cannot run them yet"),
-)
-
-MODEL_BY_ID = {spec.catalog_id: spec for spec in MODELS}
-
-MODEL_REQUIRED_FILES = {
-    stt_lib.ENGINE_VOSK: ("conf/model.conf", "am/final.mdl"),
-    stt_lib.ENGINE_VIBEVOICE: (
-        "vibeasr-lm-i2_s-embed-q6_k.gguf",
-        "vibeasr-vae-encoder-i8_s.gguf",
-    ),
-}
+# Public aliases keep the executable's tested module surface compatible while
+# all catalog data now lives in the installed voicelib package.
+ModelSpec = model_catalog.ModelSpec
+MODELS = model_catalog.MODELS
+MODEL_BY_ID = model_catalog.MODEL_BY_ID
+MODEL_REQUIRED_FILES = model_catalog.REQUIRED_FILES
 
 
 class Control(NamedTuple):
@@ -850,7 +825,7 @@ def _print_models() -> None:
     for spec in MODELS:
         target = paths.model_dir(spec.catalog_id)
         installed = model_payload_present(spec, target)
-        supported = spec.engine == stt_lib.ENGINE_VOSK
+        supported = spec.runtime_supported
         print(f"model={spec.catalog_id} engine={spec.engine} "
               f"size={spec.size} human={human_bytes(spec.size)} "
               f"installed={'yes' if installed else 'no'} "
@@ -859,6 +834,44 @@ def _print_models() -> None:
               f"path={target}")
         if not installed:
             print(f"install={install_command(spec)}")
+
+
+def _model_catalog_document() -> dict:
+    """Return the versioned, download-free model-control document.
+
+    This is the process boundary for desktop and shell consumers. It contains
+    only local state and immutable catalog metadata; installation remains an
+    explicit command supplied for each record.
+    """
+    active = settings.stt_model()
+    records = []
+    for spec in MODELS:
+        target = paths.model_dir(spec.catalog_id)
+        records.append({
+            "id": spec.catalog_id,
+            "engine": spec.engine,
+            "download_bytes": spec.size,
+            "download_size": human_bytes(spec.size),
+            "installed": model_payload_present(spec, target),
+            "runtime_supported": spec.runtime_supported,
+            "selected": spec.catalog_id == active,
+            "path": target,
+            "install_and_default_argv": [
+                "kilix", "stt", "--install", spec.catalog_id,
+                "--default", spec.catalog_id,
+            ],
+            "summary": spec.summary,
+        })
+    return {
+        "schema": model_catalog.CATALOG_SCHEMA,
+        "default_model": active,
+        "models": records,
+    }
+
+
+def _print_models_json() -> None:
+    """Print the stable speech-model control document as one JSON value."""
+    print(json.dumps(_model_catalog_document(), sort_keys=True))
 
 
 # -- the screen ------------------------------------------------------------
@@ -1485,6 +1498,9 @@ def main(argv: list[str] | None = None) -> int:
                              "is missing")
     parser.add_argument("--models", action="store_true",
                         help="print the speech-model catalog")
+    parser.add_argument("--json", action="store_true",
+                        help="with --models, emit the versioned machine-readable "
+                             "catalog contract")
     parser.add_argument("--install", choices=tuple(MODEL_BY_ID),
                         metavar="MODEL",
                         help="install one model through Kilix's verified lazy "
@@ -1503,6 +1519,9 @@ def main(argv: list[str] | None = None) -> int:
                         version=f"kilix-stt {__version__}")
     args = parser.parse_args(argv)
 
+    if args.json and not args.models:
+        parser.error("--json requires --models")
+
     changes = dict(args.changes)
     try:
         if args.install:
@@ -1520,7 +1539,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.show:
             _print_report()
         if args.models:
-            _print_models()
+            _print_models_json() if args.json else _print_models()
     except (ModelInstallError, settings.SettingsError, paths.PathError,
             OSError) as error:
         parser.exit(1, f"kilix-stt: {error}\n")

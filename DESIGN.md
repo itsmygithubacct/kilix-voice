@@ -97,6 +97,7 @@ Booleans are false for `"" 0 no false off disabled` (case-insensitive).
 | `voicelib/protocol.py` | control/dictation message encode/decode + validation |
 | `voicelib/audio.py` | `build_capture_cmd`, `MicCapture`, `build_play_cmd`, `Player`, `AudioError` |
 | `voicelib/vad.py` | `Vad` |
+| `voicelib/models.py` | canonical model/engine catalog and `kilix.speech.models/v1` schema |
 | `voicelib/stt.py` | `SttError`, `NullStt`, `VoskStt` (ctypes), `make_stt` |
 | `voicelib/tts.py` | `TtsError`, `NullTts`, `EspeakTts`, `SentenceChunker`, `condition_text`, `make_tts` |
 | `voicelib/arbiter.py` | half-duplex policy, single-owner session lock |

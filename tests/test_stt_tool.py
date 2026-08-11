@@ -6,6 +6,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import pathlib
 import sys
@@ -13,7 +14,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from voicelib import settings, stt
+from voicelib import models, settings, stt
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -45,6 +46,8 @@ class ModelCatalogTests(unittest.TestCase):
             tool.MODEL_BY_ID["vibevoice-asr-bitnet"].size,
             1705771590,
         )
+        self.assertIs(tool.MODELS, models.MODELS)
+        self.assertEqual(models.CATALOG_SCHEMA, "kilix.speech.models/v1")
 
     def test_vosk_models_use_the_pinned_voice_installer(self) -> None:
         with mock.patch.object(tool, "kilix_launcher", return_value="/kilix"):
@@ -78,6 +81,39 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertIn(
             "model=vibevoice-asr-bitnet engine=vibevoice", shown)
         self.assertIn("runtime_supported=no", shown)
+
+    def test_json_catalog_is_versioned_complete_and_download_free(self) -> None:
+        with tempfile.TemporaryDirectory() as root, mock.patch.dict(
+            os.environ,
+            {"KILIX_DATA_HOME": os.path.join(root, "data")},
+        ), mock.patch.object(tool, "install_model") as install:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(tool.main(["--models", "--json"]), 0)
+
+        install.assert_not_called()
+        document = json.loads(output.getvalue())
+        self.assertEqual(document["schema"], "kilix.speech.models/v1")
+        self.assertEqual(document["default_model"], "small-en-us")
+        records = {record["id"]: record for record in document["models"]}
+        self.assertEqual(tuple(records), tuple(tool.MODEL_BY_ID))
+        for catalog_id, spec in tool.MODEL_BY_ID.items():
+            with self.subTest(model=catalog_id):
+                record = records[catalog_id]
+                self.assertEqual(record["engine"], spec.engine)
+                self.assertEqual(record["download_bytes"], spec.size)
+                self.assertEqual(
+                    record["runtime_supported"], spec.runtime_supported)
+                self.assertEqual(record["install_and_default_argv"], [
+                    "kilix", "stt", "--install", catalog_id,
+                    "--default", catalog_id,
+                ])
+
+    def test_json_requires_the_catalog_action(self) -> None:
+        with self.assertRaises(SystemExit) as caught, mock.patch(
+                "sys.stderr", new=io.StringIO()):
+            tool.main(["--json"])
+        self.assertEqual(caught.exception.code, 2)
 
     def test_tui_install_repairs_vosk_even_when_model_directory_exists(self) -> None:
         with tempfile.TemporaryDirectory() as root, mock.patch.dict(

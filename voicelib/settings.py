@@ -19,7 +19,7 @@ import re
 import tempfile
 from collections.abc import Mapping
 
-from . import paths
+from . import models, paths
 
 
 class SettingsError(RuntimeError):
@@ -54,9 +54,8 @@ SPEC: dict[str, tuple[str, tuple[str, ...] | None]] = {
     KEY_TTS_RATE: ("170", ("120", "150", "170", "200", "240")),
     KEY_TTS_EXTENT: ("screen", ("screen", "scrollback", "selection")),
     KEY_TTS_MAX_CHARS: ("4000", ("1000", "4000", "16000", "unlimited")),
-    KEY_STT_ENGINE: ("vosk", ("vosk", "vibevoice", "off")),
-    KEY_STT_MODEL: ("small-en-us",
-                    ("small-en-us", "lgraph-en-us", "vibevoice-asr-bitnet")),
+    KEY_STT_ENGINE: (models.ENGINE_VOSK, models.ENGINE_CHOICES),
+    KEY_STT_MODEL: ("small-en-us", models.MODEL_IDS),
     # There is deliberately no "always": dictation never presses Enter for you.
     KEY_STT_SUBMIT: ("never", ("never", "confirm")),
     KEY_STT_MAX_SECONDS: ("30", ("15", "30", "60", "120")),

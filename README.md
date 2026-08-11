@@ -70,6 +70,7 @@ Both TUIs also work as plain CLIs:
 ./kilix-tts --print
 ./kilix-tts --set wpm=200
 ./kilix-stt --models
+./kilix-stt --models --json
 ./kilix-stt --install lgraph-en-us --default lgraph-en-us
 ./kilix-stt --set stt_submit=confirm
 ```
@@ -82,6 +83,14 @@ engine, plus `vibevoice-asr-bitnet`, whose shared weights are installed through
 Kilix Bonsai. VibeVoice can be installed and selected for forward compatibility,
 but this voice runtime does not yet run it and says so in both TUI and CLI output.
 
+`voicelib.models` is the canonical in-process catalog. Cross-process consumers
+use `kilix-stt --models --json`, whose `kilix.speech.models/v1` document
+reports immutable catalog metadata, local installed/default state, and the
+common install-and-default argv without opening the network. Installation
+remains a separate explicit action. This versioned CLI document is the 0.1.9
+compatibility boundary for the terminal chrome and desktop surfaces; consumers
+must reject an unknown schema rather than guessing at fields.
+
 `make install PREFIX=/path` creates a self-contained runtime: the three
 commands land in `bin/`, while their exact `voicelib` package and `VERSION`
 land in `lib/kilix-voice/`. Installed commands therefore do not depend on the
@@ -89,6 +98,8 @@ source checkout or an ambient `PYTHONPATH`.
 
 ## Release history
 
+- **0.1.3** — centralize the speech-model catalog and publish its download-free
+  `kilix.speech.models/v1` JSON control-plane contract.
 - **0.1.2** — expose asynchronous synthesis/playback failures through daemon
   status so detached read-aloud errors remain visible in Kilix.
 - **0.1.1** — make installed runtimes self-contained by packaging `voicelib`
