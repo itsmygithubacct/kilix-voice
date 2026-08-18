@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import selectors
@@ -92,6 +93,12 @@ JOIN_TIMEOUT_S = 5.0
 # One control request is one datagram. The ceiling is what stops a client from
 # making the daemon hold a scrollback-sized allocation per connection.
 MAX_REQUEST_BYTES = 1 << 20
+
+# Overrides are a small operator-authored document. Bound the read before JSON
+# parsing so a mistaken or hostile path cannot make startup consume the size of
+# an arbitrary file.
+MAX_CONFIG_BYTES = 1 << 20
+MAX_CONFIG_DEPTH = 32
 
 TtsEngine = tts_lib.NullTts | tts_lib.EspeakTts
 SttEngine = stt_lib.NullStt | stt_lib.VoskStt
@@ -152,16 +159,21 @@ class _DictationTurn:
 def _load_overrides(path: str) -> dict:
     """Return the JSON config layered over the shared settings."""
     try:
-        with open(path, encoding="utf-8") as handle:
-            raw = handle.read()
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_CONFIG_BYTES + 1)
     except OSError as error:
         raise DaemonError(
             f"cannot read the daemon config {path}: {error}. Point --config "
             f"(or {ENV_CONFIG}) at a readable JSON file, or drop it to use the "
             "shared Kilix settings alone.") from error
+    if len(raw) > MAX_CONFIG_BYTES:
+        raise DaemonError(
+            f"the daemon config {path} is larger than {MAX_CONFIG_BYTES} "
+            "bytes. Keep overrides small or point --config at the intended "
+            "JSON file.")
     try:
-        data = json.loads(raw)
-    except ValueError as error:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError) as error:
         raise DaemonError(
             f"{path} is not valid JSON: {error}. It must hold a single "
             'object, for example {"audio": {"play_cmd": ["cat"]}}.') from error
@@ -169,6 +181,19 @@ def _load_overrides(path: str) -> dict:
         raise DaemonError(
             f"{path} must contain a JSON object, got {type(data).__name__}. "
             'Wrap the settings, for example {"daemon": {"idle_seconds": 30}}.')
+    pending = [(data, 1)]
+    while pending:
+        value, depth = pending.pop()
+        if depth > MAX_CONFIG_DEPTH:
+            raise DaemonError(
+                f"the daemon config {path} is nested more than "
+                f"{MAX_CONFIG_DEPTH} levels. Flatten the override document.")
+        if isinstance(value, dict):
+            pending.extend((child, depth + 1) for child in value.values()
+                           if isinstance(child, (dict, list)))
+        elif isinstance(value, list):
+            pending.extend((child, depth + 1) for child in value
+                           if isinstance(child, (dict, list)))
     return data
 
 
@@ -180,6 +205,20 @@ def _merge(base: dict, extra: dict) -> dict:
         else:
             base[key] = value
     return base
+
+
+def _idle_timeout(raw: object) -> float:
+    """Return a finite non-negative idle timeout, or a stable config error."""
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError) as error:
+        raise DaemonError(
+            f"daemon.idle_seconds must be a number, got {raw!r}.") from error
+    if not math.isfinite(seconds) or seconds < 0:
+        raise DaemonError(
+            "daemon.idle_seconds must be finite and at least zero, got "
+            f"{raw!r}. Use 0 to keep the daemon running.")
+    return seconds
 
 
 def _connect_dictation(path: str) -> socket.socket:
@@ -227,9 +266,9 @@ class Daemon:
         self._cfg: dict = {}
         self._refresh_config()
         if idle_seconds is None:
-            idle_seconds = float(
-                util.cfg_get(self._cfg, "daemon.idle_seconds", IDLE_SECONDS))
-        self._idle_seconds = idle_seconds
+            idle_seconds = util.cfg_get(
+                self._cfg, "daemon.idle_seconds", IDLE_SECONDS)
+        self._idle_seconds = _idle_timeout(idle_seconds)
         self._session_dir = paths.session_dir()
         self._socket_path = paths.control_socket()
         # Lock ordering: this lock is always taken before the arbiter's and

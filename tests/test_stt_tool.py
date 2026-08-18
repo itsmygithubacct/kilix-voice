@@ -85,7 +85,11 @@ class ModelCatalogTests(unittest.TestCase):
     def test_json_catalog_is_versioned_complete_and_download_free(self) -> None:
         with tempfile.TemporaryDirectory() as root, mock.patch.dict(
             os.environ,
-            {"KILIX_DATA_HOME": os.path.join(root, "data")},
+            {
+                "KILIX_DATA_HOME": os.path.join(root, "data"),
+                "GPU_TERMINAL_SETTINGS_FILE": os.path.join(
+                    root, "settings.conf"),
+            },
         ), mock.patch.object(tool, "install_model") as install:
             output = io.StringIO()
             with contextlib.redirect_stdout(output):

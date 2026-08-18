@@ -49,6 +49,44 @@ class InstalledRuntimeTests(unittest.TestCase):
                     )
                     self.assertEqual(result.stdout.strip(), f"{tool} 0.1.3")
 
+            subprocess.run(
+                ["make", "uninstall", f"PREFIX={prefix}"],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            for tool in ("kilix-tts", "kilix-stt", "kilix-voiced"):
+                self.assertFalse((prefix / "bin" / tool).exists())
+            self.assertFalse((prefix / "lib" / "kilix-voice").exists())
+
+    def test_make_uninstall_refuses_a_modified_command(self):
+        with tempfile.TemporaryDirectory(prefix="kilix-voice-install-") as raw:
+            prefix = pathlib.Path(raw) / "prefix"
+            subprocess.run(
+                ["make", "install", f"PREFIX={prefix}"],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            changed = prefix / "bin" / "kilix-stt"
+            changed.write_text("foreign replacement\n", encoding="utf-8")
+
+            result = subprocess.run(
+                ["make", "uninstall", f"PREFIX={prefix}"],
+                cwd=ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("modified or foreign file", result.stderr)
+            self.assertTrue((prefix / "bin" / "kilix-tts").exists())
+            self.assertEqual(changed.read_text(encoding="utf-8"),
+                             "foreign replacement\n")
+
 
 if __name__ == "__main__":
     unittest.main()

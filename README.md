@@ -94,7 +94,8 @@ must reject an unknown schema rather than guessing at fields.
 `make install PREFIX=/path` creates a self-contained runtime: the three
 commands land in `bin/`, while their exact `voicelib` package and `VERSION`
 land in `lib/kilix-voice/`. Installed commands therefore do not depend on the
-source checkout or an ambient `PYTHONPATH`.
+source checkout or an ambient `PYTHONPATH`. `make uninstall PREFIX=/path`
+removes that exact runtime and refuses to remove files changed since install.
 
 ## Release history
 
