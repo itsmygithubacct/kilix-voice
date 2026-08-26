@@ -49,7 +49,11 @@ KEY_HISTORY = "KILIX_VOICE_HISTORY"
 SPEC: dict[str, tuple[str, tuple[str, ...] | None]] = {
     KEY_SPEAK: ("1", None),
     KEY_DICTATE: ("1", None),
-    KEY_TTS_ENGINE: ("espeak", ("espeak", "mbrola", "off")),
+    KEY_TTS_ENGINE: (
+        models.TTS_ENGINE_ESPEAK,
+        (models.TTS_ENGINE_ESPEAK, models.TTS_ENGINE_MBROLA,
+         models.ENGINE_OFF),
+    ),
     KEY_TTS_VOICE: ("en-us", None),
     KEY_TTS_RATE: ("170", ("120", "150", "170", "200", "240")),
     KEY_TTS_EXTENT: ("screen", ("screen", "scrollback", "selection")),

@@ -1,9 +1,10 @@
-"""Canonical local speech-model catalog for every Kilix Voice surface.
+"""Canonical local speech-model catalogs for every Kilix Voice surface.
 
 The catalog is deliberately data-only: importing it performs no filesystem,
 subprocess, audio, or network work. The TUI, CLI, settings validator, and
 machine-readable control-plane output all consume these same records. Other
-processes should use ``kilix-stt --models --json`` instead of importing this
+processes should use ``kilix-stt --models --json`` for recognition artifacts
+and ``kilix-tts --models`` for synthesis choices instead of importing this
 private package from another release closure.
 """
 
@@ -19,6 +20,9 @@ ENGINE_VIBEVOICE = "vibevoice"
 ENGINE_OFF = "off"
 ENGINE_CHOICES = (ENGINE_VOSK, ENGINE_VIBEVOICE, ENGINE_OFF)
 
+TTS_ENGINE_ESPEAK = "espeak"
+TTS_ENGINE_MBROLA = "mbrola"
+
 
 class ModelSpec(NamedTuple):
     """One immutable entry in the local speech-model catalog."""
@@ -26,6 +30,21 @@ class ModelSpec(NamedTuple):
     catalog_id: str
     engine: str
     size: int
+    runtime_supported: bool
+    summary: str
+
+
+class TtsModelSpec(NamedTuple):
+    """One synthesis family selectable by an untrusted speak request.
+
+    The ID is deliberately separate from the engine name.  They happen to be
+    equal for the two system synthesis families, while a future immutable
+    neural model ID will map to its shared runtime without widening the wire
+    protocol to arbitrary executable names or model paths.
+    """
+
+    catalog_id: str
+    engine: str
     runtime_supported: bool
     summary: str
 
@@ -63,6 +82,25 @@ MODELS = (
 MODEL_BY_ID = {spec.catalog_id: spec for spec in MODELS}
 MODEL_IDS = tuple(MODEL_BY_ID)
 
+TTS_MODELS = (
+    TtsModelSpec(
+        "espeak",
+        TTS_ENGINE_ESPEAK,
+        True,
+        "compact rule-based local speech with the installed eSpeak voices",
+    ),
+    TtsModelSpec(
+        "mbrola",
+        TTS_ENGINE_MBROLA,
+        True,
+        "local MBROLA diphone voices through eSpeak; explicit model requests "
+        "fail closed when the voice is absent",
+    ),
+)
+
+TTS_MODEL_BY_ID = {spec.catalog_id: spec for spec in TTS_MODELS}
+TTS_MODEL_IDS = tuple(TTS_MODEL_BY_ID)
+
 # A published model directory is installed only when every file its engine
 # needs exists and is non-empty. Installers publish these paths atomically; the
 # check still refuses half-copied or manually damaged payloads.
@@ -80,6 +118,11 @@ def engine_for_model(catalog_id: str) -> str:
     return MODEL_BY_ID[catalog_id].engine
 
 
+def tts_engine_for_model(catalog_id: str) -> str:
+    """Return the matching synthesizer, or raise ``KeyError`` for a bad ID."""
+    return TTS_MODEL_BY_ID[catalog_id].engine
+
+
 __all__ = [
     "CATALOG_SCHEMA",
     "ENGINE_CHOICES",
@@ -91,5 +134,12 @@ __all__ = [
     "MODEL_IDS",
     "ModelSpec",
     "REQUIRED_FILES",
+    "TTS_ENGINE_ESPEAK",
+    "TTS_ENGINE_MBROLA",
+    "TTS_MODELS",
+    "TTS_MODEL_BY_ID",
+    "TTS_MODEL_IDS",
+    "TtsModelSpec",
     "engine_for_model",
+    "tts_engine_for_model",
 ]

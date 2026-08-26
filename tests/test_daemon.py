@@ -244,6 +244,56 @@ class DaemonTestCase(unittest.TestCase):
         self.assertEqual(status["speech_error"], "", status)
         self.assertEqual(status["speech_error_serial"], 1, status)
 
+    def test_speak_applies_and_echoes_explicit_tts_selection(self) -> None:
+        """The wire choice reaches argv and is confirmed before audio runs."""
+        argv_log = os.path.join(self.root, "synth-argv.json")
+        synthesiser = pathlib.Path(self.nowhere) / "espeak-ng"
+        synthesiser.write_text(
+            f"#!{sys.executable}\n"
+            "import io, json, pathlib, sys, wave\n"
+            "sys.stdin.buffer.read()\n"
+            f"pathlib.Path({argv_log!r}).write_text("
+            "json.dumps(sys.argv[1:]), encoding='utf-8')\n"
+            "output = io.BytesIO()\n"
+            "with wave.open(output, 'wb') as wav:\n"
+            "    wav.setnchannels(1)\n"
+            "    wav.setsampwidth(2)\n"
+            "    wav.setframerate(22050)\n"
+            "    wav.writeframes(b'\\x01\\x00' * 1000)\n"
+            "sys.stdout.buffer.write(output.getvalue())\n",
+            encoding="utf-8",
+        )
+        synthesiser.chmod(0o755)
+        sink = pathlib.Path(self.nowhere) / "pacat"
+        sink.write_text(
+            f"#!{sys.executable}\nimport sys\nsys.stdin.buffer.read()\n",
+            encoding="utf-8",
+        )
+        sink.chmod(0o755)
+
+        accepted = self.request({
+            "op": "speak", "text": "selected voice", "model": "mbrola",
+            "voice": "us1", "rate": 200,
+        })
+        self.assertTrue(accepted["ok"], accepted)
+        self.assertEqual(accepted["model"], "mbrola")
+        self.assertEqual(accepted["voice"], "us1")
+        self.assertEqual(accepted["rate"], 200)
+
+        deadline = time.monotonic() + REPLY_TIMEOUT_S
+        status = {}
+        while time.monotonic() < deadline:
+            status = self.request({"op": "status"})["status"]
+            if not status["speaking"]:
+                break
+            time.sleep(POLL_S)
+        self.assertFalse(status["speaking"], status)
+        self.assertEqual(status["speech_error"], "", status)
+        argv = json.loads(pathlib.Path(argv_log).read_text(encoding="utf-8"))
+        self.assertEqual(argv, [
+            "-b", "1", "-v", "mb-us1", "-s", "200", "--stdout",
+        ])
+
     def test_status_names_the_missing_library_and_model(self) -> None:
         status = self.request({"op": "status"})["status"]
         library = os.path.join(self.data_dir, "lib", "current", "libvosk.so")
@@ -310,6 +360,15 @@ class DaemonTestCase(unittest.TestCase):
         self.assertIn("espeak", reply["error"])
         self.assertTrue(self.request({"op": "status"})["ok"],
                         "a failed speak must not take the daemon down")
+
+    def test_unregistered_tts_model_is_refused_before_synthesis(self) -> None:
+        reply = self.request({
+            "op": "speak", "text": "hello", "model": "../../qwen",
+            "voice": "en-us", "rate": 170,
+        })
+        self.assertFalse(reply["ok"], reply)
+        self.assertIn("registered local synthesizer", reply["error"])
+        self.assertFalse(self.request({"op": "status"})["status"]["speaking"])
 
     def test_an_unknown_op_is_refused_and_the_daemon_survives(self) -> None:
         reply = self.request({"op": "recite-poetry"})

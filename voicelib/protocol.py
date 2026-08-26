@@ -12,6 +12,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
+
+from . import models
 
 OP_SPEAK = "speak"
 OP_STOP_SPEECH = "stop-speech"
@@ -22,6 +25,14 @@ OP_STATUS = "status"
 OPS = (OP_SPEAK, OP_STOP_SPEECH, OP_DICTATE, OP_STOP_DICTATION, OP_STATUS)
 
 MAX_ID_CHARS = 64
+# AF_UNIX/SOCK_SEQPACKET has a platform message ceiling below the daemon's old
+# one-megabyte read guard.  This conservative bound is shared by clients and
+# the daemon so an oversized request is rejected explicitly instead of failing
+# at send(2) with an opaque EMSGSIZE.
+MAX_REQUEST_BYTES = 192 * 1024
+
+TTS_RATE_CHOICES = (120, 150, 170, 200, 240)
+_VOICE_TOKEN = re.compile(r"^[A-Za-z0-9_+-]{1,32}$")
 
 
 class ProtocolError(ValueError):
@@ -36,11 +47,11 @@ def encode(msg: dict) -> bytes:
             "Wrap the value, for example {'op': 'status'}.")
     try:
         line = json.dumps(msg, ensure_ascii=False, separators=(",", ":"))
-    except (TypeError, ValueError) as error:
+        return line.encode("utf-8") + b"\n"
+    except (TypeError, ValueError, UnicodeEncodeError) as error:
         raise ProtocolError(
             f"message is not JSON-serialisable ({error}). Use only str, int, "
             "float, bool, None, list and dict values.") from error
-    return line.encode("utf-8") + b"\n"
 
 
 def decode(raw: bytes | str) -> dict:
@@ -159,6 +170,29 @@ def validate_request(msg: dict, session_dir: str) -> dict:
                 '{"op":"speak","text":"…"}; the caller decides what the '
                 "extent setting means before it sends.")
         request["text"] = text
+        if "model" in msg:
+            model = msg.get("model")
+            if not isinstance(model, str) or model not in models.TTS_MODEL_IDS:
+                raise ProtocolError(
+                    f"'model' must be one of: {', '.join(models.TTS_MODEL_IDS)}. "
+                    "It selects a registered local synthesizer; executable "
+                    "paths and download URLs are never accepted.")
+            request["model"] = model
+        if "voice" in msg:
+            voice = msg.get("voice")
+            if not isinstance(voice, str) or not _VOICE_TOKEN.fullmatch(voice):
+                raise ProtocolError(
+                    "'voice' must be 1-32 characters from [A-Za-z0-9_+-], "
+                    "such as en-us or us1.")
+            request["voice"] = voice
+        if "rate" in msg:
+            rate = msg.get("rate")
+            if (not isinstance(rate, int) or isinstance(rate, bool)
+                    or rate not in TTS_RATE_CHOICES):
+                raise ProtocolError(
+                    f"'rate' must be one of: "
+                    f"{', '.join(map(str, TTS_RATE_CHOICES))} words per minute.")
+            request["rate"] = rate
     elif op == OP_DICTATE:
         request["sock"] = _validated_socket(msg.get("sock"), session_dir)
     return request

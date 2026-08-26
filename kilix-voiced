@@ -89,9 +89,9 @@ SPEECH_POLL_S = 0.05         # how often a speech turn notices a cancellation
 CAPTURE_POLL_S = 0.2
 JOIN_TIMEOUT_S = 5.0
 
-# One control request is one datagram. The ceiling is what stops a client from
-# making the daemon hold a scrollback-sized allocation per connection.
-MAX_REQUEST_BYTES = 1 << 20
+# One control request is one datagram. The shared ceiling both bounds the
+# allocation and stays below the platform's AF_UNIX/SOCK_SEQPACKET send limit.
+MAX_REQUEST_BYTES = protocol.MAX_REQUEST_BYTES
 
 TtsEngine = tts_lib.NullTts | tts_lib.EspeakTts
 SttEngine = stt_lib.NullStt | stt_lib.VoskStt
@@ -580,7 +580,9 @@ class Daemon:
 
     def _op_speak(self, request: dict) -> dict:
         self._refresh_config()
-        engine = tts_lib.make_tts(self._cfg)
+        engine = tts_lib.make_tts(
+            self._cfg, model=request.get("model"), voice=request.get("voice"),
+            rate=request.get("rate"))
         if isinstance(engine, tts_lib.EspeakTts):
             # A PATH lookup that launches nothing: better to answer "no
             # synthesiser, install this" now than to accept the request and
@@ -591,7 +593,9 @@ class Daemon:
         if not chunks:
             # A pane of nothing but box drawing conditions down to nothing;
             # silence is the right rendering of that, not a failure.
-            return protocol.reply_ok(request["id"], chunks=0)
+            return protocol.reply_ok(
+                request["id"], chunks=0, model=engine.model,
+                voice=engine.voice, rate=engine.rate)
         turn = _SpeechTurn(self._next_turn_id("speak"), chunks, engine)
         turn.thread = threading.Thread(
             target=self._run_speech, args=(turn,),
@@ -602,8 +606,9 @@ class Daemon:
             self._arbiter.begin_speech(turn.id)
             self._speech = turn
             self._start(turn.thread, self._cancel_speech)
-        return protocol.reply_ok(request["id"], turn=turn.id,
-                                 chunks=len(chunks))
+        return protocol.reply_ok(
+            request["id"], turn=turn.id, chunks=len(chunks),
+            model=engine.model, voice=engine.voice, rate=engine.rate)
 
     def _speech_chunks(self, text: str) -> list[str]:
         """Condition pane text and split it into clips worth synthesising."""
@@ -905,7 +910,8 @@ class Daemon:
         """Report read-aloud without launching anything."""
         engine = settings.tts_engine()
         if engine == "off":
-            return {"engine": engine, "available": False, "detail": (
+            return {"engine": engine, "model": engine,
+                    "available": False, "detail": (
                 "read-aloud is switched off. Set "
                 f"{settings.KEY_TTS_ENGINE}=espeak to enable it.")}
         voice = settings.tts_voice()
@@ -913,14 +919,15 @@ class Daemon:
             command = tts_lib.build_synth_cmd(self._cfg, voice=voice,
                                               rate=settings.tts_rate())
         except tts_lib.TtsError as error:
-            return {"engine": engine, "available": False, "voice": voice,
+            return {"engine": engine, "model": engine,
+                    "available": False, "voice": voice,
                     "detail": str(error)}
         detail = command[0]
         if engine == "mbrola":
             detail += (f"; the mb-{voice} voice is tried first and falls back "
                        "to plain espeak when it is not installed")
-        return {"engine": engine, "available": True, "voice": voice,
-                "detail": detail}
+        return {"engine": engine, "model": engine, "available": True,
+                "voice": voice, "detail": detail}
 
     def _stt_status(self) -> dict:
         """Report dictation without loading a model."""

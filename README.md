@@ -7,8 +7,8 @@ plus two standalone TUIs and the small daemon that owns the audio device.
 
 Everything runs locally. No audio, text, or transcript ever leaves the machine.
 
-- `kilix-tts` — read-aloud: engine, voice, speaking rate, how much of the pane
-  to read, and a test phrase
+- `kilix-tts` — read-aloud settings plus a scriptable speech command for
+  arbitrary text, standard input, and per-request model/voice/rate selection
 - `kilix-stt` — dictation: input device, model, a live level meter and voice
   activity readout for working out why it cannot hear you, plus explicit model
   installation/default selection
@@ -69,11 +69,26 @@ Both TUIs also work as plain CLIs:
 ```bash
 ./kilix-tts --print
 ./kilix-tts --set wpm=200
+./kilix-tts --models
+./kilix-tts --speak "Hello from Kilix"
+printf '%s\n' "Text from an agent" | \
+  ./kilix-tts --speak - --model mbrola --voice us1 --rate 200
 ./kilix-stt --models
 ./kilix-stt --models --json
 ./kilix-stt --install lgraph-en-us --default lgraph-en-us
 ./kilix-stt --set stt_submit=confirm
 ```
+
+`kilix-tts --speak` returns as soon as `kilix-voiced` accepts the turn; speech
+continues in the background and a new turn replaces it. `--model espeak` and
+`--model mbrola` are the currently registered local model families. A request
+may also override the voice and one of the shared WPM presets without changing
+the saved read-aloud settings. Model IDs are catalogued: callers cannot supply
+an executable, model path, URL, or download action. An explicit MBROLA request
+fails if its voice is unavailable; the longstanding saved MBROLA preference
+keeps its eSpeak fallback. Use `--speak -` for strict UTF-8 standard input.
+When running from a source checkout, start `./kilix-voiced` first; the main
+`kilix speak` wrapper starts an installed daemon on demand.
 
 Opening `kilix-stt` only lists local state; it never downloads a model. On the
 Models tab, `i` hands the terminal to Kilix's checksum-pinned lazy installer,
@@ -98,6 +113,9 @@ source checkout or an ambient `PYTHONPATH`.
 
 ## Release history
 
+- **0.1.4** — add arbitrary-text/stdin speech, safe per-request TTS
+  model/voice/rate selection, model discovery, and acknowledgement-loss stop
+  compensation to `kilix-tts`.
 - **0.1.3** — centralize the speech-model catalog and publish its download-free
   `kilix.speech.models/v1` JSON control-plane contract.
 - **0.1.2** — expose asynchronous synthesis/playback failures through daemon

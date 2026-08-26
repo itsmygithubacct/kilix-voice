@@ -1,7 +1,7 @@
 # kilix-voice — design & module contracts
 
-Read-aloud and dictation for Kilix. Ships two TUIs (`kilix-tts`, `kilix-stt`),
-one arbiter daemon (`kilix-voiced`), and `voicelib/`.
+Read-aloud and dictation for Kilix. Ships two TUI/CLI tools (`kilix-tts`,
+`kilix-stt`), one arbiter daemon (`kilix-voiced`), and `voicelib/`.
 
 This file is the **authoritative contract**. Implement what is written here.
 If a contract seems wrong, implement it as written and flag the concern —
@@ -85,6 +85,9 @@ Booleans are false for `"" 0 no false off disabled` (case-insensitive).
    should never emit these, but the sink is a PTY.
 4. **Nothing leaves the machine.** No network calls at runtime, ever.
 5. Sockets 0600, directories 0700, `SO_PEERCRED` uid checked on every accept.
+6. **A speak request selects only registered synthesis.** A caller may name a
+   catalogued model family, validated voice token, and preset rate. It can
+   never supply an executable, model path, URL, or download action.
 
 ## Files & ownership
 
@@ -97,12 +100,12 @@ Booleans are false for `"" 0 no false off disabled` (case-insensitive).
 | `voicelib/protocol.py` | control/dictation message encode/decode + validation |
 | `voicelib/audio.py` | `build_capture_cmd`, `MicCapture`, `build_play_cmd`, `Player`, `AudioError` |
 | `voicelib/vad.py` | `Vad` |
-| `voicelib/models.py` | canonical model/engine catalog and `kilix.speech.models/v1` schema |
+| `voicelib/models.py` | separate canonical STT artifact and request-selectable TTS model catalogs |
 | `voicelib/stt.py` | `SttError`, `NullStt`, `VoskStt` (ctypes), `make_stt` |
 | `voicelib/tts.py` | `TtsError`, `NullTts`, `EspeakTts`, `SentenceChunker`, `condition_text`, `make_tts` |
 | `voicelib/arbiter.py` | half-duplex policy, single-owner session lock |
 | `kilix-voiced` | daemon: control socket, request dispatch, idle exit |
-| `kilix-tts` | curses TUI |
+| `kilix-tts` | curses TUI plus arbitrary-text/stdin speech and model-selection CLI |
 | `kilix-stt` | curses TUI |
 
 ## Contracts
@@ -150,6 +153,15 @@ def validate_request(msg: dict, session_dir: str) -> dict
     # 'sock' (dictate only) MUST resolve inside session_dir -> else ProtocolError
     # returns a normalised copy with defaults applied
 ```
+
+One encoded control request is at most `MAX_REQUEST_BYTES` (192 KiB), which is
+below the local `AF_UNIX/SOCK_SEQPACKET` message ceiling. A `speak` request
+requires non-empty `text` and may additionally carry `model`, `voice`, and
+`rate`. `model` must be in `voicelib.models.TTS_MODEL_IDS`; `voice` must match
+`[A-Za-z0-9_+-]{1,32}`; and `rate` must be one of 120, 150, 170, 200, or 240.
+Unknown fields are dropped. An accepted speak reply echoes the effective model,
+voice, and rate so a new client can detect an older daemon that ignored its
+selection and issue a compensating stop.
 
 Replies: `{"ok": true, "id": ...}` or `{"ok": false, "error": "..."}`.
 Dictation datagrams: `{"partial": str}`, `{"final": str}`, `{"error": str}`.
@@ -242,8 +254,9 @@ raise `SttError` naming it as a later phase, not silently fall back.
 
 ```python
 class TtsError(RuntimeError): ...
-class NullTts:   name = "null"
+class NullTts:   name = "null"; model = "off"
 class EspeakTts: name = "espeak"     # espeak-ng --stdout, WAV parsed in memory
+    model: str                         # "espeak" or "mbrola"
     def synth(self, text: str) -> tuple[bytes, int]     # (s16le mono pcm, rate)
 
 class SentenceChunker:
@@ -251,7 +264,7 @@ class SentenceChunker:
     def flush(self) -> str
 
 def condition_text(text: str, *, max_chars: int | None) -> str
-def make_tts(cfg) -> object
+def make_tts(cfg, *, model=None, voice=None, rate=None) -> object
 ```
 
 `condition_text` is the read-aloud conditioner and must, in order:
@@ -262,7 +275,21 @@ appending `" …truncated"` when it cuts. It never raises on odd input.
 
 `EspeakTts` uses `mbrola` voices when `KILIX_VOICE_TTS_ENGINE=mbrola`
 (`-v mb-<voice>`), and **falls back to plain espeak-ng when the mbrola voice is
-unavailable** rather than failing the read.
+unavailable** rather than failing the read. That compatibility fallback applies
+to the saved preference only. An explicit per-request `model="mbrola"` is exact
+and fails closed rather than claiming it used a model that was unavailable.
+
+### kilix-tts CLI
+
+`--speak TEXT` sends arbitrary text through the same daemon, arbiter, engine,
+and sink as read-aloud; `--speak -` reads bounded strict UTF-8 from standard
+input. `--model`, `--voice`, and `--rate` are per-request overrides and do not
+rewrite shared settings. `--models` lists registered local model families and
+their current availability without opening the network or an audio device.
+Speech is a standalone action and cannot be combined with settings mutations or
+status actions. If acceptance is ambiguous or an older daemon fails to echo an
+explicit selection, the client sends a best-effort `stop-speech` before it
+reports the error.
 
 ### voicelib/arbiter.py
 

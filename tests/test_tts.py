@@ -15,7 +15,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from voicelib import settings, tts, util
+from voicelib import models, settings, tts, util
 
 # What kitty actually writes for an image: an APC introducer, key=value pairs,
 # ';', base64 payload, string terminator — chunked at 4096 encoded bytes.
@@ -426,6 +426,15 @@ class Synthesis(unittest.TestCase):
         engine.synth("second")
         self.assertEqual(fake.voices, ["mb-en-us", "en-us", "en-us"])
 
+    def test_explicit_mbrola_model_does_not_fall_back_to_espeak(self) -> None:
+        fake = self.engine(fail=("mb-us1",))
+        engine = tts.EspeakTts(
+            self.CFG, voice="us1", rate=170, mbrola=True,
+            mbrola_fallback=False)
+        with self.assertRaises(tts.TtsError):
+            engine.synth("hello")
+        self.assertEqual(fake.voices, ["mb-us1"])
+
     def test_a_failing_engine_raises_with_the_voice_to_check(self) -> None:
         self.engine(fail=("en-us",))
         engine = tts.EspeakTts(self.CFG, voice="en-us", rate=170)
@@ -495,6 +504,27 @@ class EngineSelection(unittest.TestCase):
             engine = tts.make_tts()
             with self.assertRaises(tts.TtsError):
                 engine.synth("hello")
+
+    def test_explicit_model_voice_and_rate_override_shared_settings(self) -> None:
+        self.write("off")
+        engine = tts.make_tts(model="mbrola", voice="us1", rate=200)
+        self.assertIsInstance(engine, tts.EspeakTts)
+        self.assertEqual(engine.model, "mbrola")
+        self.assertEqual(engine.voice, "us1")
+        self.assertEqual(engine.rate, 200)
+        self.assertTrue(engine.mbrola)
+
+    def test_each_catalogued_tts_model_selects_its_declared_engine(self) -> None:
+        for spec in models.TTS_MODELS:
+            with self.subTest(model=spec.catalog_id):
+                engine = tts.make_tts(model=spec.catalog_id)
+                self.assertEqual(engine.model, spec.catalog_id)
+
+    def test_unknown_explicit_model_is_never_treated_as_a_command(self) -> None:
+        with self.assertRaises(tts.TtsError) as caught:
+            tts.make_tts(model="/tmp/run-this")
+        self.assertIn("unknown TTS model", str(caught.exception))
+        self.assertIn("cannot be supplied", str(caught.exception))
 
 
 if __name__ == "__main__":

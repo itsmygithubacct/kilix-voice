@@ -304,6 +304,45 @@ class ValidateRequestTestCase(SessionTestCase):
         self.assertEqual(request, {"op": "speak", "id": "",
                                    "text": " hello\nworld "})
 
+    def test_speak_keeps_valid_model_voice_and_rate_overrides(self) -> None:
+        request = protocol.validate_request({
+            "op": "speak", "text": "hello", "model": "mbrola",
+            "voice": "us1", "rate": 200,
+        }, self.session)
+        self.assertEqual(request, {
+            "op": "speak", "id": "", "text": "hello",
+            "model": "mbrola", "voice": "us1", "rate": 200,
+        })
+
+    def test_speak_refuses_unregistered_models(self) -> None:
+        for model in (None, "", "qwen", "../../model", ["espeak"]):
+            with self.subTest(model=model):
+                with self.assertRaises(protocol.ProtocolError) as caught:
+                    protocol.validate_request({
+                        "op": "speak", "text": "hello", "model": model,
+                    }, self.session)
+                self.assertIn("registered local synthesizer",
+                              str(caught.exception))
+
+    def test_speak_refuses_unsafe_voice_tokens(self) -> None:
+        for voice in (None, "", "en us", "../../voice", "en-us;id",
+                      "x" * 33, ["en-us"]):
+            with self.subTest(voice=voice):
+                with self.assertRaises(protocol.ProtocolError) as caught:
+                    protocol.validate_request({
+                        "op": "speak", "text": "hello", "voice": voice,
+                    }, self.session)
+                self.assertIn("voice", str(caught.exception))
+
+    def test_speak_refuses_rates_outside_the_shared_presets(self) -> None:
+        for rate in (None, True, 0, 119, 171, 999, "170", 170.0):
+            with self.subTest(rate=rate):
+                with self.assertRaises(protocol.ProtocolError) as caught:
+                    protocol.validate_request({
+                        "op": "speak", "text": "hello", "rate": rate,
+                    }, self.session)
+                self.assertIn("words per minute", str(caught.exception))
+
     def test_speak_requires_non_empty_text(self) -> None:
         for text in (None, "", "   ", "\n\t", 3, ["hello"], True):
             with self.subTest(text=text):
@@ -334,7 +373,7 @@ class ValidateRequestTestCase(SessionTestCase):
         # including a 'sock' smuggled in on an op that never validates one.
         request = protocol.validate_request(
             {"op": "speak", "text": "hi", "sock": "/etc/evil.sock",
-             "cmd": "rm -rf /", "rate": 999}, self.session)
+             "cmd": "rm -rf /", "pitch": 999}, self.session)
         self.assertEqual(set(request), {"op", "id", "text"})
 
         request = protocol.validate_request(

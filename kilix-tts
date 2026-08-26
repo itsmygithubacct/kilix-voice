@@ -18,6 +18,8 @@ As a CLI, for scripts and for terminals that cannot run curses:
     kilix-tts --print
     kilix-tts --status
     kilix-tts --set wpm=200 --set voice=en-gb
+    kilix-tts --speak "Hello from Kilix"
+    printf '%s' "Longer text" | kilix-tts --speak - --model espeak
 """
 
 from __future__ import annotations
@@ -43,8 +45,8 @@ for _package_root in (_INSTALLED_LIB, _HERE):
         sys.path.insert(0, _package_root)
 
 from voicelib import (  # noqa: E402  (the import follows the path bootstrap)
-    __version__, audio, paths, protocol, settings, tts as tts_lib, tui_shell,
-    util)
+    __version__, audio, models, paths, protocol, settings, tts as tts_lib,
+    tui_shell, util)
 
 # A reply is a status payload at most, and the daemon answers a read as soon as
 # it is queued rather than when it finishes speaking, so neither of these has to
@@ -79,6 +81,11 @@ _OFF_WORDS = ("0", "off", "no", "false", "disable", "disabled")
 
 class VoiceToolError(RuntimeError):
     """kilix-tts cannot do what was asked; the message says what to do."""
+
+    def __init__(self, message: str, *, request_may_be_active: bool = False
+                 ) -> None:
+        super().__init__(message)
+        self.request_may_be_active = request_may_be_active
 
 
 # --------------------------------------------------------------------------
@@ -182,6 +189,16 @@ def control(request: dict, timeout: float = CONTROL_TIMEOUT_S) -> dict:
     a screen somebody is reading never holds the control socket open against
     the pane that actually wants to speak.
     """
+    try:
+        packet = protocol.encode(request)
+    except protocol.ProtocolError as error:
+        raise VoiceToolError(str(error)) from error
+    if len(packet) > protocol.MAX_REQUEST_BYTES:
+        raise VoiceToolError(
+            f"the encoded voice request is {len(packet)} bytes; the local "
+            f"control-packet limit is {protocol.MAX_REQUEST_BYTES}. Send "
+            "shorter text or split it into several speak requests.")
+
     path = paths.control_socket()
     endpoint = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     try:
@@ -210,32 +227,36 @@ def control(request: dict, timeout: float = CONTROL_TIMEOUT_S) -> dict:
                 "this version, or point KILIX_SESSION_HOME at a shorter path "
                 "you own — a unix socket path is limited to about 100 "
                 "characters.") from error
+        attempted_send = False
         try:
-            endpoint.send(protocol.encode(request))
+            attempted_send = True
+            endpoint.send(packet)
             raw = endpoint.recv(MAX_REPLY_BYTES)
         except TimeoutError as error:
             raise VoiceToolError(
                 f"kilix-voiced did not answer within {timeout:.0f} seconds. It "
                 "may be stuck on an audio device: check `pactl info`, or stop "
-                "the daemon and start it again.") from error
+                "the daemon and start it again.",
+                request_may_be_active=attempted_send) from error
         except OSError as error:
             raise VoiceToolError(
                 f"kilix-voiced closed the connection: {error}. Its stderr says "
-                "why it refused the request.") from error
+                "why it refused the request.",
+                request_may_be_active=attempted_send) from error
     finally:
         endpoint.close()
     if not raw:
         raise VoiceToolError(
             "kilix-voiced accepted the connection and closed it without "
             "replying. It only serves the user it runs as — check its stderr, "
-            "and that it is your own daemon.")
+            "and that it is your own daemon.", request_may_be_active=True)
     try:
         reply = protocol.decode(raw)
     except protocol.ProtocolError as error:
         raise VoiceToolError(
             f"kilix-voiced sent a reply this version cannot read ({error}). "
             "Check that kilix-tts and kilix-voiced come from the same "
-            "installation.") from error
+            "installation.", request_may_be_active=True) from error
     if not reply.get("ok"):
         raise VoiceToolError(str(reply.get("error") or (
             "kilix-voiced refused the request without saying why. Its stderr "
@@ -351,16 +372,71 @@ def test_phrase() -> str:
             f"at {settings.tts_rate()} words per minute.")
 
 
-def speak_test() -> str:
-    """Ask the daemon to read the test phrase; return what happened."""
-    reply = control({"op": protocol.OP_SPEAK, "text": test_phrase(),
-                     "id": "kilix-tts"})
+def speak_text(text: str, *, model: str | None = None,
+               voice: str | None = None,
+               rate: int | None = None) -> str:
+    """Ask the daemon to speak caller-supplied text with safe overrides."""
+    if not isinstance(text, str) or not text.strip():
+        raise VoiceToolError("nothing to read aloud: speech text is empty")
+    request: dict = {"op": protocol.OP_SPEAK, "text": text,
+                     "id": "kilix-tts"}
+    requested = {"model": model, "voice": voice, "rate": rate}
+    request.update({key: value for key, value in requested.items()
+                    if value is not None})
+    try:
+        request = protocol.validate_request(request, paths.session_dir())
+    except protocol.ProtocolError as error:
+        raise VoiceToolError(str(error)) from error
+    try:
+        reply = control(request)
+    except VoiceToolError as error:
+        if not error.request_may_be_active:
+            raise
+        stopped = _compensate_speech()
+        outcome = ("a stop request was confirmed"
+                   if stopped else "a stop request could not be confirmed")
+        raise VoiceToolError(f"{error} Because acceptance was uncertain, "
+                             f"{outcome}.") from error
+
+    # An older daemon would discard fields it does not know and speak with the
+    # configured default.  That is acceptable for a request with no override,
+    # but never for an explicit model/voice choice. Silence the possibly active
+    # turn before reporting the incompatible installation.
+    mismatched = [key for key, value in requested.items()
+                  if value is not None and reply.get(key) != value]
+    if mismatched:
+        stopped = _compensate_speech()
+        outcome = ("the unconfirmed turn was stopped"
+                   if stopped else "the unconfirmed turn may still be active")
+        raise VoiceToolError(
+            "kilix-voiced did not confirm the requested "
+            f"{', '.join(mismatched)}. Install matching kilix-tts and "
+            f"kilix-voiced versions; {outcome}.")
+
     chunks = reply.get("chunks") or 0
     if not chunks:
         return ("kilix-voiced had nothing to say: the phrase conditioned down "
                 "to nothing.")
-    return (f"Speaking {chunks} clip{'' if chunks == 1 else 's'} — "
+    selected_model = reply.get("model") or settings.tts_engine()
+    selected_voice = reply.get("voice") or settings.tts_voice()
+    selected_rate = reply.get("rate") or settings.tts_rate()
+    return (f"Speaking {chunks} clip{'' if chunks == 1 else 's'} with "
+            f"{selected_model}/{selected_voice} at {selected_rate} wpm — "
             "\"Stop speaking now\" cuts it short.")
+
+
+def speak_test() -> str:
+    """Ask the daemon to read the test phrase; return what happened."""
+    return speak_text(test_phrase())
+
+
+def _compensate_speech() -> bool:
+    """Best-effort stop after a speak whose exact acceptance is unknown."""
+    try:
+        control({"op": protocol.OP_STOP_SPEECH, "id": "kilix-tts"})
+    except VoiceToolError:
+        return False
+    return True
 
 
 def stop_speech() -> str:
@@ -889,15 +965,74 @@ def _print_status() -> None:
     print(f"output_detail={status.output_detail}")
 
 
+def _print_models() -> None:
+    """List safe request-selectable synthesis families without networking."""
+    synthesizer = tts_lib.espeak_binary()
+    mbrola = util.which("mbrola")
+    voice_count = len(discover_voices()) if synthesizer else 0
+    selected = settings.tts_engine()
+    for spec in models.TTS_MODELS:
+        if spec.engine == models.TTS_ENGINE_ESPEAK:
+            available = synthesizer is not None
+            detail = (f"{voice_count} installed eSpeak voice names"
+                      if available else "install espeak-ng")
+        else:
+            available = synthesizer is not None and mbrola is not None
+            detail = ("MBROLA runtime found; each requested voice must also "
+                      "be installed" if available else
+                      "install espeak-ng, mbrola, and an MBROLA voice package")
+        print(
+            f"model={spec.catalog_id} engine={spec.engine} "
+            f"available={'yes' if available else 'no'} "
+            f"selected={'yes' if selected == spec.engine else 'no'}")
+        print(f"  {spec.summary}; {detail}")
+
+
+def _stdin_speech_text() -> str:
+    """Read one bounded, strict-UTF-8 speech request from standard input."""
+    stream = getattr(sys.stdin, "buffer", sys.stdin)
+    raw = stream.read(protocol.MAX_REQUEST_BYTES + 1)
+    if isinstance(raw, str):
+        try:
+            encoded = raw.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise VoiceToolError(
+                f"standard input is not valid UTF-8 text ({error})") from error
+        text = raw
+    else:
+        encoded = bytes(raw)
+        try:
+            text = encoded.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise VoiceToolError(
+                f"standard input is not valid UTF-8 ({error})") from error
+    if len(encoded) > protocol.MAX_REQUEST_BYTES:
+        raise VoiceToolError(
+            f"standard input is larger than the "
+            f"{protocol.MAX_REQUEST_BYTES}-byte local request limit. Split it "
+            "into several speak requests.")
+    return text
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="kilix-tts",
-        description="Configure Kilix read-aloud, and test it through "
-                    "kilix-voiced.")
+        description="Configure Kilix read-aloud, or speak supplied text "
+                    "through kilix-voiced.")
     parser.add_argument("--print", action="store_true", dest="show",
                         help="print the effective read-aloud settings")
     parser.add_argument("--status", action="store_true",
                         help="print what kilix-voiced and this machine can do")
+    parser.add_argument("--models", action="store_true",
+                        help="list request-selectable local TTS model families")
+    parser.add_argument("--speak", metavar="TEXT",
+                        help="speak arbitrary text; use - to read UTF-8 stdin")
+    parser.add_argument("--model", choices=models.TTS_MODEL_IDS,
+                        help="model family for this --speak request")
+    parser.add_argument("--voice", metavar="NAME",
+                        help="voice for this --speak request, such as en-us")
+    parser.add_argument("--rate", type=int, choices=protocol.TTS_RATE_CHOICES,
+                        metavar="WPM", help="rate for this --speak request")
     parser.add_argument("--set", action="append", default=[],
                         type=_parse_assignment, metavar="NAME=VALUE",
                         help="set one setting, for example wpm=200, "
@@ -911,6 +1046,32 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     changes = dict(args.set)
+    speech_overrides = (args.model, args.voice, args.rate)
+    if args.speak is None and any(value is not None
+                                  for value in speech_overrides):
+        parser.error("--model, --voice and --rate require --speak TEXT")
+    if args.speak is not None and (changes or args.show or args.status
+                                   or args.models
+                                   or args.section is not None):
+        parser.error("--speak is a standalone action; do not combine it with "
+                     "--set, --print, --status, --models or --section")
+    if args.models and (changes or args.show or args.status
+                        or args.section is not None):
+        parser.error("--models is a standalone action")
+
+    if args.speak is not None:
+        try:
+            text = (_stdin_speech_text() if args.speak == "-"
+                    else args.speak)
+            print(speak_text(text, model=args.model, voice=args.voice,
+                             rate=args.rate))
+        except VoiceToolError as error:
+            parser.exit(1, f"kilix-tts: {error}\n")
+        return 0
+    if args.models:
+        _print_models()
+        return 0
+
     if changes:
         try:
             settings.update(changes)
@@ -926,13 +1087,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.error("the interactive screen needs a terminal; use --print, "
-                     "--status, or --set NAME=VALUE")
+                     "--status, --models, --speak TEXT, or --set NAME=VALUE")
     try:
         return curses.wrapper(_run_tui, args.section)
     except curses.error as error:
         parser.exit(1, f"kilix-tts: this terminal will not run a curses "
-                       f"screen ({error}). Use --print, --status or --set "
-                       f"instead.\n")
+                       f"screen ({error}). Use --print, --status, --models, "
+                       f"--speak or --set instead.\n")
     except KeyboardInterrupt:
         return 0
 

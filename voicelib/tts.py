@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 import subprocess
 
-from . import settings, util
+from . import models, settings, util
 
 # espeak-ng writes 22.05 kHz mono at --stdout. The real rate always comes from
 # the WAV header; this is only what an empty clip is labelled with.
@@ -326,6 +326,9 @@ class NullTts:
     """
 
     name = "null"
+    model = "off"
+    voice = ""
+    rate = 0
 
     def synth(self, text: str) -> tuple[bytes, int]:
         """Return an empty clip regardless of ``text``."""
@@ -397,12 +400,16 @@ class EspeakTts:
     name = "espeak"
 
     def __init__(self, cfg: dict | None = None, *, voice: str | None = None,
-                 rate: int | None = None, mbrola: bool = False) -> None:
+                 rate: int | None = None, mbrola: bool = False,
+                 mbrola_fallback: bool = True) -> None:
         self._cfg = cfg or {}
         self.voice = self._checked_voice(
             settings.tts_voice() if voice is None else voice)
         self.rate = int(settings.tts_rate() if rate is None else rate)
         self.mbrola = bool(mbrola)
+        self._mbrola_fallback = bool(mbrola_fallback)
+        self.model = (models.TTS_ENGINE_MBROLA if self.mbrola
+                      else models.TTS_ENGINE_ESPEAK)
         # Set when an mbrola voice turns out not to be installed, so a TUI can
         # explain why the voice sounds like plain espeak.
         self.mbrola_error = ""
@@ -429,6 +436,8 @@ class EspeakTts:
             try:
                 return self._run(clean, f"mb-{self.voice}")
             except TtsError as error:
+                if not self._mbrola_fallback:
+                    raise
                 # A quality tier that is not installed must never lose a read.
                 # Remembering the failure keeps the rest of the page from
                 # paying for a doomed process once per sentence.
@@ -476,17 +485,34 @@ class EspeakTts:
                 f"{_failure_hint(command[0], voice)}.") from error
 
 
-def make_tts(cfg: dict | None = None) -> NullTts | EspeakTts:
-    """Return the engine the shared settings select.
+def make_tts(cfg: dict | None = None, *, model: str | None = None,
+             voice: str | None = None,
+             rate: int | None = None) -> NullTts | EspeakTts:
+    """Return the selected engine, with optional request-scoped overrides.
 
     Construction deliberately does not probe for espeak-ng: a missing
     synthesiser has to degrade the read at the moment it is asked for, with a
     message saying how to install it, rather than stop a TUI or the daemon
     from starting at all.
     """
-    engine = settings.tts_engine()
+    if model is None:
+        engine = settings.tts_engine()
+    else:
+        try:
+            engine = models.tts_engine_for_model(model)
+        except KeyError as error:
+            raise TtsError(
+                f"unknown TTS model {model!r}; choose one of: "
+                f"{', '.join(models.TTS_MODEL_IDS)}. Model paths and commands "
+                "cannot be supplied by a speak request.") from error
     if engine == "off":
         return NullTts()
     # settings.tts_engine() validates against the vocabulary, so anything that
     # is not "off" is espeak, with or without the mbrola tier on top.
-    return EspeakTts(cfg, mbrola=(engine == "mbrola"))
+    return EspeakTts(
+        cfg, voice=voice, rate=rate,
+        mbrola=(engine == models.TTS_ENGINE_MBROLA),
+        # The longstanding persistent mbrola setting is a preferred quality
+        # tier and keeps its eSpeak fallback. An explicit request model is an
+        # exact choice: failure must be reported rather than disguised.
+        mbrola_fallback=(model is None))
