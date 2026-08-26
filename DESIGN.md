@@ -102,7 +102,7 @@ Booleans are false for `"" 0 no false off disabled` (case-insensitive).
 | `voicelib/vad.py` | `Vad` |
 | `voicelib/models.py` | separate canonical STT artifact and request-selectable TTS model catalogs |
 | `voicelib/stt.py` | `SttError`, `NullStt`, `VoskStt` (ctypes), `make_stt` |
-| `voicelib/tts.py` | `TtsError`, `NullTts`, `EspeakTts`, `SentenceChunker`, `condition_text`, `make_tts` |
+| `voicelib/tts.py` | `TtsError`, engines, conditioning/chunking, `make_tts`, complete in-memory rendering |
 | `voicelib/arbiter.py` | half-duplex policy, single-owner session lock |
 | `kilix-voiced` | daemon: control socket, request dispatch, idle exit |
 | `kilix-tts` | curses TUI plus arbitrary-text/stdin speech and model-selection CLI |
@@ -254,6 +254,9 @@ raise `SttError` naming it as a later phase, not silently fall back.
 
 ```python
 class TtsError(RuntimeError): ...
+class RenderedSpeech(NamedTuple):
+    pcm: bytes; sample_rate: int; chunks: int
+    model: str; voice: str; rate: int
 class NullTts:   name = "null"; model = "off"
 class EspeakTts: name = "espeak"     # espeak-ng --stdout, WAV parsed in memory
     model: str                         # "espeak" or "mbrola"
@@ -264,7 +267,10 @@ class SentenceChunker:
     def flush(self) -> str
 
 def condition_text(text: str, *, max_chars: int | None) -> str
+def speech_chunks(text: str, *, max_chars: int | None) -> list[str]
 def make_tts(cfg, *, model=None, voice=None, rate=None) -> object
+def render_text(text, *, model=None, voice=None, rate=None,
+                max_chars=None, cfg=None) -> RenderedSpeech
 ```
 
 `condition_text` is the read-aloud conditioner and must, in order:
@@ -290,6 +296,12 @@ Speech is a standalone action and cannot be combined with settings mutations or
 status actions. If acceptance is ambiguous or an older daemon fails to echo an
 explicit selection, the client sends a best-effort `stop-speech` before it
 reports the error.
+
+`--output FILE` / `--save FILE` changes that same speech action from playback
+to synchronous file rendering. Only `.wav` and `.mp3` suffixes are accepted;
+MP3 uses an installed local `ffmpeg` or `lame`, never the network. Export does
+not contact the daemon or open an audio device. It uses `render_text`, refuses
+mixed sample rates, writes mode 0600, and refuses to replace an existing path.
 
 ### voicelib/arbiter.py
 

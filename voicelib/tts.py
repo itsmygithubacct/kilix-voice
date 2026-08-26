@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from typing import NamedTuple
 
 from . import models, settings, util
 
@@ -46,6 +47,17 @@ _VOICE_TOKEN = re.compile(r"^[A-Za-z0-9_+-]{1,32}$")
 
 class TtsError(RuntimeError):
     """Synthesis failed; the message says what to do about it."""
+
+
+class RenderedSpeech(NamedTuple):
+    """One complete in-memory rendering, ready for a file container."""
+
+    pcm: bytes
+    sample_rate: int
+    chunks: int
+    model: str
+    voice: str
+    rate: int
 
 
 # --------------------------------------------------------------------------
@@ -312,6 +324,17 @@ class SentenceChunker:
         return tail
 
 
+def speech_chunks(text: str, *, max_chars: int | None) -> list[str]:
+    """Condition one speech turn and return its bounded synthesis clips."""
+    conditioned = condition_text(text, max_chars=max_chars)
+    chunker = SentenceChunker()
+    chunks = chunker.feed(conditioned)
+    tail = chunker.flush()
+    if tail:
+        chunks.append(tail)
+    return chunks
+
+
 # --------------------------------------------------------------------------
 # Engines
 # --------------------------------------------------------------------------
@@ -516,3 +539,33 @@ def make_tts(cfg: dict | None = None, *, model: str | None = None,
         # tier and keeps its eSpeak fallback. An explicit request model is an
         # exact choice: failure must be reported rather than disguised.
         mbrola_fallback=(model is None))
+
+
+def render_text(text: str, *, model: str | None = None,
+                voice: str | None = None, rate: int | None = None,
+                max_chars: int | None = None,
+                cfg: dict | None = None) -> RenderedSpeech:
+    """Synchronously synthesise a whole turn without opening an audio device.
+
+    The same conditioning, chunking and model factory used by the daemon are
+    used here.  Clips are concatenated only when their sample rates match; a
+    container must never label PCM from two rates as though it had one.
+    """
+    engine = make_tts(cfg, model=model, voice=voice, rate=rate)
+    chunks = speech_chunks(text, max_chars=max_chars)
+    rendered: list[bytes] = []
+    sample_rate: int | None = None
+    for chunk in chunks:
+        pcm, chunk_rate = engine.synth(chunk)
+        if sample_rate is None:
+            sample_rate = chunk_rate
+        elif chunk_rate != sample_rate:
+            raise TtsError(
+                f"the synthesiser changed sample rate from {sample_rate} to "
+                f"{chunk_rate} Hz between clips. Save shorter text with one "
+                "voice, or fix the engine so every clip uses one rate.")
+        rendered.append(pcm)
+    return RenderedSpeech(
+        b"".join(rendered),
+        ESPEAK_SAMPLE_RATE if sample_rate is None else sample_rate,
+        len(chunks), engine.model, engine.voice, engine.rate)

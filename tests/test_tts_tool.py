@@ -11,8 +11,10 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import os
 import pathlib
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -158,12 +160,99 @@ class TtsToolTests(unittest.TestCase):
 
     def test_speech_options_require_the_speech_action(self) -> None:
         for arguments in (["--model", "espeak"], ["--voice", "en-us"],
-                          ["--rate", "170"]):
+                          ["--rate", "170"], ["--output", "speech.wav"]):
             with self.subTest(arguments=arguments), \
                     contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit) as caught:
                     self.tool.main(list(arguments))
                 self.assertEqual(caught.exception.code, 2)
+
+    def test_cli_saves_private_wav_without_contacting_daemon(self) -> None:
+        pcm = b"\x01\x00\xff\xff" * 100
+        rendered = self.tool.tts_lib.RenderedSpeech(
+            pcm, 16000, 2, "espeak", "en-gb", 200)
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / "paragraph.wav"
+            with mock.patch.object(
+                    self.tool.tts_lib, "render_text",
+                    return_value=rendered) as render, \
+                    mock.patch.object(self.tool, "control") as control, \
+                    contextlib.redirect_stdout(output):
+                result = self.tool.main([
+                    "--speak", "This is an export test.",
+                    "--model", "espeak", "--voice", "en-gb",
+                    "--rate", "200", "--output", str(target),
+                ])
+
+            self.assertEqual(result, 0)
+            control.assert_not_called()
+            render.assert_called_once_with(
+                "This is an export test.", model="espeak", voice="en-gb",
+                rate=200, max_chars=mock.ANY)
+            parsed, sample_rate = self.tool.util.parse_wav_bytes(
+                target.read_bytes())
+            self.assertEqual((parsed, sample_rate), (pcm, 16000))
+            self.assertEqual(os.stat(target).st_mode & 0o777, 0o600)
+            self.assertIn("Saved 2 clips with espeak/en-gb", output.getvalue())
+            self.assertIn("as WAV", output.getvalue())
+
+    def test_save_alias_encodes_mp3_after_building_a_wav(self) -> None:
+        rendered = self.tool.tts_lib.RenderedSpeech(
+            b"\x01\x00" * 100, 22050, 1, "espeak", "en-us", 170)
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / "paragraph.mp3"
+            with mock.patch.object(
+                    self.tool.tts_lib, "render_text",
+                    return_value=rendered), \
+                    mock.patch.object(
+                        self.tool, "_encode_mp3",
+                        return_value=(b"ID3-test", "test-encoder")) as encode, \
+                    contextlib.redirect_stdout(output):
+                self.assertEqual(self.tool.main([
+                    "--speak", "MP3 export test.", "--save", str(target),
+                ]), 0)
+
+            self.assertEqual(target.read_bytes(), b"ID3-test")
+            wav = encode.call_args.args[0]
+            self.assertEqual(wav[:4], b"RIFF")
+
+    def test_export_rejects_unknown_suffix_and_existing_file(self) -> None:
+        with mock.patch.object(self.tool.tts_lib, "render_text") as render:
+            with self.assertRaises(self.tool.VoiceToolError) as caught:
+                self.tool.save_text("hello", "speech.ogg")
+        render.assert_not_called()
+        self.assertIn(".wav or .mp3", str(caught.exception))
+
+        rendered = self.tool.tts_lib.RenderedSpeech(
+            b"\x01\x00", 16000, 1, "espeak", "en-us", 170)
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / "exists.wav"
+            target.write_bytes(b"keep me")
+            with mock.patch.object(
+                    self.tool.tts_lib, "render_text",
+                    return_value=rendered), \
+                    self.assertRaises(self.tool.VoiceToolError) as caught:
+                self.tool.save_text("hello", str(target))
+            self.assertEqual(target.read_bytes(), b"keep me")
+        self.assertIn("refusing to overwrite", str(caught.exception))
+
+    def test_mp3_without_an_encoder_has_an_actionable_error(self) -> None:
+        with mock.patch.object(self.tool.util, "which", return_value=None), \
+                self.assertRaises(self.tool.VoiceToolError) as caught:
+            self.tool._encode_mp3(b"RIFF")
+        self.assertIn("Install ffmpeg", str(caught.exception))
+
+    def test_failed_output_write_leaves_no_partial_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = pathlib.Path(directory) / "partial.wav"
+            with mock.patch.object(
+                    self.tool.os, "fsync", side_effect=OSError("disk full")), \
+                    self.assertRaises(self.tool.VoiceToolError) as caught:
+                self.tool._write_new_output(str(target), b"audio")
+            self.assertFalse(target.exists())
+        self.assertIn("No partial audio file was kept", str(caught.exception))
 
     def test_models_lists_only_registered_families(self) -> None:
         output = io.StringIO()

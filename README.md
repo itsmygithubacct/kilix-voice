@@ -8,7 +8,8 @@ plus two standalone TUIs and the small daemon that owns the audio device.
 Everything runs locally. No audio, text, or transcript ever leaves the machine.
 
 - `kilix-tts` — read-aloud settings plus a scriptable speech command for
-  arbitrary text, standard input, and per-request model/voice/rate selection
+  arbitrary text, standard input, per-request model/voice/rate selection, and
+  WAV/MP3 file export
 - `kilix-stt` — dictation: input device, model, a live level meter and voice
   activity readout for working out why it cannot hear you, plus explicit model
   installation/default selection
@@ -46,6 +47,7 @@ These are not preferences; they are enforced by the code and covered by tests.
 - Python 3.11 or newer
 - `espeak-ng` for read-aloud (`mbrola` plus a voice such as `mbrola-us1` is an
   optional quality tier)
+- `ffmpeg` or `lame` only when exporting MP3; WAV export needs no encoder
 - PulseAudio or PipeWire tools — `parec`/`pacat`, or ALSA's `arecord`/`aplay`
 - `libvosk.so` and a model for dictation, built and fetched by Kilix's pinned
   installer
@@ -73,6 +75,10 @@ Both TUIs also work as plain CLIs:
 ./kilix-tts --speak "Hello from Kilix"
 printf '%s\n' "Text from an agent" | \
   ./kilix-tts --speak - --model mbrola --voice us1 --rate 200
+./kilix-tts --speak - --model espeak --voice en-us \
+  --output kilix-test.wav < examples/tts-export-test.txt
+./kilix-tts --speak - --model espeak --save kilix-test.mp3 \
+  < examples/tts-export-test.txt
 ./kilix-stt --models
 ./kilix-stt --models --json
 ./kilix-stt --install lgraph-en-us --default lgraph-en-us
@@ -89,6 +95,14 @@ fails if its voice is unavailable; the longstanding saved MBROLA preference
 keeps its eSpeak fallback. Use `--speak -` for strict UTF-8 standard input.
 When running from a source checkout, start `./kilix-voiced` first; the main
 `kilix speak` wrapper starts an installed daemon on demand.
+
+`--output FILE` (also spelled `--save FILE`) renders the same conditioned text
+directly to a new `.wav` or `.mp3` file instead of playing it. Export does not
+need the daemon and never opens an audio device. The suffix selects the format;
+MP3 encoding stays local through `ffmpeg` or `lame`. Output is mode 0600 and an
+existing file is never overwritten implicitly. The self-describing paragraph
+in `examples/tts-export-test.txt` exercises arbitrary UTF-8 stdin, selection,
+synthesis, and both containers.
 
 Opening `kilix-stt` only lists local state; it never downloads a model. On the
 Models tab, `i` hands the terminal to Kilix's checksum-pinned lazy installer,
@@ -113,6 +127,8 @@ source checkout or an ambient `PYTHONPATH`.
 
 ## Release history
 
+- **0.1.5** — render arbitrary speech to private, no-overwrite WAV or MP3
+  files, with the daemon's conditioning and model-selection semantics.
 - **0.1.4** — add arbitrary-text/stdin speech, safe per-request TTS
   model/voice/rate selection, model discovery, and acknowledgement-loss stop
   compensation to `kilix-tts`.

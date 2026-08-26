@@ -8,8 +8,10 @@ disagree about what "read this" means, and a test phrase travels the same
 route — daemon, arbiter, engine, sink — that a real read takes, so a test that
 sounds right proves the real path rather than a private shortcut.
 
-Nothing here synthesises audio and nothing here opens a device.  A machine with
-no daemon running and no ``espeak-ng`` installed still opens the screen, still
+The screen and audible tests leave synthesis and playback to the daemon.  A
+file export is the deliberate exception: it runs the selected local
+synthesiser synchronously but never opens an audio device.  A machine with no
+daemon running and no ``espeak-ng`` installed still opens the screen, still
 saves settings, and says in the status block what is missing and what to install
 rather than failing to start.
 
@@ -20,6 +22,7 @@ As a CLI, for scripts and for terminals that cannot run curses:
     kilix-tts --set wpm=200 --set voice=en-gb
     kilix-tts --speak "Hello from Kilix"
     printf '%s' "Longer text" | kilix-tts --speak - --model espeak
+    kilix-tts --speak "Save this" --output speech.wav
 """
 
 from __future__ import annotations
@@ -59,6 +62,8 @@ PROBE_TIMEOUT_S = 2.0
 # Filling a picker is a convenience; a helper that hangs must not hold the
 # screen shut behind it.
 DISCOVERY_TIMEOUT_S = 3.0
+MP3_ENCODING_TIMEOUT_S = 30.0
+_EXPORT_SUFFIXES = frozenset({".wav", ".mp3"})
 
 TOGGLE = "toggle"      # a boolean setting, drawn [x] / [ ]
 CHOICE = "choice"      # a fixed vocabulary from settings.SPEC
@@ -372,10 +377,10 @@ def test_phrase() -> str:
             f"at {settings.tts_rate()} words per minute.")
 
 
-def speak_text(text: str, *, model: str | None = None,
-               voice: str | None = None,
-               rate: int | None = None) -> str:
-    """Ask the daemon to speak caller-supplied text with safe overrides."""
+def _speech_request(text: str, *, model: str | None = None,
+                    voice: str | None = None,
+                    rate: int | None = None) -> dict:
+    """Validate one bounded arbitrary-text request for playback or export."""
     if not isinstance(text, str) or not text.strip():
         raise VoiceToolError("nothing to read aloud: speech text is empty")
     request: dict = {"op": protocol.OP_SPEAK, "text": text,
@@ -385,8 +390,24 @@ def speak_text(text: str, *, model: str | None = None,
                     if value is not None})
     try:
         request = protocol.validate_request(request, paths.session_dir())
+        packet = protocol.encode(request)
     except protocol.ProtocolError as error:
         raise VoiceToolError(str(error)) from error
+    if len(packet) > protocol.MAX_REQUEST_BYTES:
+        raise VoiceToolError(
+            f"the encoded voice request is {len(packet)} bytes; the local "
+            f"control/file request limit is {protocol.MAX_REQUEST_BYTES}. "
+            "Use shorter text or split it into several speech requests or "
+            "files.")
+    return request
+
+
+def speak_text(text: str, *, model: str | None = None,
+               voice: str | None = None,
+               rate: int | None = None) -> str:
+    """Ask the daemon to speak caller-supplied text with safe overrides."""
+    request = _speech_request(text, model=model, voice=voice, rate=rate)
+    requested = {key: request.get(key) for key in ("model", "voice", "rate")}
     try:
         reply = control(request)
     except VoiceToolError as error:
@@ -428,6 +449,142 @@ def speak_text(text: str, *, model: str | None = None,
 def speak_test() -> str:
     """Ask the daemon to read the test phrase; return what happened."""
     return speak_text(test_phrase())
+
+
+def _export_format(output: str) -> str:
+    """Return the requested container name, inferred from its safe suffix."""
+    suffix = os.path.splitext(output)[1].lower()
+    if suffix not in _EXPORT_SUFFIXES:
+        raise VoiceToolError(
+            f"cannot infer an audio format from {output!r}: use a .wav or "
+            ".mp3 filename.")
+    return suffix[1:]
+
+
+def _encode_mp3(wav: bytes) -> tuple[bytes, str]:
+    """Encode an in-memory WAV with an installed, local MP3 command."""
+    ffmpeg = util.which("ffmpeg")
+    lame = util.which("lame")
+    if ffmpeg:
+        encoder = "ffmpeg"
+        command = [
+            ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-f", "wav", "-i", "pipe:0", "-vn", "-map_metadata", "-1",
+            "-codec:a", "libmp3lame", "-b:a", "64k", "-f", "mp3", "pipe:1",
+        ]
+    elif lame:
+        encoder = "lame"
+        command = [lame, "--silent", "-", "-"]
+    else:
+        raise VoiceToolError(
+            "MP3 export needs a local encoder. Install ffmpeg "
+            "(Debian/Ubuntu: sudo apt install ffmpeg) or lame, or save to "
+            "a .wav file instead.")
+    try:
+        completed = subprocess.run(
+            command, input=wav, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=MP3_ENCODING_TIMEOUT_S,
+            check=False)
+    except subprocess.TimeoutExpired as error:
+        raise VoiceToolError(
+            f"{encoder} did not finish the MP3 within "
+            f"{MP3_ENCODING_TIMEOUT_S:.0f} seconds. Save WAV instead or "
+            "check the encoder installation.") from error
+    except OSError as error:
+        raise VoiceToolError(
+            f"cannot run the {encoder} MP3 encoder: {error}. Reinstall it or "
+            "save WAV instead.") from error
+    if completed.returncode != 0 or not completed.stdout:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        note = f" ({detail.splitlines()[0][:200]})" if detail else ""
+        raise VoiceToolError(
+            f"{encoder} could not encode the MP3 (exit "
+            f"{completed.returncode}){note}. Save WAV instead or check the "
+            "encoder installation.")
+    return completed.stdout, encoder
+
+
+def _write_new_output(output: str, payload: bytes) -> str:
+    """Write one private output file, refusing replacement and partial data."""
+    target = os.path.abspath(output)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    try:
+        descriptor = os.open(target, flags, 0o600)
+    except FileExistsError as error:
+        raise VoiceToolError(
+            f"refusing to overwrite existing output {target!r}. Choose a new "
+            "filename or remove the old file explicitly.") from error
+    except OSError as error:
+        raise VoiceToolError(
+            f"cannot create output {target!r}: {error}. Check that its parent "
+            "directory exists and is writable.") from error
+    try:
+        stream = os.fdopen(descriptor, "wb")
+    except BaseException:
+        os.close(descriptor)
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        raise
+    try:
+        with stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as error:
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        raise VoiceToolError(
+            f"could not finish output {target!r}: {error}. No partial audio "
+            "file was kept; check free space and directory permissions.") \
+            from error
+    except BaseException:
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        raise
+    return target
+
+
+def save_text(text: str, output: str, *, model: str | None = None,
+              voice: str | None = None,
+              rate: int | None = None) -> str:
+    """Render caller-supplied text to a new WAV or MP3 without playback."""
+    container = _export_format(output)
+    request = _speech_request(text, model=model, voice=voice, rate=rate)
+    try:
+        rendered = tts_lib.render_text(
+            request["text"], model=request.get("model"),
+            voice=request.get("voice"), rate=request.get("rate"),
+            max_chars=settings.tts_max_chars())
+    except (tts_lib.TtsError, settings.SettingsError, ValueError) as error:
+        raise VoiceToolError(str(error)) from error
+    if not rendered.chunks:
+        raise VoiceToolError(
+            "the supplied text conditioned down to silence; provide words "
+            "rather than only terminal controls or decoration.")
+    if not rendered.pcm:
+        raise VoiceToolError(
+            f"the selected {rendered.model!r} model produced no audio. Choose "
+            "--model espeak or another available model shown by --models.")
+    wav = util.write_wav(rendered.pcm, rendered.sample_rate)
+    encoder = ""
+    if container == "mp3":
+        payload, encoder = _encode_mp3(wav)
+    else:
+        payload = wav
+    target = _write_new_output(output, payload)
+    duration = len(rendered.pcm) / (2 * rendered.sample_rate)
+    encoded_by = f" via {encoder}" if encoder else ""
+    return (
+        f"Saved {rendered.chunks} clip"
+        f"{'' if rendered.chunks == 1 else 's'} with "
+        f"{rendered.model}/{rendered.voice} at {rendered.rate} wpm as "
+        f"{container.upper()}{encoded_by} ({duration:.1f}s) to {target}")
 
 
 def _compensate_speech() -> bool:
@@ -1017,8 +1174,8 @@ def _stdin_speech_text() -> str:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="kilix-tts",
-        description="Configure Kilix read-aloud, or speak supplied text "
-                    "through kilix-voiced.")
+        description="Configure Kilix read-aloud, speak supplied text through "
+                    "kilix-voiced, or save it as WAV/MP3.")
     parser.add_argument("--print", action="store_true", dest="show",
                         help="print the effective read-aloud settings")
     parser.add_argument("--status", action="store_true",
@@ -1027,12 +1184,15 @@ def main(argv: list[str] | None = None) -> int:
                         help="list request-selectable local TTS model families")
     parser.add_argument("--speak", metavar="TEXT",
                         help="speak arbitrary text; use - to read UTF-8 stdin")
+    parser.add_argument(
+        "--output", "--save", dest="output", metavar="FILE",
+        help="save --speak text to a new .wav or .mp3 file instead of playing")
     parser.add_argument("--model", choices=models.TTS_MODEL_IDS,
-                        help="model family for this --speak request")
+                        help="model family for this speech request")
     parser.add_argument("--voice", metavar="NAME",
-                        help="voice for this --speak request, such as en-us")
+                        help="voice for this speech request, such as en-us")
     parser.add_argument("--rate", type=int, choices=protocol.TTS_RATE_CHOICES,
-                        metavar="WPM", help="rate for this --speak request")
+                        metavar="WPM", help="rate for this speech request")
     parser.add_argument("--set", action="append", default=[],
                         type=_parse_assignment, metavar="NAME=VALUE",
                         help="set one setting, for example wpm=200, "
@@ -1046,10 +1206,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     changes = dict(args.set)
-    speech_overrides = (args.model, args.voice, args.rate)
+    speech_overrides = (args.model, args.voice, args.rate, args.output)
     if args.speak is None and any(value is not None
                                   for value in speech_overrides):
-        parser.error("--model, --voice and --rate require --speak TEXT")
+        parser.error(
+            "--model, --voice, --rate and --output require --speak TEXT")
     if args.speak is not None and (changes or args.show or args.status
                                    or args.models
                                    or args.section is not None):
@@ -1063,8 +1224,12 @@ def main(argv: list[str] | None = None) -> int:
         try:
             text = (_stdin_speech_text() if args.speak == "-"
                     else args.speak)
-            print(speak_text(text, model=args.model, voice=args.voice,
-                             rate=args.rate))
+            if args.output:
+                print(save_text(text, args.output, model=args.model,
+                                voice=args.voice, rate=args.rate))
+            else:
+                print(speak_text(text, model=args.model, voice=args.voice,
+                                 rate=args.rate))
         except VoiceToolError as error:
             parser.exit(1, f"kilix-tts: {error}\n")
         return 0

@@ -612,14 +612,8 @@ class Daemon:
 
     def _speech_chunks(self, text: str) -> list[str]:
         """Condition pane text and split it into clips worth synthesising."""
-        conditioned = tts_lib.condition_text(
+        return tts_lib.speech_chunks(
             text, max_chars=settings.tts_max_chars())
-        chunker = tts_lib.SentenceChunker()
-        chunks = chunker.feed(conditioned)
-        tail = chunker.flush()
-        if tail:
-            chunks.append(tail)
-        return chunks
 
     def _op_stop_speech(self, request: dict) -> dict:
         with self._lock:

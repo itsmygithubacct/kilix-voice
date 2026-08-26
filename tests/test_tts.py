@@ -527,5 +527,44 @@ class EngineSelection(unittest.TestCase):
         self.assertIn("cannot be supplied", str(caught.exception))
 
 
+class WholeTurnRendering(unittest.TestCase):
+    """File rendering shares the daemon's chunking and one sample rate."""
+
+    class Engine:
+        model = "espeak"
+        voice = "en-us"
+        rate = 170
+
+        def __init__(self, rates: tuple[int, ...] = (16000, 16000)) -> None:
+            self.rates = iter(rates)
+            self.calls: list[str] = []
+
+        def synth(self, text: str) -> tuple[bytes, int]:
+            self.calls.append(text)
+            return bytes([len(self.calls), 0]) * 4, next(self.rates)
+
+    def test_render_concatenates_conditioned_sentence_clips(self) -> None:
+        engine = self.Engine()
+        with mock.patch.object(tts, "make_tts", return_value=engine):
+            rendered = tts.render_text(
+                "First sentence. Second sentence.", model="espeak",
+                voice="en-us", rate=170)
+
+        self.assertEqual(engine.calls,
+                         ["First sentence.", "Second sentence."])
+        self.assertEqual(rendered.pcm, b"\x01\x00" * 4 + b"\x02\x00" * 4)
+        self.assertEqual(rendered.sample_rate, 16000)
+        self.assertEqual(rendered.chunks, 2)
+        self.assertEqual((rendered.model, rendered.voice, rendered.rate),
+                         ("espeak", "en-us", 170))
+
+    def test_render_refuses_to_mislabel_mixed_sample_rates(self) -> None:
+        engine = self.Engine((16000, 22050))
+        with mock.patch.object(tts, "make_tts", return_value=engine), \
+                self.assertRaises(tts.TtsError) as caught:
+            tts.render_text("One. Two.")
+        self.assertIn("changed sample rate", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
