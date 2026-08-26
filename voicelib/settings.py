@@ -52,7 +52,7 @@ SPEC: dict[str, tuple[str, tuple[str, ...] | None]] = {
     KEY_TTS_ENGINE: (
         models.TTS_ENGINE_ESPEAK,
         (models.TTS_ENGINE_ESPEAK, models.TTS_ENGINE_MBROLA,
-         models.ENGINE_OFF),
+         models.TTS_ENGINE_PIPER, models.ENGINE_OFF),
     ),
     KEY_TTS_VOICE: ("en-us", None),
     KEY_TTS_RATE: ("170", ("120", "150", "170", "200", "240")),

@@ -63,6 +63,7 @@ PROBE_TIMEOUT_S = 2.0
 # screen shut behind it.
 DISCOVERY_TIMEOUT_S = 3.0
 MP3_ENCODING_TIMEOUT_S = 30.0
+MODEL_INSTALL_TIMEOUT_S = 20 * 60.0
 _EXPORT_SUFFIXES = frozenset({".wav", ".mp3"})
 
 TOGGLE = "toggle"      # a boolean setting, drawn [x] / [ ]
@@ -124,8 +125,11 @@ class Section(NamedTuple):
 
 def _read_aloud_summary(values: dict) -> str:
     button = "button on" if values[settings.KEY_SPEAK] else "button off"
+    voice = (tts_lib.PIPER_VOICE
+             if values[settings.KEY_TTS_ENGINE] == models.TTS_ENGINE_PIPER
+             else values[settings.KEY_TTS_VOICE])
     return (f"Read-aloud: {button} · {values[settings.KEY_TTS_ENGINE]} · "
-            f"{values[settings.KEY_TTS_VOICE]} · "
+            f"{voice} · "
             f"{values[settings.KEY_TTS_RATE]} wpm")
 
 
@@ -157,9 +161,9 @@ SECTIONS = (
         Field(settings.KEY_SPEAK,
               "Speaking-head button in the tab bar", TOGGLE),
         Field(settings.KEY_TTS_ENGINE,
-              "Engine (espeak · mbrola voices · off)", CHOICE),
+              "Engine (espeak · mbrola · Piper Kristin · off)", CHOICE),
         Field(settings.KEY_TTS_VOICE,
-              "Voice (espeak name; mbrola reads it as mb-<voice>)", TOKEN, 32),
+              "Voice (eSpeak/MBROLA name; Piper has fixed Kristin)", TOKEN, 32),
         Field(settings.KEY_TTS_RATE,
               "Speaking rate (words per minute)", CHOICE),
     ), _read_aloud_summary),
@@ -301,6 +305,8 @@ def _local_engine() -> tuple[bool, str]:
         return False, (f"read-aloud is switched off. Set the engine to espeak "
                        f"here, or {settings.KEY_TTS_ENGINE}=espeak in "
                        f"{paths.settings_file()}, to enable it.")
+    if engine == models.TTS_ENGINE_PIPER:
+        return tts_lib.piper_status()
     voice = settings.tts_voice()
     try:
         command = tts_lib.build_synth_cmd(None, voice=voice,
@@ -1003,7 +1009,9 @@ _ALIASES: dict[str, tuple[str, ...]] = {
 # the setting means gets what it is called rather than an error.
 _SPELLINGS: dict[str, dict[str, str]] = {
     settings.KEY_TTS_ENGINE: {"espeak-ng": "espeak", "ng": "espeak",
-                              "mb": "mbrola", "none": "off", "silent": "off"},
+                              "mb": "mbrola", "neural": "piper",
+                              "kristin": "piper", "none": "off",
+                              "silent": "off"},
     settings.KEY_TTS_EXTENT: {"visible": "screen", "pane": "screen",
                               "history": "scrollback", "buffer": "scrollback",
                               "sel": "selection"},
@@ -1133,16 +1141,51 @@ def _print_models() -> None:
             available = synthesizer is not None
             detail = (f"{voice_count} installed eSpeak voice names"
                       if available else "install espeak-ng")
-        else:
+        elif spec.engine == models.TTS_ENGINE_MBROLA:
             available = synthesizer is not None and mbrola is not None
             detail = ("MBROLA runtime found; each requested voice must also "
                       "be installed" if available else
                       "install espeak-ng, mbrola, and an MBROLA voice package")
+        else:
+            available, detail = tts_lib.piper_status()
         print(
             f"model={spec.catalog_id} engine={spec.engine} "
             f"available={'yes' if available else 'no'} "
             f"selected={'yes' if selected == spec.engine else 'no'}")
         print(f"  {spec.summary}; {detail}")
+
+
+def _install_model(catalog_id: str) -> str:
+    """Run the fixed provider's explicit, checksum-pinned install action."""
+    try:
+        spec = models.TTS_MODEL_BY_ID[catalog_id]
+    except KeyError as error:
+        raise VoiceToolError(
+            f"unknown TTS model {catalog_id!r}; choose one of: "
+            f"{', '.join(models.TTS_MODEL_IDS)}"
+        ) from error
+    if spec.engine != models.TTS_ENGINE_PIPER:
+        raise VoiceToolError(
+            f"{catalog_id} is supplied by the operating system, not a "
+            "downloadable Kilix model. Install its distribution package."
+        )
+    binary = tts_lib.piper_binary()
+    if binary is None:
+        raise VoiceToolError(
+            "kilix-piper-tts is not installed. Install that public Kilix "
+            "module first, then repeat this command."
+        )
+    try:
+        result = subprocess.run(
+            [binary, "install", catalog_id], capture_output=True, check=False,
+            timeout=MODEL_INSTALL_TIMEOUT_S, text=True, errors="replace")
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise VoiceToolError(f"cannot install {catalog_id} with {binary}: {error}") from error
+    if result.returncode != 0:
+        detail = _one_line(result.stderr or result.stdout or "no detail")
+        raise VoiceToolError(
+            f"{binary} could not install {catalog_id}: {detail}")
+    return _one_line(result.stdout) or f"Installed {catalog_id}."
 
 
 def _stdin_speech_text() -> str:
@@ -1182,6 +1225,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="print what kilix-voiced and this machine can do")
     parser.add_argument("--models", action="store_true",
                         help="list request-selectable local TTS model families")
+    parser.add_argument(
+        "--install", choices=(models.PIPER_KRISTIN_MODEL,), metavar="MODEL",
+        help="explicitly install a checksum-pinned neural TTS model")
     parser.add_argument("--speak", metavar="TEXT",
                         help="speak arbitrary text; use - to read UTF-8 stdin")
     parser.add_argument(
@@ -1212,13 +1258,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(
             "--model, --voice, --rate and --output require --speak TEXT")
     if args.speak is not None and (changes or args.show or args.status
-                                   or args.models
+                                   or args.models or args.install
                                    or args.section is not None):
         parser.error("--speak is a standalone action; do not combine it with "
-                     "--set, --print, --status, --models or --section")
+                     "--set, --print, --status, --models, --install or --section")
     if args.models and (changes or args.show or args.status
-                        or args.section is not None):
+                        or args.install or args.section is not None):
         parser.error("--models is a standalone action")
+    if args.install and (changes or args.show or args.status
+                         or args.section is not None):
+        parser.error("--install is a standalone action")
 
     if args.speak is not None:
         try:
@@ -1236,6 +1285,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.models:
         _print_models()
         return 0
+    if args.install:
+        try:
+            print(_install_model(args.install))
+        except VoiceToolError as error:
+            parser.exit(1, f"kilix-tts: {error}\n")
+        return 0
 
     if changes:
         try:
@@ -1252,7 +1307,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.error("the interactive screen needs a terminal; use --print, "
-                     "--status, --models, --speak TEXT, or --set NAME=VALUE")
+                     "--status, --models, --install MODEL, --speak TEXT, or "
+                     "--set NAME=VALUE")
     try:
         return curses.wrapper(_run_tui, args.section)
     except curses.error as error:

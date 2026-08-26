@@ -69,7 +69,7 @@ for _package_root in (_INSTALLED_LIB, _HERE):
         sys.path.insert(0, _package_root)
 
 from voicelib import (  # noqa: E402  (the import follows the path bootstrap)
-    __version__, audio, events, paths, protocol, settings, stt as stt_lib,
+    __version__, audio, events, models, paths, protocol, settings, stt as stt_lib,
     tts as tts_lib, util)
 from voicelib.arbiter import Arbiter, ArbiterError  # noqa: E402
 from voicelib.vad import Vad  # noqa: E402
@@ -93,7 +93,7 @@ JOIN_TIMEOUT_S = 5.0
 # allocation and stays below the platform's AF_UNIX/SOCK_SEQPACKET send limit.
 MAX_REQUEST_BYTES = protocol.MAX_REQUEST_BYTES
 
-TtsEngine = tts_lib.NullTts | tts_lib.EspeakTts
+TtsEngine = tts_lib.NullTts | tts_lib.EspeakTts | tts_lib.PiperTts
 SttEngine = stt_lib.NullStt | stt_lib.VoskStt
 
 # Recognised text is inserted into a PTY, so this is the one place that decides
@@ -589,6 +589,11 @@ class Daemon:
             # fail where only the daemon's stderr can see it.
             tts_lib.build_synth_cmd(self._cfg, voice=engine.voice,
                                     rate=engine.rate)
+        elif isinstance(engine, tts_lib.PiperTts):
+            # The provider status contract loads no model and starts no
+            # service, but confirms both the isolated runtime and pinned
+            # Kristin artifacts before this request is acknowledged.
+            engine.check_available()
         chunks = self._speech_chunks(request["text"])
         if not chunks:
             # A pane of nothing but box drawing conditions down to nothing;
@@ -628,6 +633,7 @@ class Daemon:
             player = self._player
         if turn is not None:
             turn.cancel.set()
+            turn.engine.cancel()
             self._arbiter.end_speech(turn.id)
         if player is not None:
             # Kills the sink outright rather than draining it: barge-in has to
@@ -908,6 +914,15 @@ class Daemon:
                     "available": False, "detail": (
                 "read-aloud is switched off. Set "
                 f"{settings.KEY_TTS_ENGINE}=espeak to enable it.")}
+        if engine == models.TTS_ENGINE_PIPER:
+            available, detail = tts_lib.piper_status()
+            return {
+                "engine": engine,
+                "model": models.PIPER_KRISTIN_MODEL,
+                "available": available,
+                "voice": tts_lib.PIPER_VOICE,
+                "detail": detail,
+            }
         voice = settings.tts_voice()
         try:
             command = tts_lib.build_synth_cmd(self._cfg, voice=voice,

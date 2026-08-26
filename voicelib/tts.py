@@ -13,8 +13,11 @@ import and to exercise on a machine with no sound server at all.
 
 from __future__ import annotations
 
+import json
+import os
 import re
 import subprocess
+import threading
 from typing import NamedTuple
 
 from . import models, settings, util
@@ -22,6 +25,11 @@ from . import models, settings, util
 # espeak-ng writes 22.05 kHz mono at --stdout. The real rate always comes from
 # the WAV header; this is only what an empty clip is labelled with.
 ESPEAK_SAMPLE_RATE = 22050
+PIPER_SAMPLE_RATE = 22050
+PIPER_VOICE = "en_US-kristin-medium"
+PIPER_STATUS_TIMEOUT_S = 5.0
+PIPER_SYNTH_TIMEOUT_S = 210.0
+PIPER_ENV_COMMAND = "KILIX_PIPER_TTS"
 
 # Synthesis is far faster than real time, so a run that takes this long is
 # stuck rather than busy. Generous, because a first run pages in the voice data.
@@ -357,6 +365,11 @@ class NullTts:
         """Return an empty clip regardless of ``text``."""
         return b"", ESPEAK_SAMPLE_RATE
 
+    def cancel(self) -> None:
+        """Silence has no process to interrupt."""
+
+    close = cancel
+
 
 def espeak_binary() -> str | None:
     """Return the synthesiser on PATH, or None when none is installed.
@@ -507,10 +520,161 @@ class EspeakTts:
                 f"{_stderr_note(err)} "
                 f"{_failure_hint(command[0], voice)}.") from error
 
+    def cancel(self) -> None:
+        """eSpeak clips are short and have no persistent process to close."""
+
+    close = cancel
+
+
+def piper_binary() -> str | None:
+    """Return the fixed provider command selected by the trusted environment."""
+    return util.which(os.environ.get(PIPER_ENV_COMMAND, "kilix-piper-tts"))
+
+
+def piper_status() -> tuple[bool, str]:
+    """Inspect the provider and pinned model without starting it or networking."""
+    binary = piper_binary()
+    if binary is None:
+        return False, (
+            "kilix-piper-tts is not installed. Install the public "
+            "kilix-piper-tts module, then run `kilix-tts --install "
+            f"{models.PIPER_KRISTIN_MODEL}`."
+        )
+    try:
+        result = subprocess.run(
+            [binary, "status", "--json"],
+            capture_output=True,
+            check=False,
+            timeout=PIPER_STATUS_TIMEOUT_S,
+            text=True,
+            errors="replace",
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, f"cannot inspect {binary}: {error}"
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        suffix = f": {detail[0][:200]}" if detail else ""
+        return False, f"{binary} status exited {result.returncode}{suffix}"
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        return False, f"{binary} status returned invalid JSON: {error}"
+    if not isinstance(payload, dict):
+        return False, f"{binary} status returned no JSON object"
+    if (payload.get("model") != models.PIPER_KRISTIN_MODEL
+            or payload.get("voice") != PIPER_VOICE):
+        return False, (
+            f"{binary} is an incompatible Piper provider: expected "
+            f"{models.PIPER_KRISTIN_MODEL}/{PIPER_VOICE}. Reinstall the "
+            "matching kilix-piper-tts release."
+        )
+    installed = payload.get("installed") is True
+    detail = str(payload.get("detail") or "provider gave no model detail")
+    if installed:
+        state = "warm provider" if payload.get("loaded") else "provider starts on demand"
+        return True, f"{PIPER_VOICE} · {binary} · {state}"
+    return False, detail
+
+
+class PiperTts:
+    """Pinned Kristin synthesis through the isolated persistent provider."""
+
+    name = models.TTS_ENGINE_PIPER
+    model = models.PIPER_KRISTIN_MODEL
+    voice = PIPER_VOICE
+
+    def __init__(self, *, voice: str | None = None,
+                 rate: int | None = None) -> None:
+        if voice is not None and str(voice).strip().lower() not in {
+                "kristin", PIPER_VOICE.lower(), self.model.lower()}:
+            raise TtsError(
+                f"model {self.model!r} has the fixed voice {PIPER_VOICE!r}; "
+                "omit --voice or use --voice en_US-kristin-medium."
+            )
+        self.rate = int(settings.tts_rate() if rate is None else rate)
+        if self.rate not in (120, 150, 170, 200, 240):
+            raise TtsError("Piper rate must be one of: 120, 150, 170, 200, 240 wpm")
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen[bytes] | None = None
+        self._cancelled = False
+
+    def check_available(self) -> None:
+        available, detail = piper_status()
+        if not available:
+            raise TtsError(detail)
+
+    def synth(self, text: str) -> tuple[bytes, int]:
+        clean = _as_text(text).strip()
+        if not clean:
+            return b"", PIPER_SAMPLE_RATE
+        binary = piper_binary()
+        if binary is None:
+            raise TtsError(
+                "kilix-piper-tts is not installed. Install that module and run "
+                f"`kilix-tts --install {self.model}`."
+            )
+        command = [
+            binary, "synthesize", "--stdin", "--raw", "--model", self.model,
+            "--rate", str(self.rate),
+        ]
+        try:
+            process = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE)
+        except OSError as error:
+            raise TtsError(f"cannot run {binary!r}: {error}") from error
+        with self._lock:
+            self._process = process
+            cancelled = self._cancelled
+        if cancelled:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        try:
+            out, err = process.communicate(
+                clean.encode("utf-8", "replace"), timeout=PIPER_SYNTH_TIMEOUT_S)
+        except subprocess.TimeoutExpired as error:
+            process.kill()
+            process.communicate()
+            raise TtsError(
+                f"{binary} did not finish within {PIPER_SYNTH_TIMEOUT_S:.0f} "
+                "seconds; run its status command and retry."
+            ) from error
+        finally:
+            with self._lock:
+                if self._process is process:
+                    self._process = None
+        with self._lock:
+            cancelled = self._cancelled
+        if cancelled:
+            return b"", PIPER_SAMPLE_RATE
+        if process.returncode != 0:
+            raise TtsError(
+                f"{binary} exited {process.returncode}{_stderr_note(err)}. "
+                f"Run: {binary} status"
+            )
+        if len(out) % 2:
+            raise TtsError(f"{binary} returned an odd-length s16le PCM stream")
+        return out, PIPER_SAMPLE_RATE
+
+    def cancel(self) -> None:
+        """Kill the client; the provider observes EOF and drops its worker."""
+        with self._lock:
+            self._cancelled = True
+            process = self._process
+        if process is not None and process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+    close = cancel
+
 
 def make_tts(cfg: dict | None = None, *, model: str | None = None,
              voice: str | None = None,
-             rate: int | None = None) -> NullTts | EspeakTts:
+             rate: int | None = None) -> NullTts | EspeakTts | PiperTts:
     """Return the selected engine, with optional request-scoped overrides.
 
     Construction deliberately does not probe for espeak-ng: a missing
@@ -530,6 +694,8 @@ def make_tts(cfg: dict | None = None, *, model: str | None = None,
                 "cannot be supplied by a speak request.") from error
     if engine == "off":
         return NullTts()
+    if engine == models.TTS_ENGINE_PIPER:
+        return PiperTts(voice=voice, rate=rate)
     # settings.tts_engine() validates against the vocabulary, so anything that
     # is not "off" is espeak, with or without the mbrola tier on top.
     return EspeakTts(
@@ -555,17 +721,22 @@ def render_text(text: str, *, model: str | None = None,
     chunks = speech_chunks(text, max_chars=max_chars)
     rendered: list[bytes] = []
     sample_rate: int | None = None
-    for chunk in chunks:
-        pcm, chunk_rate = engine.synth(chunk)
-        if sample_rate is None:
-            sample_rate = chunk_rate
-        elif chunk_rate != sample_rate:
-            raise TtsError(
-                f"the synthesiser changed sample rate from {sample_rate} to "
-                f"{chunk_rate} Hz between clips. Save shorter text with one "
-                "voice, or fix the engine so every clip uses one rate.")
-        rendered.append(pcm)
-    return RenderedSpeech(
-        b"".join(rendered),
-        ESPEAK_SAMPLE_RATE if sample_rate is None else sample_rate,
-        len(chunks), engine.model, engine.voice, engine.rate)
+    try:
+        for chunk in chunks:
+            pcm, chunk_rate = engine.synth(chunk)
+            if sample_rate is None:
+                sample_rate = chunk_rate
+            elif chunk_rate != sample_rate:
+                raise TtsError(
+                    f"the synthesiser changed sample rate from {sample_rate} to "
+                    f"{chunk_rate} Hz between clips. Save shorter text with one "
+                    "voice, or fix the engine so every clip uses one rate.")
+            rendered.append(pcm)
+        return RenderedSpeech(
+            b"".join(rendered),
+            ESPEAK_SAMPLE_RATE if sample_rate is None else sample_rate,
+            len(chunks), engine.model, engine.voice, engine.rate)
+    finally:
+        closer = getattr(engine, "close", None)
+        if closer is not None:
+            closer()

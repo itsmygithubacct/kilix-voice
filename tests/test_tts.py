@@ -492,6 +492,69 @@ class EngineSelection(unittest.TestCase):
                 self.assertIsInstance(engine, tts.EspeakTts)
                 self.assertEqual(engine.mbrola, mbrola)
 
+    def test_piper_setting_selects_fixed_kristin_provider(self) -> None:
+        self.write("piper")
+        engine = tts.make_tts()
+        self.assertIsInstance(engine, tts.PiperTts)
+        self.assertEqual(engine.model, models.PIPER_KRISTIN_MODEL)
+        self.assertEqual(engine.voice, "en_US-kristin-medium")
+
+    def test_piper_rejects_a_voice_not_owned_by_its_model(self) -> None:
+        with self.assertRaises(tts.TtsError) as caught:
+            tts.make_tts(
+                model=models.PIPER_KRISTIN_MODEL, voice="en-gb", rate=170)
+        self.assertIn("fixed voice", str(caught.exception))
+
+    def test_piper_runs_only_the_fixed_provider_argv(self) -> None:
+        class Process:
+            returncode = 0
+
+            def communicate(self, data, timeout):
+                self.data = data
+                self.timeout = timeout
+                return b"\x01\x00\x02\x00", b""
+
+            def kill(self):
+                self.returncode = -9
+
+            def poll(self):
+                return self.returncode
+
+        process = Process()
+        with mock.patch.object(tts, "piper_binary", return_value="/fixed/piper"), \
+                mock.patch.object(tts.subprocess, "Popen", return_value=process) as popen:
+            engine = tts.PiperTts(rate=200)
+            pcm, rate = engine.synth("Hello Kristin")
+        self.assertEqual((pcm, rate), (b"\x01\x00\x02\x00", 22050))
+        self.assertEqual(process.data, b"Hello Kristin")
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:4], [
+            "/fixed/piper", "synthesize", "--stdin", "--raw"])
+        self.assertIn(models.PIPER_KRISTIN_MODEL, command)
+
+    def test_piper_status_is_machine_readable_and_download_free(self) -> None:
+        completed = tts.subprocess.CompletedProcess(
+            ["provider"], 0,
+            '{"installed":true,"loaded":false,"detail":"complete",'
+            f'"model":"{models.PIPER_KRISTIN_MODEL}",'
+            '"voice":"en_US-kristin-medium"}', "")
+        with mock.patch.object(tts, "piper_binary", return_value="/fixed/piper"), \
+                mock.patch.object(tts.subprocess, "run", return_value=completed) as run:
+            available, detail = tts.piper_status()
+        self.assertTrue(available)
+        self.assertIn("en_US-kristin-medium", detail)
+        self.assertEqual(run.call_args.args[0], ["/fixed/piper", "status", "--json"])
+
+    def test_piper_status_rejects_a_mismatched_provider(self) -> None:
+        completed = tts.subprocess.CompletedProcess(
+            ["provider"], 0,
+            '{"installed":true,"model":"other","voice":"other"}', "")
+        with mock.patch.object(tts, "piper_binary", return_value="/fixed/piper"), \
+                mock.patch.object(tts.subprocess, "run", return_value=completed):
+            available, detail = tts.piper_status()
+        self.assertFalse(available)
+        self.assertIn("incompatible", detail)
+
     def test_an_unknown_engine_falls_back_to_the_default(self) -> None:
         self.write("festival")
         self.assertIsInstance(tts.make_tts(), tts.EspeakTts)

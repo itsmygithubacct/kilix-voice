@@ -20,10 +20,10 @@ Everything runs locally. No audio, text, or transcript ever leaves the machine.
 
 `voicelib/` is **Python standard library only** — there is no third-party
 import anywhere, including speech recognition. Recognition binds `libvosk.so`
-directly through `ctypes` (seven functions), so there is no wheel, no virtual
-environment, and nothing to `pip install`. Speech synthesis shells out to
-`espeak-ng`, optionally through `mbrola` voices. Both are ordinary packages
-from your distribution.
+directly through `ctypes` (seven functions). Speech synthesis uses system
+`espeak-ng`, optionally with MBROLA voices, or the separately installed
+`kilix-piper-tts` provider. That GPL provider owns its isolated Python runtime
+and keeps the pinned Kristin neural model warm; Kilix Voice never imports it.
 
 ## Safety model
 
@@ -47,6 +47,8 @@ These are not preferences; they are enforced by the code and covered by tests.
 - Python 3.11 or newer
 - `espeak-ng` for read-aloud (`mbrola` plus a voice such as `mbrola-us1` is an
   optional quality tier)
+- `kilix-piper-tts` plus its explicitly installed
+  `piper-en-us-kristin-medium` model for the optional local neural tier
 - `ffmpeg` or `lame` only when exporting MP3; WAV export needs no encoder
 - PulseAudio or PipeWire tools — `parec`/`pacat`, or ALSA's `arecord`/`aplay`
 - `libvosk.so` and a model for dictation, built and fetched by Kilix's pinned
@@ -72,7 +74,10 @@ Both TUIs also work as plain CLIs:
 ./kilix-tts --print
 ./kilix-tts --set wpm=200
 ./kilix-tts --models
+./kilix-tts --install piper-en-us-kristin-medium
 ./kilix-tts --speak "Hello from Kilix"
+./kilix-tts --speak "Hello from Kristin" \
+  --model piper-en-us-kristin-medium
 printf '%s\n' "Text from an agent" | \
   ./kilix-tts --speak - --model mbrola --voice us1 --rate 200
 ./kilix-tts --speak - --model espeak --voice en-us \
@@ -86,13 +91,19 @@ printf '%s\n' "Text from an agent" | \
 ```
 
 `kilix-tts --speak` returns as soon as `kilix-voiced` accepts the turn; speech
-continues in the background and a new turn replaces it. `--model espeak` and
-`--model mbrola` are the currently registered local model families. A request
+continues in the background and a new turn replaces it. `--model espeak`,
+`--model mbrola`, and `--model piper-en-us-kristin-medium` are the registered
+local model families. A request
 may also override the voice and one of the shared WPM presets without changing
 the saved read-aloud settings. Model IDs are catalogued: callers cannot supply
 an executable, model path, URL, or download action. An explicit MBROLA request
 fails if its voice is unavailable; the longstanding saved MBROLA preference
 keeps its eSpeak fallback. Use `--speak -` for strict UTF-8 standard input.
+The Piper model has the fixed `en_US-kristin-medium` voice and CPU-only
+inference. `--install piper-en-us-kristin-medium` is a separate explicit
+network action delegated to the checksum-pinned `kilix-piper-tts` catalog;
+listing models, opening the TUI, and speaking with other engines never
+download it.
 When running from a source checkout, start `./kilix-voiced` first; the main
 `kilix speak` wrapper starts an installed daemon on demand.
 
@@ -127,6 +138,9 @@ source checkout or an ambient `PYTHONPATH`.
 
 ## Release history
 
+- **0.1.6** — add the isolated persistent Piper provider contract, explicit
+  pinned Kristin installation, cancellable neural speech, and WAV/MP3 export
+  through the existing arbitrary-text CLI.
 - **0.1.5** — render arbitrary speech to private, no-overwrite WAV or MP3
   files, with the daemon's conditioning and model-selection semantics.
 - **0.1.4** — add arbitrary-text/stdin speech, safe per-request TTS

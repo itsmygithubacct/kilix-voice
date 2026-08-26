@@ -27,7 +27,7 @@ class InstalledRuntimeTests(unittest.TestCase):
             self.assertTrue((package / "__init__.py").is_file())
             self.assertEqual(
                 (prefix / "lib" / "kilix-voice" / "VERSION").read_text(),
-                "0.1.5\n",
+                "0.1.6\n",
             )
 
             env = {
@@ -47,7 +47,7 @@ class InstalledRuntimeTests(unittest.TestCase):
                         capture_output=True,
                         text=True,
                     )
-                    self.assertEqual(result.stdout.strip(), f"{tool} 0.1.5")
+                    self.assertEqual(result.stdout.strip(), f"{tool} 0.1.6")
 
 
 if __name__ == "__main__":

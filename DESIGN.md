@@ -261,6 +261,11 @@ class NullTts:   name = "null"; model = "off"
 class EspeakTts: name = "espeak"     # espeak-ng --stdout, WAV parsed in memory
     model: str                         # "espeak" or "mbrola"
     def synth(self, text: str) -> tuple[bytes, int]     # (s16le mono pcm, rate)
+class PiperTts:  name = "piper"
+    model = "piper-en-us-kristin-medium"
+    voice = "en_US-kristin-medium"
+    def synth(self, text: str) -> tuple[bytes, int]
+    def cancel(self) -> None
 
 class SentenceChunker:
     def feed(self, text: str) -> list[str]   # complete sentences
@@ -285,6 +290,14 @@ unavailable** rather than failing the read. That compatibility fallback applies
 to the saved preference only. An explicit per-request `model="mbrola"` is exact
 and fails closed rather than claiming it used a model that was unavailable.
 
+`PiperTts` launches only the fixed `kilix-piper-tts` provider executable. The
+provider is an independent GPL release closure: it owns Piper, ONNX Runtime,
+the checksum-pinned model catalog, and a private persistent worker. Kilix Voice
+sends bounded ordinary UTF-8 text, the registered model ID, and a preset rate;
+it never sends an executable, path, URL, or raw phoneme block. Cancelling a turn
+kills the provider client, whose disconnected socket causes the provider to
+kill and recreate an in-flight worker.
+
 ### kilix-tts CLI
 
 `--speak TEXT` sends arbitrary text through the same daemon, arbiter, engine,
@@ -302,6 +315,9 @@ to synchronous file rendering. Only `.wav` and `.mp3` suffixes are accepted;
 MP3 uses an installed local `ffmpeg` or `lame`, never the network. Export does
 not contact the daemon or open an audio device. It uses `render_text`, refuses
 mixed sample rates, writes mode 0600, and refuses to replace an existing path.
+`--install piper-en-us-kristin-medium` is the only TTS network action and is a
+standalone explicit command delegated to the fixed provider. `--models` and
+status inspection remain download-free.
 
 ### voicelib/arbiter.py
 

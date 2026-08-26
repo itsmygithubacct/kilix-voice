@@ -22,6 +22,8 @@ ENGINE_CHOICES = (ENGINE_VOSK, ENGINE_VIBEVOICE, ENGINE_OFF)
 
 TTS_ENGINE_ESPEAK = "espeak"
 TTS_ENGINE_MBROLA = "mbrola"
+TTS_ENGINE_PIPER = "piper"
+PIPER_KRISTIN_MODEL = "piper-en-us-kristin-medium"
 
 
 class ModelSpec(NamedTuple):
@@ -37,10 +39,10 @@ class ModelSpec(NamedTuple):
 class TtsModelSpec(NamedTuple):
     """One synthesis family selectable by an untrusted speak request.
 
-    The ID is deliberately separate from the engine name.  They happen to be
-    equal for the two system synthesis families, while a future immutable
-    neural model ID will map to its shared runtime without widening the wire
-    protocol to arbitrary executable names or model paths.
+    The ID is deliberately separate from the engine name. They are equal for
+    the two system synthesis families; the immutable Piper model ID maps to
+    its isolated provider without widening the wire protocol to arbitrary
+    executable names or model paths.
     """
 
     catalog_id: str
@@ -96,6 +98,13 @@ TTS_MODELS = (
         "local MBROLA diphone voices through eSpeak; explicit model requests "
         "fail closed when the voice is absent",
     ),
+    TtsModelSpec(
+        PIPER_KRISTIN_MODEL,
+        TTS_ENGINE_PIPER,
+        True,
+        "local neural US English speech through the isolated persistent "
+        "Piper provider and its pinned Kristin medium voice",
+    ),
 )
 
 TTS_MODEL_BY_ID = {spec.catalog_id: spec for spec in TTS_MODELS}
@@ -136,9 +145,11 @@ __all__ = [
     "REQUIRED_FILES",
     "TTS_ENGINE_ESPEAK",
     "TTS_ENGINE_MBROLA",
+    "TTS_ENGINE_PIPER",
     "TTS_MODELS",
     "TTS_MODEL_BY_ID",
     "TTS_MODEL_IDS",
+    "PIPER_KRISTIN_MODEL",
     "TtsModelSpec",
     "engine_for_model",
     "tts_engine_for_model",

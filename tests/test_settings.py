@@ -23,7 +23,8 @@ from voicelib import settings
 DESIGN_TABLE: dict[str, tuple[str, tuple[str, ...] | None]] = {
     "KILIX_CHROME_SPEAK": ("1", None),
     "KILIX_CHROME_DICTATE": ("1", None),
-    "KILIX_VOICE_TTS_ENGINE": ("espeak", ("espeak", "mbrola", "off")),
+    "KILIX_VOICE_TTS_ENGINE": (
+        "espeak", ("espeak", "mbrola", "piper", "off")),
     "KILIX_VOICE_TTS_VOICE": ("en-us", None),
     "KILIX_VOICE_TTS_RATE": ("170", ("120", "150", "170", "200", "240")),
     "KILIX_VOICE_TTS_EXTENT": ("screen", ("screen", "scrollback", "selection")),

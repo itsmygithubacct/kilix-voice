@@ -264,6 +264,8 @@ class TtsToolTests(unittest.TestCase):
                                   return_value=("en-gb", "en-us")), \
                 mock.patch.object(self.tool.settings, "tts_engine",
                                   return_value="espeak"), \
+                mock.patch.object(self.tool.tts_lib, "piper_status",
+                                  return_value=(False, "not installed")), \
                 contextlib.redirect_stdout(output):
             self.assertEqual(self.tool.main(["--models"]), 0)
 
@@ -272,6 +274,24 @@ class TtsToolTests(unittest.TestCase):
             self.assertIn(f"model={spec.catalog_id}", shown)
         self.assertNotIn("command=", shown)
         self.assertNotIn("url=", shown)
+
+    def test_install_delegates_only_to_the_fixed_piper_provider(self) -> None:
+        completed = self.tool.subprocess.CompletedProcess(
+            ["provider"], 0, "Installed Kristin\n", "")
+        output = io.StringIO()
+        with mock.patch.object(
+                self.tool.tts_lib, "piper_binary",
+                return_value="/fixed/kilix-piper-tts"), \
+                mock.patch.object(
+                    self.tool.subprocess, "run",
+                    return_value=completed) as run, \
+                contextlib.redirect_stdout(output):
+            self.assertEqual(self.tool.main([
+                "--install", models.PIPER_KRISTIN_MODEL]), 0)
+        self.assertEqual(run.call_args.args[0], [
+            "/fixed/kilix-piper-tts", "install",
+            models.PIPER_KRISTIN_MODEL])
+        self.assertIn("Installed Kristin", output.getvalue())
 
 
 if __name__ == "__main__":
