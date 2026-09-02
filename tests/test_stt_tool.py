@@ -83,9 +83,16 @@ class ModelCatalogTests(unittest.TestCase):
         self.assertIn("runtime_supported=no", shown)
 
     def test_json_catalog_is_versioned_complete_and_download_free(self) -> None:
+        # GPU_TERMINAL_SETTINGS_FILE as well as KILIX_DATA_HOME: a live Kilix
+        # session exports it, and the catalog's default_model is read through
+        # it. Without this the assertion below tests whichever model the
+        # operator happens to have selected, and fails on any machine where
+        # that is not the default. Every other test in this file already
+        # points it at a sandbox.
         with tempfile.TemporaryDirectory() as root, mock.patch.dict(
             os.environ,
-            {"KILIX_DATA_HOME": os.path.join(root, "data")},
+            {"KILIX_DATA_HOME": os.path.join(root, "data"),
+             "GPU_TERMINAL_SETTINGS_FILE": os.path.join(root, "settings.conf")},
         ), mock.patch.object(tool, "install_model") as install:
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
