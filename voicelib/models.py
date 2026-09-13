@@ -231,6 +231,18 @@ def read_catalog(document: object) -> dict:
                 f"model record {index} device_class must be one of: "
                 f"{', '.join(resources.DEVICE_CLASSES)}, got "
                 f"{record['device_class']!r}.")
+        if ("device_class" in record and "resource_profile" in record
+                and isinstance(record["resource_profile"], dict)
+                and record["resource_profile"].get("device_class")
+                != record["device_class"]):
+            # Two device declarations that disagree cannot both be acted on,
+            # and picking one silently is how a cuda model gets scheduled onto
+            # a cpu. Refuse the record instead.
+            raise CatalogError(
+                f"model record {index} declares device_class "
+                f"{record['device_class']!r} but its resource_profile declares "
+                f"{record['resource_profile'].get('device_class')!r}; they must "
+                "agree.")
         if "resource_profile" in record:
             # C18: conformance is checked here, at the boundary, so a
             # malformed profile cannot reach a consumer that would size

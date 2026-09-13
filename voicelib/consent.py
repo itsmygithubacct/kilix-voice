@@ -16,10 +16,12 @@ Importing this module performs no filesystem work.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import tempfile
+from contextlib import contextmanager
 
 from . import paths
 
@@ -31,8 +33,34 @@ _SUBJECT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 
 
+LOCK_FILE = "consent.lock"
+
+
 class ConsentError(ValueError):
     """Malformed consent input, or an unreadable record."""
+
+
+@contextmanager
+def _transaction():
+    """Serialise a whole read-modify-write across writers.
+
+    An atomic rename guarantees that readers never see a half-written file. It
+    does NOT isolate transactions: two writers that each load, modify their own
+    copy and replace the whole file lose one of the two updates. An independent
+    review demonstrated exactly that with two concurrent grants of different
+    subjects, only one of which survived.
+
+    The lock is a separate file, so it is never the thing being replaced.
+    """
+    directory = paths.ensure_private_dir(paths.data_dir())
+    handle = os.open(os.path.join(directory, LOCK_FILE),
+                     os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, FILE_MODE)
+    try:
+        os.fchmod(handle, FILE_MODE)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield directory
+    finally:
+        os.close(handle)          # releases the flock
 
 
 def consent_path() -> str:
@@ -73,6 +101,20 @@ def _load() -> dict:
         raise ConsentError(
             f"consent record at {consent_path()} is not {CONSENT_SCHEMA}. "
             "Remove it and grant consent again.")
+    grants = record.get("grants")
+    if grants is not None:
+        if not isinstance(grants, dict):
+            raise ConsentError(
+                f"consent record at {consent_path()} has a malformed 'grants'. "
+                "Remove it and grant consent again.")
+        for key, value in grants.items():
+            # A malformed entry must not read as "no grant for that subject":
+            # that would silently downgrade to unconsented and hide tampering.
+            if not isinstance(key, str) or not _SUBJECT.fullmatch(key) \
+                    or not isinstance(value, str) or not _DIGEST.fullmatch(value):
+                raise ConsentError(
+                    f"consent record at {consent_path()} has a malformed grant "
+                    f"for {key!r}. Remove it and grant consent again.")
     return record
 
 
@@ -83,12 +125,12 @@ def grant(subject: str, digest: str) -> dict:
     grant, which is what S02's "reuse" means.
     """
     subject, digest = _checked(subject, digest)
-    existing = _load()
-    grants = dict(existing.get("grants") or {})
-    if grants.get(subject) != digest:
+    with _transaction():
+        existing = _load()
+        grants = dict(existing.get("grants") or {})
         grants[subject] = digest
-    record = {"schema": CONSENT_SCHEMA, "grants": grants}
-    _write(record)
+        record = {"schema": CONSENT_SCHEMA, "grants": grants}
+        _write(record)
     return record
 
 
@@ -98,12 +140,12 @@ def _write(record: dict) -> None:
     handle, temporary = tempfile.mkstemp(dir=directory, prefix=".consent-")
     try:
         with os.fdopen(handle, "wb") as stream:
-            # Defence in depth, NOT the guarantor: tempfile.mkstemp already
-            # creates 0600 regardless of umask, so removing this line does not
-            # change the observed mode -- measured, and the mutation test that
-            # deletes it correctly still passes. It is kept so the intended mode
-            # is stated at the write site rather than inherited from mkstemp's
-            # documented behaviour.
+            # LOAD-BEARING. An earlier annotation here claimed mkstemp gives
+            # 0600 "regardless of umask" and that this line was mere defence in
+            # depth. That was wrong, and an independent review caught it: a
+            # umask can only NARROW creation, so under umask 0777 mkstemp
+            # yields mode 0000 and only this fchmod restores 0600. Measured:
+            # umask 0000 -> 0600, 0077 -> 0600, 0777 -> 0000.
             os.fchmod(stream.fileno(), FILE_MODE)
             stream.write(json.dumps(record, sort_keys=True).encode("utf-8"))
             stream.flush()
@@ -131,10 +173,11 @@ def revoke(subject: str) -> bool:
     """Drop any grant for ``subject``; return whether one was present."""
     if not isinstance(subject, str) or not _SUBJECT.fullmatch(subject):
         raise ConsentError(f"invalid consent subject {subject!r}.")
-    record = _load()
-    grants = dict(record.get("grants") or {})
-    if subject not in grants:
-        return False
-    del grants[subject]
-    _write({"schema": CONSENT_SCHEMA, "grants": grants})
+    with _transaction():
+        record = _load()
+        grants = dict(record.get("grants") or {})
+        if subject not in grants:
+            return False
+        del grants[subject]
+        _write({"schema": CONSENT_SCHEMA, "grants": grants})
     return True

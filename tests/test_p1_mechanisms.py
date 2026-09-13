@@ -291,16 +291,119 @@ class ConsentTestCase(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode), 0o700)
 
     def test_mode_is_not_umask_dependent(self) -> None:
-        # Real property, but note what enforces it: tempfile.mkstemp creates
-        # 0600 whatever the umask. Deleting the explicit fchmod in _write does
-        # NOT turn this red. Recorded so nobody reads a pass here as proof that
-        # the fchmod is load-bearing.
+        # An earlier version of this comment claimed mkstemp gives 0600
+        # "whatever the umask" and that the explicit fchmod was not
+        # load-bearing. WRONG, and an independent review caught it: a umask can
+        # only narrow creation. Measured: umask 0000 -> 0600, 0077 -> 0600,
+        # 0777 -> 0000. See test_mode_survives_a_hostile_umask, which is the
+        # arm that actually discriminates.
         old = os.umask(0o000)
         try:
             consent.grant("dictation", self.A)
             self.assertEqual(stat.S_IMODE(os.stat(consent.consent_path()).st_mode), 0o600)
         finally:
             os.umask(old)
+
+    def test_mode_survives_a_hostile_umask(self) -> None:
+        # THIS is the discriminating arm: under umask 0777 mkstemp yields 0000
+        # and only the explicit fchmod restores 0600. Deleting that fchmod
+        # turns this red.
+        # Establish the directories under a normal umask first. Creating them
+        # under 0777 fails outright, because paths.ensure_private_dir hardens
+        # only the LEAF: os.makedirs(parent, mode=DIR_MODE) has the umask strip
+        # every ancestor bit. That is a real pre-existing defect in a pinned
+        # seam, recorded separately; it is not what this test is about.
+        consent.grant("dictation", self.A)
+        os.unlink(consent.consent_path())
+        old = os.umask(0o777)
+        try:
+            consent.grant("dictation", self.A)
+            self.assertEqual(stat.S_IMODE(os.stat(consent.consent_path()).st_mode),
+                             0o600)
+        finally:
+            os.umask(old)
+
+    def test_concurrent_grants_of_different_subjects_are_all_retained(self) -> None:
+        # Finding 7: atomic rename gives complete-file visibility, not isolated
+        # transactions. This forces the LOST-UPDATE interleaving deterministically
+        # instead of hoping two threads race: writer A is held between its read
+        # and its write while writer B completes. Without the transaction lock A
+        # then writes back a record that never saw B. With the lock, B cannot
+        # start until A has finished, so both survive.
+        import threading
+        a_has_read = threading.Event()
+        b_has_finished = threading.Event()
+        real_load = consent._load
+        first_call = {"done": False}
+
+        def slow_load():
+            record = real_load()
+            if not first_call["done"]:
+                first_call["done"] = True
+                a_has_read.set()
+                b_has_finished.wait(timeout=5)
+            return record
+
+        errors = []
+
+        def writer_a():
+            try:
+                with mock.patch.object(consent, "_load", slow_load):
+                    consent.grant("first", self.A)
+            except BaseException as error:
+                errors.append(error)
+
+        def writer_b():
+            try:
+                a_has_read.wait(timeout=5)
+                consent.grant("second", self.B)
+            finally:
+                b_has_finished.set()
+
+        threads = [threading.Thread(target=writer_a), threading.Thread(target=writer_b)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=15)
+        self.assertEqual(errors, [])
+        self.assertTrue(consent.granted("first", self.A), "writer A's grant was lost")
+        self.assertTrue(consent.granted("second", self.B), "writer B's grant was lost")
+
+    def test_the_transaction_is_actually_exclusive(self) -> None:
+        # Direct check of the mechanism, not of a race: while one transaction is
+        # open, a second must not be able to enter.
+        import threading
+        inside = threading.Event()
+        release = threading.Event()
+        second_entered = threading.Event()
+
+        def holder():
+            with consent._transaction():
+                inside.set()
+                release.wait(timeout=5)
+
+        def contender():
+            inside.wait(timeout=5)
+            with consent._transaction():
+                second_entered.set()
+
+        h = threading.Thread(target=holder); c = threading.Thread(target=contender)
+        h.start(); c.start()
+        inside.wait(timeout=5)
+        self.assertFalse(second_entered.wait(timeout=0.5),
+                         "a second transaction entered while the first was open")
+        release.set()
+        h.join(timeout=5); c.join(timeout=5)
+        self.assertTrue(second_entered.is_set(), "the lock was never released")
+
+    def test_a_malformed_grant_entry_is_refused_not_read_as_absent(self) -> None:
+        consent.grant("dictation", self.A)
+        with open(consent.consent_path(), "w") as handle:
+            json.dump({"schema": consent.CONSENT_SCHEMA,
+                       "grants": {"dictation": "not-a-digest"}}, handle)
+        with self.assertRaises(consent.ConsentError) as caught:
+            consent.granted("dictation", self.A)
+        self.assertIn("malformed grant", str(caught.exception))
 
     def test_revoke(self) -> None:
         consent.grant("dictation", self.A)
@@ -568,6 +671,30 @@ class LegacyCatalogEntryTestCase(unittest.TestCase):
                                "device_class": "cuda",
                                "measured": {"host": "pleon", "date": "2026-09-13",
                                             "peak_vram_mib": 3629}}}]}
+        self.assertEqual(models.read_catalog(doc)["models"][0]["device_class"], "cuda")
+
+    def test_contradictory_device_declarations_are_refused(self) -> None:
+        # Finding 6: both were validated individually and never compared, so a
+        # cuda model could be scheduled onto a cpu.
+        doc = {"schema": models.CATALOG_SCHEMA,
+               "models": [{"id": "m", "engine": "vosk", "device_class": "cpu",
+                           "resource_profile": {
+                               "schema": resources.RESOURCE_SCHEMA,
+                               "device_class": "cuda",
+                               "measured": {"host": "h", "date": "2026-09-13",
+                                            "peak_vram_mib": 100}}}]}
+        with self.assertRaises(models.CatalogError) as caught:
+            models.read_catalog(doc)
+        self.assertIn("they must", str(caught.exception))
+
+    def test_agreeing_device_declarations_are_accepted(self) -> None:   # control
+        doc = {"schema": models.CATALOG_SCHEMA,
+               "models": [{"id": "m", "engine": "vosk", "device_class": "cuda",
+                           "resource_profile": {
+                               "schema": resources.RESOURCE_SCHEMA,
+                               "device_class": "cuda",
+                               "measured": {"host": "h", "date": "2026-09-13",
+                                            "peak_vram_mib": 100}}}]}
         self.assertEqual(models.read_catalog(doc)["models"][0]["device_class"], "cuda")
 
     def test_a_malformed_profile_is_refused_at_the_catalog_boundary(self) -> None:
