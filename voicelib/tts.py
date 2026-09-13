@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 from typing import NamedTuple
 
 from . import models, settings, util
@@ -51,6 +52,26 @@ INSTALL_HINT = ("Install it (Debian/Ubuntu: sudo apt install espeak-ng; "
 # becomes argv for espeak-ng, so it is held to an alphabet even when a caller
 # passes it directly instead of through the shared settings file.
 _VOICE_TOKEN = re.compile(r"^[A-Za-z0-9_+-]{1,32}$")
+
+
+def _bounded(cap: float, budget: float | None) -> float:
+    """The timeout for a blocking engine call, under the caller's budget.
+
+    R3 F01: every engine applied its OWN ceiling -- about 20 s plus text cost
+    for eSpeak, 210 s for Piper, 5 s for Piper's status probe -- no matter how
+    little the caller had left.  Nothing can poll a deadline while
+    ``communicate`` is blocked, so an engine ceiling longer than the request
+    budget is a hole the daemon cannot close from outside.  Whichever is
+    smaller wins.
+
+    ``budget`` is seconds remaining, or None for an unbounded caller.
+    """
+    if budget is None:
+        return cap
+    if budget <= 0:
+        raise TtsError(
+            "the request deadline elapsed before synthesis could start")
+    return min(cap, budget)
 
 
 class TtsError(RuntimeError):
@@ -361,7 +382,8 @@ class NullTts:
     voice = ""
     rate = 0
 
-    def synth(self, text: str) -> tuple[bytes, int]:
+    def synth(self, text: str, *,
+              budget: float | None = None) -> tuple[bytes, int]:
         """Return an empty clip regardless of ``text``."""
         return b"", ESPEAK_SAMPLE_RATE
 
@@ -461,8 +483,10 @@ class EspeakTts:
                 "(run: espeak-ng --voices).")
         return token
 
-    def synth(self, text: str) -> tuple[bytes, int]:
+    def synth(self, text: str, *,
+              budget: float | None = None) -> tuple[bytes, int]:
         """Return (s16le mono PCM, sample rate) for one clip of ``text``."""
+        started = time.monotonic()
         clean = _as_text(text).strip()
         if not clean:
             # A screen of nothing but decoration conditions down to nothing;
@@ -470,7 +494,7 @@ class EspeakTts:
             return b"", ESPEAK_SAMPLE_RATE
         if self._mbrola_ok:
             try:
-                return self._run(clean, f"mb-{self.voice}")
+                return self._run(clean, f"mb-{self.voice}", budget=budget)
             except TtsError as error:
                 if not self._mbrola_fallback:
                     raise
@@ -479,11 +503,18 @@ class EspeakTts:
                 # paying for a doomed process once per sentence.
                 self._mbrola_ok = False
                 self.mbrola_error = str(error)
-        return self._run(clean, self.voice)
+        # The fallback inherits what the FIRST attempt left, not a fresh
+        # allowance: two full budgets would let one request take twice as long
+        # as it asked for.
+        left = (None if budget is None
+                else budget - (time.monotonic() - started))
+        return self._run(clean, self.voice, budget=left)
 
-    def _run(self, text: str, voice: str) -> tuple[bytes, int]:
+    def _run(self, text: str, voice: str, *,
+             budget: float | None = None) -> tuple[bytes, int]:
         command = build_synth_cmd(self._cfg, voice=voice, rate=self.rate)
-        timeout = SYNTH_TIMEOUT_BASE_S + len(text) * SYNTH_TIMEOUT_PER_CHAR_S
+        timeout = _bounded(
+            SYNTH_TIMEOUT_BASE_S + len(text) * SYNTH_TIMEOUT_PER_CHAR_S, budget)
         try:
             process = subprocess.Popen(
                 command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -531,7 +562,7 @@ def piper_binary() -> str | None:
     return util.which(os.environ.get(PIPER_ENV_COMMAND, "kilix-piper-tts"))
 
 
-def piper_status() -> tuple[bool, str]:
+def piper_status(*, budget: float | None = None) -> tuple[bool, str]:
     """Inspect the provider and pinned model without starting it or networking."""
     binary = piper_binary()
     if binary is None:
@@ -540,12 +571,19 @@ def piper_status() -> tuple[bool, str]:
             "kilix-piper-tts module, then run `kilix-tts --install "
             f"{models.PIPER_KRISTIN_MODEL}`."
         )
+    # Clamp BEFORE the try. _bounded raises TtsError on an exhausted budget,
+    # and this function's contract is to RETURN (ok, detail) -- letting that
+    # escape would hand every caller an exception where they expect a tuple.
+    if budget is not None and budget <= 0:
+        return False, ("the request deadline elapsed before "
+                       f"{binary} could be inspected")
+    status_timeout = _bounded(PIPER_STATUS_TIMEOUT_S, budget)
     try:
         result = subprocess.run(
             [binary, "status", "--json"],
             capture_output=True,
             check=False,
-            timeout=PIPER_STATUS_TIMEOUT_S,
+            timeout=status_timeout,
             text=True,
             errors="replace",
         )
@@ -598,15 +636,17 @@ class PiperTts:
         self._process: subprocess.Popen[bytes] | None = None
         self._cancelled = False
 
-    def check_available(self) -> None:
-        available, detail = piper_status()
+    def check_available(self, *, budget: float | None = None) -> None:
+        available, detail = piper_status(budget=budget)
         if not available:
             raise TtsError(detail)
 
-    def synth(self, text: str) -> tuple[bytes, int]:
+    def synth(self, text: str, *,
+              budget: float | None = None) -> tuple[bytes, int]:
         clean = _as_text(text).strip()
         if not clean:
             return b"", PIPER_SAMPLE_RATE
+        timeout = _bounded(PIPER_SYNTH_TIMEOUT_S, budget)
         binary = piper_binary()
         if binary is None:
             raise TtsError(
@@ -633,12 +673,12 @@ class PiperTts:
                 pass
         try:
             out, err = process.communicate(
-                clean.encode("utf-8", "replace"), timeout=PIPER_SYNTH_TIMEOUT_S)
+                clean.encode("utf-8", "replace"), timeout=timeout)
         except subprocess.TimeoutExpired as error:
             process.kill()
             process.communicate()
             raise TtsError(
-                f"{binary} did not finish within {PIPER_SYNTH_TIMEOUT_S:.0f} "
+                f"{binary} did not finish within {timeout:.0f} "
                 "seconds; run its status command and retry."
             ) from error
         finally:
