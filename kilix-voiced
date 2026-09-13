@@ -45,15 +45,18 @@ text is never logged — it is the user's, and stderr is not private.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
+import select
 import selectors
 import signal
 import socket
 import stat
 import struct
 import sys
+import termios
 import threading
 import time
 from collections.abc import Callable
@@ -87,6 +90,10 @@ IDLE_SECONDS = 300.0
 LISTEN_BACKLOG = 8
 ACCEPT_POLL_S = 1.0          # also the resolution of the idle timer
 REQUEST_TIMEOUT_S = 2.0      # a peer that connects and then says nothing
+# How long a refused peer that sent more than was read gets to read the reply
+# before the connection closes under it. Only a connection with a record still
+# unread waits at all; a normal single-record request never does.
+REFUSAL_LINGER_S = 0.25
 DATAGRAM_TIMEOUT_S = 1.0     # a dictation receiver that stopped reading
 SPEECH_POLL_S = 0.05         # how often a speech turn notices a cancellation
 CAPTURE_POLL_S = 0.2
@@ -619,12 +626,45 @@ class Daemon:
                     conn.send(frame)
                 except OSError as error:
                     self._debug(f"client left before the reply: {error}")
+                    return
+                self._linger_for_peer(conn)
             except Exception as error:
                 # BaseException still propagates: a signal or SystemExit
                 # keeps its meaning. Only the type is logged, never the
                 # message, which can carry what the request said.
                 self._warn(f"a connection failed unexpectedly "
                            f"({type(error).__name__}); still serving")
+
+    def _linger_for_peer(self, conn: socket.socket) -> None:
+        """Let a peer that sent more than was read see the reply before close.
+
+        Closing an AF_UNIX SEQPACKET connection with a record still unread
+        makes the peer's NEXT recv fail with ECONNRESET, ahead of the reply
+        already queued for it; the reply is readable only on a second recv.
+        That hits exactly the peers a refusal is for: a client that split one
+        frame across two records, and a non-owner whose request is never read
+        at all. kilix_voice.py logs the OSError and gives up, and speech.c
+        counts it a bad reply, so neither ever saw the refusal.
+
+        So when FIONREAD says a record is still queued, wait -- up to
+        REFUSAL_LINGER_S -- for the peer to hang up, without reading what it
+        sent: the daemon must still never read a non-owner's request. POLLHUP
+        and POLLERR are always reported, so the wait ends the moment the peer
+        closes. A connection with nothing unread returns at once.
+        """
+        try:
+            unread = struct.unpack("i", fcntl.ioctl(
+                conn.fileno(), termios.FIONREAD, b"\0\0\0\0"))[0]
+        except (OSError, ValueError):
+            return
+        if unread <= 0:
+            return
+        poller = select.poll()
+        poller.register(conn.fileno(), select.POLLRDHUP)
+        try:
+            poller.poll(int(REFUSAL_LINGER_S * 1000))
+        except OSError:
+            pass
 
     def _answer(self, conn: socket.socket) -> dict | None:
         """Return the reply for one connection, or None to just hang up."""

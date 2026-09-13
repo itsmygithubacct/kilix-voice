@@ -15,6 +15,7 @@ import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -119,6 +120,54 @@ class AcceptOneGuardTestCase(_ListeningFixture):
         self.assertLessEqual(len(frame), protocol.MAX_REPLY_BYTES)
         reply = protocol.decode(frame)
         self.assertEqual(reply["code"], protocol.ERR_INTERNAL)
+
+
+class LingerForPeerTestCase(unittest.TestCase):
+    """A refused peer with a record still unread reads the reply first."""
+
+    def pair(self):
+        server, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.addCleanup(server.close)
+        self.addCleanup(peer.close)
+        return server, peer
+
+    def linger(self, server):
+        d = object.__new__(voiced.Daemon)
+        started = time.monotonic()
+        voiced.Daemon._linger_for_peer(d, server)
+        return time.monotonic() - started
+
+    def test_a_peer_that_never_hangs_up_is_released_after_the_linger(self) -> None:
+        server, peer = self.pair()
+        peer.send(b"a record nobody reads")
+        elapsed = self.linger(server)
+        self.assertGreaterEqual(elapsed, voiced.REFUSAL_LINGER_S * 0.8,
+                                "it did not wait for the peer at all")
+        self.assertLess(elapsed, voiced.REFUSAL_LINGER_S + 0.1)
+
+    def test_a_peer_that_hangs_up_ends_the_wait_at_once(self) -> None:
+        server, peer = self.pair()
+        peer.send(b"a record nobody reads")
+        closer = threading.Timer(0.03, peer.close)
+        closer.start()
+        self.addCleanup(closer.cancel)
+        elapsed = self.linger(server)
+        self.assertLess(elapsed, 0.1)
+
+    def test_nothing_unread_costs_no_wait_and_builds_no_poller(self) -> None:
+        server, _peer = self.pair()
+        with mock.patch.object(voiced.select, "poll",
+                               mock.Mock(side_effect=AssertionError("poll built"))) as poll:
+            elapsed = self.linger(server)
+        poll.assert_not_called()
+        self.assertLess(elapsed, 0.05)
+
+    def test_the_request_is_never_read_while_lingering(self) -> None:
+        server, peer = self.pair()
+        peer.send(b"a non-owner's request")
+        peer.close()
+        self.linger(server)
+        self.assertEqual(server.recv(1 << 16), b"a non-owner's request")
 
 
 class DispatchNetTestCase(unittest.TestCase):

@@ -419,6 +419,35 @@ class DaemonTestCase(unittest.TestCase):
                 self.assertIsNone(self.daemon.poll(), self._log_tail())
                 self.assertTrue(self.request({"op": "status"})["ok"])
 
+    def test_a_split_frame_is_refused_on_the_first_recv(self) -> None:
+        # One request is one record, so the first half alone is refused. The
+        # second half is never read, and closing with it unread used to reset
+        # the client's first recv: the refusal was readable only on a second.
+        #
+        # Both records must be queued before the daemon reads the first, or
+        # nothing is left unread and the test proves nothing -- and on a fast
+        # host the daemon wins that race. The daemon serves one connection at
+        # a time, so an idle connection accepted first holds it in recv while
+        # both records queue behind; closing the idle one releases it.
+        blocker = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        client.settimeout(REPLY_TIMEOUT_S)
+        with blocker, client:
+            blocker.connect(self.control)
+            client.connect(self.control)
+            client.send(b'{"op":"sta')
+            client.send(b'tus"}\n')
+            blocker.close()
+            try:
+                raw = client.recv(MAX_REPLY_BYTES)
+            except ConnectionResetError:
+                self.fail("the refusal was not readable on the first recv: the "
+                          "connection reset came first")
+        reply = json.loads(raw.decode("utf-8"))
+        self.assertIs(reply["ok"], False, reply)
+        self.assertEqual(reply["code"], "malformed", reply)
+        self.assertTrue(self.request({"op": "status"})["ok"])
+
     # -- shutdown -----------------------------------------------------------
 
     def test_sigterm_removes_the_control_socket(self) -> None:
