@@ -506,10 +506,18 @@ def synthesis_chunk(sequence: int, *, pcm_bytes: int, sample_rate: int,
                     final: bool = False, **settings: object) -> dict:
     """Return one streamed synthesis chunk descriptor.
 
-    A12 sequence, A13 voice provenance, A14 seed and deterministic settings,
-    A15 the chunk is a bounded playable descriptor that arrives before the whole
-    utterance is finished. The samples themselves never ride in the JSON -- only
-    their length, which check_audio_bytes bounds.
+    A12 sequence, A13 voice provenance, A14 seed and deterministic settings.
+    The samples never ride in the JSON -- only their length, which
+    check_audio_bytes bounds.
+
+    WHAT THIS IS NOT, stated because the earlier docstring overclaimed it and an
+    independent review caught that: this descriptor carries length, rate and
+    provenance and NO path, handle or retrieval token for the PCM. The audio
+    goes to the daemon's local player. So a subscriber learns that a bounded
+    clip is playing and what produced it -- an ANNOUNCEMENT of local playback,
+    arriving before the utterance completes. It is not delivery of playable
+    audio to the subscriber, and A15's positive arm is not satisfied by it. A
+    playable transport, or a narrower A15, is still owed.
     """
     if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
         raise ProtocolError(

@@ -760,14 +760,26 @@ class Daemon:
         and pays nothing.
         """
         if turn.receiver is None:
-            return
+            turn.sequence += 1        # the clip happened whether or not
+            return                    # anyone subscribed to hear about it
         engine = turn.engine
-        final = turn.sequence == len(turn.chunks) - 1
+        # The ordinal is the CLIP's, taken before anything can fail. Deriving it
+        # from descriptor success made a failed build leave the counter behind
+        # the real position, so later sequences lagged and the true last clip
+        # could go unmarked -- R3 F05.
+        ordinal = turn.sequence
+        turn.sequence += 1
+        final = ordinal == len(turn.chunks) - 1
         try:
             chunk = protocol.synthesis_chunk(
-                turn.sequence, pcm_bytes=len(pcm), sample_rate=rate,
+                ordinal, pcm_bytes=len(pcm), sample_rate=rate,
                 voice=getattr(engine, "voice", "") or "unset",
-                model=getattr(engine, "model", "") or "unset",
+                # F06: the EFFECTIVE family, not the requested one. eSpeak's
+                # MBROLA fallback can synthesise through espeak while
+                # engine.model still reads "mbrola", so reporting the request
+                # would describe a path the clip did not take.
+                model=(getattr(engine, "effective_model", None)
+                       or getattr(engine, "model", "") or "unset"),
                 seed=getattr(engine, "seed", None),
                 final=final, turn=turn.id,
                 rate_wpm=getattr(engine, "rate", None))
@@ -775,7 +787,6 @@ class Daemon:
             # A malformed descriptor must not take the audio down with it.
             self._warn(f"synthesis chunk {turn.sequence} not published: {error}")
             return
-        turn.sequence += 1
         self._send(turn.receiver, chunk)
 
     def _await_clip(self, turn: _SpeechTurn, player: audio.Player) -> bool:

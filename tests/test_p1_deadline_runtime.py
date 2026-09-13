@@ -426,6 +426,10 @@ class StreamedSynthesisTestCase(unittest.TestCase):
     def _turn(self, chunks=("one", "two", "three")):
         engine = mock.Mock()
         engine.voice, engine.model, engine.rate, engine.seed = "en-us", "m1", 170, 7
+        # A bare Mock auto-creates any attribute, so effective_model would be a
+        # Mock object rather than absent -- and synthesis_chunk would refuse it.
+        # An engine that reports no effective family sets it to None.
+        engine.effective_model = None
         turn = voiced._SpeechTurn("speak-9", list(chunks), engine)
         turn.receiver = mock.Mock()
         return turn
@@ -477,6 +481,31 @@ class StreamedSynthesisTestCase(unittest.TestCase):
         daemon = self._daemon(); daemon._speech = turn
         voiced.Daemon._play_if_current(daemon, turn, mock.Mock(), b"\x00\x00", 24000)
         self.assertEqual(sent, [])
+
+    def test_provenance_reports_the_effective_family_not_the_requested_one(self) -> None:
+        # R3 F06: eSpeak's MBROLA fallback synthesises through espeak while
+        # engine.model still reads "mbrola". Reporting the request would name a
+        # path the clip did not take.
+        global sent; sent = []
+        turn = self._turn(); turn.engine.model = "mbrola"
+        turn.engine.effective_model = "espeak"
+        daemon = self._daemon(); daemon._speech = turn
+        voiced.Daemon._play_if_current(daemon, turn, mock.Mock(), b"\x00\x00", 24000)
+        self.assertEqual(sent[0]["model"], "espeak")
+
+    def test_the_ordinal_tracks_the_clip_not_descriptor_success(self) -> None:
+        # R3 F05: a failed descriptor build left the counter behind the real
+        # clip position, so later sequences lagged and the true last clip could
+        # go unmarked final.
+        global sent; sent = []
+        turn = self._turn(("a", "b", "c")); daemon = self._daemon(); daemon._speech = turn
+        turn.engine.voice = "not a valid token"        # clip 0 descriptor fails
+        voiced.Daemon._play_if_current(daemon, turn, mock.Mock(), b"\x00\x00", 24000)
+        turn.engine.voice = "en-us"                    # clips 1 and 2 succeed
+        voiced.Daemon._play_if_current(daemon, turn, mock.Mock(), b"\x00\x00", 24000)
+        voiced.Daemon._play_if_current(daemon, turn, mock.Mock(), b"\x00\x00", 24000)
+        self.assertEqual([c["sequence"] for c in sent], [1, 2])
+        self.assertEqual([c["final"] for c in sent], [False, True])
 
     def test_a_malformed_descriptor_does_not_take_the_audio_down(self) -> None:
         global sent; sent = []
