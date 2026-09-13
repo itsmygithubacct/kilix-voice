@@ -91,7 +91,31 @@ _VOICE_TOKEN = re.compile(r"^[A-Za-z0-9_+-]{1,32}$")
 
 
 class ProtocolError(ValueError):
-    """A malformed or unsafe message; the text says what to send instead."""
+    """A malformed or unsafe message; the text says what to send instead.
+
+    The base carries NO code. A ProtocolError can also be raised inside a
+    worker -- building a descriptor, say -- where the adapter's default of
+    `unavailable` is the right reading; a code on the base would silently turn
+    every one of those into `malformed`. The daemon's request-validation arm
+    supplies `malformed` as ITS default instead.
+
+    A raise site that knows the cause better passes ``code=`` for that one
+    instance. It is an instance attribute rather than a subclass on purpose:
+    the refusal of an incompatible protocol major is pinned by a frozen
+    contract vector as exactly ProtocolError, so its code cannot come from a
+    new type.
+    """
+
+    code: str | None = None
+
+    def __init__(self, message: str = "", *, code: str | None = None) -> None:
+        super().__init__(message)
+        if code is not None:
+            if code not in ERROR_CODES:
+                raise ValueError(
+                    f"unknown error code {code!r}. Use one of: "
+                    f"{', '.join(ERROR_CODES)}.")
+            self.code = code
 
 
 class MessageTooLarge(ProtocolError):
@@ -101,6 +125,8 @@ class MessageTooLarge(ProtocolError):
     matching on message text -- which is exactly the coupling the error-code
     vocabulary below exists to remove.
     """
+
+    code = ERR_TOO_LARGE
 
 
 def encode(msg: dict) -> bytes:
@@ -252,11 +278,15 @@ def _protocol_version(raw: object) -> str:
             f"{PROTOCOL_VERSION!r}.")
     major = int(match.group(1))
     if major != PROTOCOL_MAJOR:
+        # Well-formed, and refused because this daemon does not speak it: that
+        # is `unsupported`, not `malformed`. A token that is not a version at
+        # all (above) stays malformed.
         raise ProtocolError(
             f"protocol major {major} is not supported; this daemon speaks "
             f"{PROTOCOL_SCHEMA} (major {PROTOCOL_MAJOR}, current "
             f"{PROTOCOL_VERSION}). A different major means a request shape "
-            "changed meaning; upgrade the client rather than retrying.")
+            "changed meaning; upgrade the client rather than retrying.",
+            code=ERR_UNSUPPORTED)
     return text
 
 
@@ -289,9 +319,18 @@ def validate_request(msg: dict, session_dir: str) -> dict:
             f"a request must be a JSON object, got {type(msg).__name__}. "
             'Send for example {"op":"status"}.')
     op = msg.get("op")
-    if not isinstance(op, str) or op not in OPS:
+    # Two different refusals that used to share one message and, on the wire,
+    # the code `internal`. A missing or non-string op is a request that is not
+    # shaped like one: malformed. A string this daemon does not implement is a
+    # well-formed request for something it does not support.
+    if not isinstance(op, str):
         raise ProtocolError(
-            f"unknown op {op!r}. Use one of: {', '.join(OPS)}.")
+            f"'op' is required and must be a string, got "
+            f"{type(op).__name__}. Use one of: {', '.join(OPS)}.")
+    if op not in OPS:
+        raise ProtocolError(
+            f"unknown op {op!r}. Use one of: {', '.join(OPS)}.",
+            code=ERR_UNSUPPORTED)
     request: dict = {"op": op, "id": _request_id(msg.get("id"))}
     if "v" in msg:
         request["v"] = _protocol_version(msg.get("v"))

@@ -244,5 +244,71 @@ class CarriedCodeTestCase(unittest.TestCase):
                 self.assertEqual(reply["code"], sent[0]["code"])
 
 
+class ValidationRefusalCodesTestCase(_ControlFixture):
+    """MALFORMED-GAP and V08: a caller's request shape is never `internal`."""
+
+    def reply(self, raw):
+        d = object.__new__(voiced.Daemon)
+        d._session_dir = self.session
+        d._touch = lambda: None
+        return voiced.Daemon._dispatch(d, raw)
+
+    def test_each_refusal_carries_the_code_for_its_cause(self) -> None:
+        outside = os.path.join(os.path.dirname(self.session), "elsewhere.sock")
+        table = (
+            ({"op": "speak", "text": "hi", "deadline_ms": 0}, protocol.ERR_MALFORMED),
+            ({"op": "speak", "text": "hi", "deadline_ms": "x"}, protocol.ERR_MALFORMED),
+            ({}, protocol.ERR_MALFORMED),
+            ({"op": 5}, protocol.ERR_MALFORMED),
+            ({"op": "nonsense"}, protocol.ERR_UNSUPPORTED),
+            ({"op": "speak"}, protocol.ERR_MALFORMED),
+            ({"op": "status", "v": "2"}, protocol.ERR_UNSUPPORTED),
+            ({"op": "status", "v": "0.9"}, protocol.ERR_UNSUPPORTED),
+            ({"op": "status", "v": "11.1"}, protocol.ERR_UNSUPPORTED),
+            ({"op": "status", "v": "abc"}, protocol.ERR_MALFORMED),
+            ({"op": "dictate", "sock": outside}, protocol.ERR_MALFORMED),
+        )
+        for message, code in table:
+            with self.subTest(message=message):
+                reply = self.reply(protocol.encode(message))
+                self.assertIs(reply["ok"], False, reply)
+                self.assertEqual(reply["code"], code, reply)
+
+    def test_frames_that_are_not_requests_are_malformed(self) -> None:
+        for raw in (b"\xff", b"not json", b"[1]"):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.reply(raw)["code"], protocol.ERR_MALFORMED)
+
+    def test_an_oversized_frame_given_to_dispatch_is_too_large(self) -> None:
+        reply = self.reply(b"x" * (protocol.MAX_REQUEST_BYTES + 1))
+        self.assertEqual(reply["code"], protocol.ERR_TOO_LARGE, reply)
+
+    def test_an_incompatible_major_is_exactly_a_protocol_error(self) -> None:
+        # The frozen V08 vector compares the refusal's type exactly, so the
+        # code must ride on the instance and the type must not change.
+        with self.assertRaises(protocol.ProtocolError) as caught:
+            protocol.validate_request({"op": "status", "v": "2"}, self.session)
+        self.assertIs(type(caught.exception), protocol.ProtocolError)
+        self.assertEqual(caught.exception.code, protocol.ERR_UNSUPPORTED)
+
+    def test_an_uncoded_protocol_error_in_the_worker_stays_unavailable(self) -> None:
+        # Why the code is not on the ProtocolError base: a descriptor that
+        # fails to build inside a dictation turn is not the caller's malformed
+        # request, and R4 confirmed `unavailable` for that arm.
+        sent = []
+        d = object.__new__(voiced.Daemon)
+        d._warn = lambda *a, **k: None
+        d._send = lambda receiver, msg: sent.append(msg) or True
+        d._clear_dictation = lambda turn: None
+        d._touch = lambda: None
+        d._dictate = mock.Mock(side_effect=protocol.ProtocolError("bad segment"))
+        voiced.Daemon._run_dictation(d, voiced._DictationTurn("listen-1", mock.Mock()))
+        self.assertEqual([m.get("code") for m in sent], [protocol.ERR_UNAVAILABLE])
+
+    def test_a_code_outside_the_vocabulary_cannot_be_attached(self) -> None:
+        with self.assertRaises(ValueError):
+            protocol.ProtocolError("x", code="oops")
+
+
 if __name__ == "__main__":
     unittest.main()
