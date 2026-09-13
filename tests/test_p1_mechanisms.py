@@ -338,3 +338,116 @@ class ConsentTestCase(unittest.TestCase):
         leftovers = [n for n in os.listdir(os.path.dirname(consent.consent_path()))
                      if n.startswith(".consent-")]
         self.assertEqual(leftovers, [])
+
+
+class AudioLimitTestCase(unittest.TestCase):
+    """V21/V22 -- A06 and A07 refuse rather than truncate or embed."""
+
+    def test_over_the_audio_limit_is_refused_not_truncated(self) -> None:
+        with self.assertRaises(protocol.MessageTooLarge) as caught:
+            protocol.check_audio_bytes(protocol.MAX_AUDIO_BYTES + 1)
+        self.assertIn("refused, not truncated", str(caught.exception))
+
+    def test_at_the_limit_is_accepted(self) -> None:          # positive control
+        self.assertEqual(protocol.check_audio_bytes(protocol.MAX_AUDIO_BYTES),
+                         protocol.MAX_AUDIO_BYTES)
+
+    def test_the_embedded_ceiling_is_far_smaller(self) -> None:
+        self.assertLess(protocol.MAX_EMBEDDED_AUDIO_BYTES, protocol.MAX_AUDIO_BYTES)
+        size = protocol.MAX_EMBEDDED_AUDIO_BYTES + 1
+        with self.assertRaises(protocol.MessageTooLarge) as caught:
+            protocol.check_audio_bytes(size, embedded=True)
+        self.assertIn("Send a descriptor", str(caught.exception))
+        protocol.check_audio_bytes(size)                      # fine unembedded
+
+    def test_negative_and_untyped_lengths_are_refused(self) -> None:
+        for value in (-1, "10", 1.0, True, None):
+            with self.subTest(value=value):
+                with self.assertRaises(protocol.ProtocolError):
+                    protocol.check_audio_bytes(value)
+
+
+class TranscriptMetadataTestCase(unittest.TestCase):
+    """V23 -- A09 segment identifiers, A10 word timestamps, A11 speaker."""
+
+    def test_partial_segments_are_unstable_and_final_stable(self) -> None:
+        self.assertIs(protocol.dictation_partial("the qu", "s1")["stable"], False)
+        self.assertIs(protocol.dictation_final("the quick", "s1")["stable"], True)
+
+    def test_metadata_is_optional_so_nothing_is_fabricated(self) -> None:
+        plain = protocol.dictation_final("hi")
+        for key in ("segment", "stable", "words", "speaker"):
+            self.assertNotIn(key, plain)
+
+    def test_word_timestamps_round_trip(self) -> None:
+        words = [{"word": "the", "start_ms": 0, "end_ms": 120},
+                 {"word": "quick", "start_ms": 120, "end_ms": 400}]
+        out = protocol.dictation_final("the quick", "s1", words=words)
+        self.assertEqual(out["words"], words)
+        self.assertEqual(protocol.decode(protocol.encode(out)), out)
+
+    def test_backwards_and_inverted_timestamps_are_refused(self) -> None:
+        inverted = [{"word": "a", "start_ms": 200, "end_ms": 100}]
+        with self.assertRaises(protocol.ProtocolError) as caught:
+            protocol.dictation_final("a", "s1", words=inverted)
+        self.assertIn("before it starts", str(caught.exception))
+        backwards = [{"word": "a", "start_ms": 0, "end_ms": 200},
+                     {"word": "b", "start_ms": 100, "end_ms": 300}]
+        with self.assertRaises(protocol.ProtocolError) as caught:
+            protocol.dictation_final("a b", "s1", words=backwards)
+        self.assertIn("must not go backwards", str(caught.exception))
+
+    def test_a_speaker_label_without_confidence_is_refused(self) -> None:
+        with self.assertRaises(protocol.ProtocolError) as caught:
+            protocol.dictation_final("hi", "s1", speaker={"label": "spk1"})
+        self.assertIn("requires a speaker confidence", str(caught.exception))
+
+    def test_speaker_confidence_is_bounded(self) -> None:
+        for bad in (-0.1, 1.1, 2, True, "0.5", None):
+            with self.subTest(confidence=bad):
+                with self.assertRaises(protocol.ProtocolError):
+                    protocol.dictation_final("hi", "s1",
+                                             speaker={"label": "spk1", "confidence": bad})
+        ok = protocol.dictation_final("hi", "s1", speaker={"label": "spk1", "confidence": 0.9})
+        self.assertEqual(ok["speaker"], {"label": "spk1", "confidence": 0.9})
+
+
+class SynthesisChunkTestCase(unittest.TestCase):
+    """V24 -- A12 sequence, A13 provenance, A14 seed/settings, A15 bounded."""
+
+    def _chunk(self, **over):
+        kw = dict(sequence=0, pcm_bytes=3200, sample_rate=24000,
+                  voice="en-us", model="piper-en-us-kristin-medium")
+        kw.update(over)
+        return protocol.synthesis_chunk(**kw)
+
+    def test_a_chunk_carries_sequence_provenance_and_bounds(self) -> None:
+        chunk = self._chunk(seed=7, temperature=0.0)
+        self.assertEqual(chunk["sequence"], 0)
+        self.assertEqual(chunk["voice"], "en-us")
+        self.assertEqual(chunk["model"], "piper-en-us-kristin-medium")
+        self.assertEqual(chunk["seed"], 7)
+        self.assertEqual(chunk["settings"], {"temperature": 0.0})
+        self.assertIs(chunk["final"], False)
+        self.assertEqual(protocol.decode(protocol.encode(chunk)), chunk)
+
+    def test_samples_never_ride_in_the_json(self) -> None:      # A07
+        chunk = self._chunk()
+        self.assertNotIn("pcm", chunk)
+        self.assertNotIn("audio", chunk)
+        self.assertIsInstance(chunk["pcm_bytes"], int)
+
+    def test_an_oversized_chunk_is_refused(self) -> None:       # A06 via A15
+        with self.assertRaises(protocol.MessageTooLarge):
+            self._chunk(pcm_bytes=protocol.MAX_AUDIO_BYTES + 1)
+
+    def test_malformed_chunk_fields_are_refused(self) -> None:
+        for kw in ({"sequence": -1}, {"sequence": "0"}, {"sample_rate": 0},
+                   {"sample_rate": -1}, {"voice": "en us"}, {"model": ""},
+                   {"seed": "7"}):
+            with self.subTest(**kw):
+                with self.assertRaises(protocol.ProtocolError):
+                    self._chunk(**kw)
+
+    def test_a_final_chunk_is_marked(self) -> None:             # A15
+        self.assertIs(self._chunk(sequence=9, final=True)["final"], True)

@@ -53,6 +53,17 @@ MAX_REQUEST_BYTES = 192 * 1024
 # from parking a job for a day.
 MAX_DEADLINE_MS = 24 * 60 * 60 * 1000
 
+# A06: a DECLARED audio byte limit that REFUSES. The capture path bounds a live
+# stream by truncating it, which is right for a microphone and wrong for a
+# request: silently handing back a prefix of what the caller asked about is a
+# wrong answer wearing a success reply. Anything at or over this is refused.
+MAX_AUDIO_BYTES = 32 * 1024 * 1024
+
+# A07: large audio is never embedded in JSON. A JSON message may carry a short
+# preview or a descriptor, never a payload -- base64 in a control frame both
+# blows the frame budget and forces the whole clip into memory to parse.
+MAX_EMBEDDED_AUDIO_BYTES = 4 * 1024
+
 # Errors cross the boundary as a CODE from this closed set plus prose.  The
 # prose is for a human and may change; the code is the contract and may not.
 # Without a code every caller ends up matching on message text, which makes the
@@ -339,16 +350,157 @@ def reply_error(message: str, code: str = ERR_INTERNAL) -> dict:
     return {"ok": False, "error": message, "code": code}
 
 
-def dictation_partial(text: str) -> dict:
-    """Return an in-progress recognition datagram."""
-    return {"partial": text}
+def check_audio_bytes(length: int, *, embedded: bool = False) -> int:
+    """Return ``length`` if it is a permissible audio size, else refuse.
+
+    A06 and A07. ``embedded`` applies the much smaller in-JSON ceiling: audio
+    that large belongs behind a descriptor, not inside a control message.
+    """
+    if not isinstance(length, int) or isinstance(length, bool) or length < 0:
+        raise ProtocolError(
+            f"audio length must be a non-negative integer, got {length!r}.")
+    limit = MAX_EMBEDDED_AUDIO_BYTES if embedded else MAX_AUDIO_BYTES
+    if length > limit:
+        raise MessageTooLarge(
+            f"audio is {length} bytes; the "
+            f"{'embedded-in-JSON' if embedded else 'audio'} limit is {limit}. "
+            + ("Send a descriptor or a path instead of the samples."
+               if embedded else
+               "Split the clip or stream it; it is refused, not truncated."))
+    return length
 
 
-def dictation_final(text: str) -> dict:
-    """Return the final recognition datagram for one turn."""
-    return {"final": text}
+def _segment_id(raw: object) -> str:
+    if not isinstance(raw, str) or not raw or len(raw) > MAX_ID_CHARS:
+        raise ProtocolError(
+            f"segment id must be 1-{MAX_ID_CHARS} characters, got {raw!r}.")
+    return raw
+
+
+def dictation_partial(text: str, segment: str | None = None) -> dict:
+    """Return an in-progress recognition datagram.
+
+    A09: an UNSTABLE segment id. The same id may be re-sent with revised text;
+    a consumer keys on it to replace rather than append.
+    """
+    datagram: dict = {"partial": text}
+    if segment is not None:
+        datagram["segment"] = _segment_id(segment)
+        datagram["stable"] = False
+    return datagram
+
+
+def dictation_final(text: str, segment: str | None = None,
+                    words: list | None = None,
+                    speaker: dict | None = None) -> dict:
+    """Return the final recognition datagram for one turn.
+
+    A09 stable segment id, A10 word timestamps, A11 speaker label with a
+    confidence. Each is optional so an engine that cannot supply it omits the
+    key rather than inventing a value -- a fabricated timestamp is worse than
+    an absent one.
+    """
+    datagram: dict = {"final": text}
+    if segment is not None:
+        datagram["segment"] = _segment_id(segment)
+        datagram["stable"] = True
+    if words is not None:
+        datagram["words"] = _words(words)
+    if speaker is not None:
+        datagram["speaker"] = _speaker(speaker)
+    return datagram
+
+
+def _words(raw: object) -> list:
+    """A10: [{word, start_ms, end_ms}], monotonic and non-negative."""
+    if not isinstance(raw, list):
+        raise ProtocolError(
+            f"'words' must be a list, got {type(raw).__name__}.")
+    out = []
+    previous_end = -1
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ProtocolError(f"word {index} must be an object.")
+        word = item.get("word")
+        start = item.get("start_ms")
+        end = item.get("end_ms")
+        if not isinstance(word, str) or not word:
+            raise ProtocolError(f"word {index} needs a non-empty 'word'.")
+        for name, value in (("start_ms", start), ("end_ms", end)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ProtocolError(
+                    f"word {index} '{name}' must be a non-negative integer of "
+                    f"milliseconds, got {value!r}.")
+        if end < start:
+            raise ProtocolError(
+                f"word {index} ends at {end}ms before it starts at {start}ms.")
+        if start < previous_end:
+            raise ProtocolError(
+                f"word {index} starts at {start}ms, before word {index - 1} "
+                f"ended at {previous_end}ms; timestamps must not go backwards.")
+        previous_end = end
+        out.append({"word": word, "start_ms": start, "end_ms": end})
+    return out
+
+
+def _speaker(raw: object) -> dict:
+    """A11: {label, confidence} with confidence in [0.0, 1.0]."""
+    if not isinstance(raw, dict):
+        raise ProtocolError(
+            f"'speaker' must be an object, got {type(raw).__name__}.")
+    label = raw.get("label")
+    confidence = raw.get("confidence")
+    if not isinstance(label, str) or not label or len(label) > MAX_ID_CHARS:
+        raise ProtocolError(
+            f"speaker label must be 1-{MAX_ID_CHARS} characters, got {label!r}.")
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        raise ProtocolError(
+            "A11 requires a speaker confidence; a label without one cannot be "
+            f"acted on. Got {confidence!r}.")
+    if not 0.0 <= float(confidence) <= 1.0:
+        raise ProtocolError(
+            f"speaker confidence must be within [0.0, 1.0], got {confidence}.")
+    return {"label": label, "confidence": float(confidence)}
 
 
 def dictation_error(message: str) -> dict:
     """Return a dictation failure datagram."""
     return {"error": message}
+
+
+def synthesis_chunk(sequence: int, *, pcm_bytes: int, sample_rate: int,
+                    voice: str, model: str, seed: int | None = None,
+                    final: bool = False, **settings: object) -> dict:
+    """Return one streamed synthesis chunk descriptor.
+
+    A12 sequence, A13 voice provenance, A14 seed and deterministic settings,
+    A15 the chunk is a bounded playable descriptor that arrives before the whole
+    utterance is finished. The samples themselves never ride in the JSON -- only
+    their length, which check_audio_bytes bounds.
+    """
+    if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+        raise ProtocolError(
+            f"chunk 'sequence' must be a non-negative integer, got {sequence!r}.")
+    if not isinstance(sample_rate, int) or isinstance(sample_rate, bool) or sample_rate <= 0:
+        raise ProtocolError(
+            f"chunk 'sample_rate' must be greater than zero, got {sample_rate!r}.")
+    if not isinstance(voice, str) or not _VOICE_TOKEN.fullmatch(voice):
+        raise ProtocolError(
+            "chunk 'voice' must be 1-32 characters from [A-Za-z0-9_+-].")
+    if not isinstance(model, str) or not model:
+        raise ProtocolError("chunk 'model' must be a non-empty string.")
+    if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool)):
+        raise ProtocolError(f"chunk 'seed' must be an integer, got {seed!r}.")
+    chunk: dict = {
+        "sequence": sequence,
+        "pcm_bytes": check_audio_bytes(pcm_bytes),
+        "sample_rate": sample_rate,
+        "voice": voice,
+        "model": model,
+        "final": bool(final),
+    }
+    if seed is not None:
+        chunk["seed"] = seed
+    if settings:
+        chunk["settings"] = dict(settings)
+    return chunk
