@@ -31,12 +31,45 @@ MAX_ID_CHARS = 64
 # at send(2) with an opaque EMSGSIZE.
 MAX_REQUEST_BYTES = 192 * 1024
 
+# A caller may bound how long it is willing to wait.  Relative milliseconds,
+# not an absolute instant: the two ends do not share a clock, and a monotonic
+# offset cannot be invalidated by a wall-clock step.  The ceiling keeps a typo
+# from parking a job for a day.
+MAX_DEADLINE_MS = 24 * 60 * 60 * 1000
+
+# Errors cross the boundary as a CODE from this closed set plus prose.  The
+# prose is for a human and may change; the code is the contract and may not.
+# Without a code every caller ends up matching on message text, which makes the
+# text load-bearing and unfixable -- and invites internals onto the wire.
+ERR_MALFORMED = "malformed"
+ERR_UNSUPPORTED = "unsupported"
+ERR_BUSY = "busy"
+ERR_DEADLINE = "deadline"
+ERR_CANCELLED = "cancelled"
+ERR_NOT_FOUND = "not-found"
+ERR_DENIED = "denied"
+ERR_TOO_LARGE = "too-large"
+ERR_UNAVAILABLE = "unavailable"
+ERR_INTERNAL = "internal"
+ERROR_CODES = (ERR_MALFORMED, ERR_UNSUPPORTED, ERR_BUSY, ERR_DEADLINE,
+               ERR_CANCELLED, ERR_NOT_FOUND, ERR_DENIED, ERR_TOO_LARGE,
+               ERR_UNAVAILABLE, ERR_INTERNAL)
+
 TTS_RATE_CHOICES = (120, 150, 170, 200, 240)
 _VOICE_TOKEN = re.compile(r"^[A-Za-z0-9_+-]{1,32}$")
 
 
 class ProtocolError(ValueError):
     """A malformed or unsafe message; the text says what to send instead."""
+
+
+class MessageTooLarge(ProtocolError):
+    """The frame exceeds MAX_REQUEST_BYTES.
+
+    A distinct type so a caller can substitute its own domain wording without
+    matching on message text -- which is exactly the coupling the error-code
+    vocabulary below exists to remove.
+    """
 
 
 def encode(msg: dict) -> bytes:
@@ -47,15 +80,38 @@ def encode(msg: dict) -> bytes:
             "Wrap the value, for example {'op': 'status'}.")
     try:
         line = json.dumps(msg, ensure_ascii=False, separators=(",", ":"))
-        return line.encode("utf-8") + b"\n"
+        frame = line.encode("utf-8") + b"\n"
     except (TypeError, ValueError, UnicodeEncodeError) as error:
         raise ProtocolError(
             f"message is not JSON-serialisable ({error}). Use only str, int, "
             "float, bool, None, list and dict values.") from error
+    # Size is checked OUTSIDE the try: ProtocolError is a ValueError, so raising
+    # it in there would be caught by this very handler and re-reported as
+    # "not JSON-serialisable" -- a wrong diagnosis for a correct message that is
+    # merely too big. The existing suite caught exactly that.
+    if len(frame) > MAX_REQUEST_BYTES:
+        raise MessageTooLarge(
+            f"message is {len(frame)} bytes; the limit is {MAX_REQUEST_BYTES}. "
+            "Send the payload as a file path or split it across messages.")
+    return frame
 
 
 def decode(raw: bytes | str) -> dict:
     """Return the object encoded in one line; raise ProtocolError otherwise."""
+    # Size is checked BEFORE decode and before json.loads, so an oversized
+    # frame costs no UTF-8 pass and no parser allocation.
+    measured = None
+    if isinstance(raw, str):
+        measured = len(raw.encode("utf-8"))
+    elif isinstance(raw, (bytes, bytearray, memoryview)):
+        measured = len(raw)
+    # Anything else falls through to the type handling below, which raises a
+    # ProtocolError naming the bad type. Measuring it here would raise TypeError
+    # instead -- the existing suite caught that.
+    if measured is not None and measured > MAX_REQUEST_BYTES:
+        raise MessageTooLarge(
+            f"message is {measured} bytes; the limit is {MAX_REQUEST_BYTES}. "
+            "Refused before decoding.")
     if isinstance(raw, str):
         text = raw
     else:
@@ -147,6 +203,24 @@ def _validated_socket(raw: object, session_dir: str) -> str:
     return target
 
 
+def _deadline_ms(raw: object) -> int:
+    """Return a positive relative deadline in milliseconds, or raise."""
+    if not isinstance(raw, int) or isinstance(raw, bool):
+        raise ProtocolError(
+            f"'deadline_ms' must be an integer number of milliseconds, got "
+            f"{type(raw).__name__}. Send for example 5000 for five seconds.")
+    if raw <= 0:
+        raise ProtocolError(
+            f"'deadline_ms' must be greater than zero, got {raw}. A deadline "
+            "that has already passed cannot be met; omit it to wait "
+            "indefinitely.")
+    if raw > MAX_DEADLINE_MS:
+        raise ProtocolError(
+            f"'deadline_ms' is {raw}; the ceiling is {MAX_DEADLINE_MS} "
+            "(24 hours). Use a shorter bound.")
+    return raw
+
+
 def validate_request(msg: dict, session_dir: str) -> dict:
     """Return a normalised copy of a control request, or raise ProtocolError.
 
@@ -162,6 +236,8 @@ def validate_request(msg: dict, session_dir: str) -> dict:
         raise ProtocolError(
             f"unknown op {op!r}. Use one of: {', '.join(OPS)}.")
     request: dict = {"op": op, "id": _request_id(msg.get("id"))}
+    if "deadline_ms" in msg:
+        request["deadline_ms"] = _deadline_ms(msg.get("deadline_ms"))
     if op == OP_SPEAK:
         text = msg.get("text")
         if not isinstance(text, str) or not text.strip():
@@ -205,9 +281,18 @@ def reply_ok(request_id: str = "", **fields: object) -> dict:
     return reply
 
 
-def reply_error(message: str) -> dict:
-    """Return a failure reply. ``message`` must say what the user should do."""
-    return {"ok": False, "error": message}
+def reply_error(message: str, code: str = ERR_INTERNAL) -> dict:
+    """Return a failure reply carrying a code from the closed set.
+
+    ``message`` is prose for a human and may be reworded freely; ``code`` is the
+    contract a caller may branch on.  An unknown code is refused rather than
+    forwarded, so the vocabulary cannot drift open one caller at a time.
+    """
+    if code not in ERROR_CODES:
+        raise ProtocolError(
+            f"unknown error code {code!r}. Use one of: "
+            f"{', '.join(ERROR_CODES)}.")
+    return {"ok": False, "error": message, "code": code}
 
 
 def dictation_partial(text: str) -> dict:

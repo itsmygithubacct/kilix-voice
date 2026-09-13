@@ -200,13 +200,16 @@ def control(request: dict, timeout: float = CONTROL_TIMEOUT_S) -> dict:
     """
     try:
         packet = protocol.encode(request)
+    except protocol.MessageTooLarge as error:
+        # protocol.encode now enforces the limit it declares, so the refusal
+        # arrives as a typed exception rather than a length check after the
+        # fact. Keep this tool's own wording; match on the TYPE, never the text.
+        raise VoiceToolError(
+            f"the encoded voice request exceeds the local control-packet "
+            f"limit of {protocol.MAX_REQUEST_BYTES} bytes ({error}). Send "
+            "shorter text or split it into several speak requests.") from error
     except protocol.ProtocolError as error:
         raise VoiceToolError(str(error)) from error
-    if len(packet) > protocol.MAX_REQUEST_BYTES:
-        raise VoiceToolError(
-            f"the encoded voice request is {len(packet)} bytes; the local "
-            f"control-packet limit is {protocol.MAX_REQUEST_BYTES}. Send "
-            "shorter text or split it into several speak requests.")
 
     path = paths.control_socket()
     endpoint = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
