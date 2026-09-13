@@ -109,28 +109,52 @@ class AttackPiperDeadlineMiscoded(unittest.TestCase):
     dispatch maps every TtsError to ERR_INTERNAL. A caller that set too tight a
     deadline is told the daemon has a bug, not that its deadline was too short."""
 
-    def test_a_speak_deadline_spent_in_the_piper_probe_reports_deadline(self):
+    def _reply(self, probe_error):
         engine = tts_lib.PiperTts(rate=170)
-        # Exactly what piper_status(budget<=0) yields, surfaced by check_available.
-        engine.check_available = mock.Mock(side_effect=tts_lib.TtsError(
-            "the request deadline elapsed before kilix-piper-tts could be "
-            "inspected"))
+        engine.check_available = mock.Mock(side_effect=probe_error)
         d = object.__new__(voiced.Daemon)
         d._session_dir = "/tmp"
         d._cfg = {}
         d._refresh_config = lambda: None
         d._touch = lambda: None
+        # A frozen clock, so 1 ms of budget is still live at the probe and the
+        # zero-budget early refusal cannot answer in the probe's place.
         with mock.patch.object(voiced.tts_lib, "make_tts",
-                               lambda *a, **k: engine):
+                               lambda *a, **k: engine), \
+             mock.patch.object(voiced.time, "monotonic", lambda: 1000.0):
             reply = voiced.Daemon._dispatch(
                 d, protocol.encode({"op": "speak", "text": "hi",
                                     "deadline_ms": 1}))
+        engine.check_available.assert_called_once()
+        return reply
+
+    def test_a_speak_deadline_spent_in_the_piper_probe_reports_deadline(self):
+        # CORRECTED (R6 finding 1). As first written this mock raised a plain
+        # TtsError while 1 ms of budget was still live and demanded the code
+        # `deadline`: it modelled a GENUINE probe failure and required it to
+        # be misattributed, so it pinned the defect R6 found -- R6's M12, the
+        # correct attribution, was "killed" by this very test. What the real
+        # probe raises when the caller's budget cuts it is the typed
+        # TtsDeadlineExceeded, and that must still read `deadline`.
+        reply = self._reply(tts_lib.TtsDeadlineExceeded(
+            "the request deadline elapsed while kilix-piper-tts status was "
+            "running"))
         self.assertFalse(reply["ok"])
         self.assertEqual(
             reply["code"], protocol.ERR_DEADLINE,
             "a deadline spent during the Piper probe is reported as %r, not "
             "'deadline'; the same class of defect as R4 finding 3."
             % reply["code"])
+
+    def test_a_genuine_probe_failure_under_a_1_ms_budget_keeps_its_code_and_message(self):
+        # The inverse the corrected test above used to forbid: a provider that
+        # is simply not installed is not a deadline, however short the budget.
+        reply = self._reply(tts_lib.TtsError(
+            "kilix-piper-tts is not installed. Install the public "
+            "kilix-piper-tts module."))
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["code"], protocol.ERR_UNAVAILABLE, reply)
+        self.assertIn("not installed", reply["error"])
 
 
 class AttackBroadArmForwardsInvalidCode(unittest.TestCase):

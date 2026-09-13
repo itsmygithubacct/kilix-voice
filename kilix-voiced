@@ -717,13 +717,10 @@ class Daemon:
             # the budget is computed from the deadline taken at entry.
             probe_budget = (None if deadline is None
                             else max(0.0, deadline - time.monotonic()))
-            # R5 finding A: bounding the probe was not enough. check_available
-            # raises TtsError, and _dispatch maps every TtsError to the default
-            # ERR_INTERNAL -- so a Piper request whose budget died in the probe
-            # was reported as an internal daemon bug, while the identical
-            # request on espeak reached turn.expired() and correctly said
-            # ERR_DEADLINE. Two engines disagreeing on the code for one
-            # condition is the same defect class as R4 finding 3.
+            # R5 finding A: a Piper request whose budget died in the probe was
+            # reported as an internal daemon bug, while the identical request
+            # on espeak correctly said ERR_DEADLINE. A spent budget refuses
+            # here, before any probe process is started for it.
             if probe_budget is not None and probe_budget <= 0:
                 return protocol.reply_error(
                     f"the request deadline of {deadline_ms} ms elapsed before "
@@ -731,27 +728,18 @@ class Daemon:
                     protocol.ERR_DEADLINE)
             try:
                 engine.check_available(budget=probe_budget)
-            except tts_lib.TtsError:
-                # Distinguish "the provider is broken" from "we ran out of
-                # time asking it", which look identical from inside.
-                #
-                # The test is WHOSE ceiling bounded the probe, not what the
-                # clock says now: re-reading the clock is a race, because a
-                # 1 ms budget need not have elapsed across the handful of
-                # calls between taking the deadline and getting here. If the
-                # caller's budget was shorter than the probe's own
-                # PIPER_STATUS_TIMEOUT_S, then the caller's deadline is what
-                # cut the probe short and the deadline is the honest reason.
-                # A generous budget leaves a probe failure a real provider
-                # failure, which keeps ERR_INTERNAL for the case that means it.
-                if probe_budget is not None and (
-                        probe_budget < tts_lib.PIPER_STATUS_TIMEOUT_S
-                        or time.monotonic() >= deadline):
-                    return protocol.reply_error(
-                        f"the request deadline of {deadline_ms} ms elapsed "
-                        "while checking the speech provider; nothing was "
-                        "spoken.", protocol.ERR_DEADLINE)
-                raise
+            except tts_lib.TtsDeadlineExceeded:
+                # R6 finding 1: the fix for R5 finding A attributed ANY probe
+                # failure to the deadline whenever the budget was under the
+                # probe's 5 s ceiling, so "not installed, run X" became "the
+                # deadline elapsed". The probe itself now says, as a type,
+                # when the caller's budget is what cut it short. Every other
+                # TtsError propagates with the provider's own diagnosis and its
+                # own code.
+                return protocol.reply_error(
+                    f"the request deadline of {deadline_ms} ms elapsed "
+                    "while checking the speech provider; nothing was "
+                    "spoken.", protocol.ERR_DEADLINE)
         chunks = self._speech_chunks(request["text"])
         if not chunks:
             # A pane of nothing but box drawing conditions down to nothing;
@@ -857,6 +845,11 @@ class Daemon:
                     turn, "read-aloud stopped: the request deadline elapsed.")
             elif player.error:
                 self._report_speech_failure(turn, player.error)
+        except tts_lib.TtsDeadlineExceeded:
+            # The same words the expiry check above uses: a synthesis the
+            # budget cut is the deadline, however the engine phrased it.
+            self._report_speech_failure(
+                turn, "read-aloud stopped: the request deadline elapsed.")
         except tts_lib.TtsError as error:
             self._report_speech_failure(
                 turn, f"read-aloud stopped: {error}")

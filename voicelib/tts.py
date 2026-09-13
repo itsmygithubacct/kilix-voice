@@ -69,9 +69,24 @@ def _bounded(cap: float, budget: float | None) -> float:
     if budget is None:
         return cap
     if budget <= 0:
-        raise TtsError(
+        raise TtsDeadlineExceeded(
             "the request deadline elapsed before synthesis could start")
     return min(cap, budget)
+
+
+def _budget_cut(cap: float, budget: float | None) -> bool:
+    """True when the caller's budget, not the engine's own ceiling, is in force.
+
+    R6 finding 1: a Piper probe failure was attributed to the deadline whenever
+    the budget was shorter than the probe's ceiling, whether or not the budget
+    was what ended it -- so "not installed" became "the deadline elapsed". The
+    only place that knows WHICH bound cut a blocking call is the site that set
+    it, so a TimeoutExpired is attributed there, with this, and nowhere else.
+    Re-reading the clock afterwards is not a substitute: a genuine failure that
+    returns just before the deadline and is inspected just after it reads as a
+    deadline that did not cut anything.
+    """
+    return budget is not None and budget <= cap
 
 
 class TtsError(RuntimeError):
@@ -88,6 +103,19 @@ class TtsUnsupported(TtsError):
     """The request asked an engine for something it cannot do at all."""
 
     code = protocol.ERR_UNSUPPORTED
+
+
+class TtsDeadlineExceeded(TtsError):
+    """The caller's budget -- and nothing else -- ended a probe or a synthesis.
+
+    Raised only where that is known for certain: the budget was already spent
+    before any process started, or a process was killed by a timeout whose
+    value was the caller's budget rather than the engine's own ceiling. Every
+    other failure stays a plain TtsError with the provider's own diagnosis.
+    A subclass, so every existing `except TtsError` still catches it.
+    """
+
+    code = protocol.ERR_DEADLINE
 
 
 class RenderedSpeech(NamedTuple):
@@ -507,6 +535,12 @@ class EspeakTts:
         if self._mbrola_ok:
             try:
                 return self._run(clean, f"mb-{self.voice}", budget=budget)
+            except TtsDeadlineExceeded:
+                # A budget that ran out says nothing about whether the mbrola
+                # voice is installed. Treating it as a failure marked mbrola
+                # broken for the rest of the page and started a fallback
+                # process with no budget left to spend on it.
+                raise
             except TtsError as error:
                 if not self._mbrola_fallback:
                     raise
@@ -525,8 +559,8 @@ class EspeakTts:
     def _run(self, text: str, voice: str, *,
              budget: float | None = None) -> tuple[bytes, int]:
         command = build_synth_cmd(self._cfg, voice=voice, rate=self.rate)
-        timeout = _bounded(
-            SYNTH_TIMEOUT_BASE_S + len(text) * SYNTH_TIMEOUT_PER_CHAR_S, budget)
+        cap = SYNTH_TIMEOUT_BASE_S + len(text) * SYNTH_TIMEOUT_PER_CHAR_S
+        timeout = _bounded(cap, budget)
         try:
             process = subprocess.Popen(
                 command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -542,7 +576,8 @@ class EspeakTts:
         except subprocess.TimeoutExpired as error:
             process.kill()
             process.communicate()
-            raise TtsError(
+            failure = TtsDeadlineExceeded if _budget_cut(cap, budget) else TtsError
+            raise failure(
                 f"{command[0]} did not finish within {timeout:.1f}s for "
                 f"{len(text)} characters of text. Read a smaller extent by "
                 f"lowering {settings.KEY_TTS_MAX_CHARS}, or check whether the "
@@ -574,8 +609,24 @@ def piper_binary() -> str | None:
     return util.which(os.environ.get(PIPER_ENV_COMMAND, "kilix-piper-tts"))
 
 
-def piper_status(*, budget: float | None = None) -> tuple[bool, str]:
-    """Inspect the provider and pinned model without starting it or networking."""
+def piper_probe(*, budget: float | None = None) -> tuple[bool, str]:
+    """Inspect the provider and pinned model without starting it or networking.
+
+    Returns (available, detail) for every provider state, and raises
+    TtsDeadlineExceeded only when the caller's budget is what stopped the
+    inspection: spent before anything ran, or the bound on a status process
+    that timed out. A daemon handler needs that distinction as a type, because
+    "the provider is broken" and "we ran out of time asking" otherwise look
+    identical -- and conflating them in either direction is R6 finding 1 or
+    R5 finding A.
+    """
+    # The spent budget is checked FIRST, before the PATH lookup: nothing about
+    # the install state can change the answer, and checking the binary first
+    # made this refusal read "not installed" on any machine without Piper.
+    if budget is not None and budget <= 0:
+        raise TtsDeadlineExceeded(
+            "the request deadline elapsed before the speech provider could "
+            "be checked")
     binary = piper_binary()
     if binary is None:
         return False, (
@@ -583,12 +634,6 @@ def piper_status(*, budget: float | None = None) -> tuple[bool, str]:
             "kilix-piper-tts module, then run `kilix-tts --install "
             f"{models.PIPER_KRISTIN_MODEL}`."
         )
-    # Clamp BEFORE the try. _bounded raises TtsError on an exhausted budget,
-    # and this function's contract is to RETURN (ok, detail) -- letting that
-    # escape would hand every caller an exception where they expect a tuple.
-    if budget is not None and budget <= 0:
-        return False, ("the request deadline elapsed before "
-                       f"{binary} could be inspected")
     status_timeout = _bounded(PIPER_STATUS_TIMEOUT_S, budget)
     try:
         result = subprocess.run(
@@ -599,7 +644,14 @@ def piper_status(*, budget: float | None = None) -> tuple[bool, str]:
             text=True,
             errors="replace",
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except subprocess.TimeoutExpired as error:
+        if _budget_cut(PIPER_STATUS_TIMEOUT_S, budget):
+            raise TtsDeadlineExceeded(
+                f"the request deadline elapsed while {binary} status was "
+                "running") from error
+        return False, (f"{binary} status did not answer within "
+                       f"{PIPER_STATUS_TIMEOUT_S:g} s")
+    except OSError as error:
         return False, f"cannot inspect {binary}: {error}"
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip().splitlines()
@@ -626,6 +678,18 @@ def piper_status(*, budget: float | None = None) -> tuple[bool, str]:
     return False, detail
 
 
+def piper_status(*, budget: float | None = None) -> tuple[bool, str]:
+    """Inspect the provider; always RETURN (available, detail), never raise.
+
+    The contract kilix-tts and the status page rely on. A caller that must
+    tell a deadline from a provider failure calls piper_probe instead.
+    """
+    try:
+        return piper_probe(budget=budget)
+    except TtsDeadlineExceeded as error:
+        return False, str(error)
+
+
 class PiperTts:
     """Pinned Kristin synthesis through the isolated persistent provider."""
 
@@ -650,7 +714,12 @@ class PiperTts:
         self._cancelled = False
 
     def check_available(self, *, budget: float | None = None) -> None:
-        available, detail = piper_status(budget=budget)
+        """Raise TtsError with the provider's own detail unless it is ready.
+
+        TtsDeadlineExceeded propagates from the probe unchanged, so a caller
+        can tell a budget that cut the check from a provider that failed it.
+        """
+        available, detail = piper_probe(budget=budget)
         if not available:
             raise TtsError(detail)
 
@@ -690,7 +759,9 @@ class PiperTts:
         except subprocess.TimeoutExpired as error:
             process.kill()
             process.communicate()
-            raise TtsError(
+            failure = (TtsDeadlineExceeded
+                       if _budget_cut(PIPER_SYNTH_TIMEOUT_S, budget) else TtsError)
+            raise failure(
                 f"{binary} did not finish within {timeout:.0f} "
                 "seconds; run its status command and retry."
             ) from error
