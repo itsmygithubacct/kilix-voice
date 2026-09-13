@@ -884,7 +884,10 @@ class Daemon:
         # CLI end to end and reading the model it printed.
         model_id = settings.stt_model()
         engine = settings.stt_engine()
-        digest = consent.capture_digest(model_id, engine)
+        # The installed bytes, not just the model NAME: S03 is about the same
+        # name over different bytes.
+        digest = consent.capture_digest(
+            model_id, engine, consent.payload_digest(model_id, engine))
         if not consent.granted("dictation", digest):
             raise DaemonError(
                 "dictation has no recorded consent for this configuration "

@@ -257,8 +257,9 @@ class DispatchBindingTestCase(unittest.TestCase):
             [sys.executable, "-c",
              "import sys;sys.path.insert(0,'.');"
              "from voicelib import consent, settings;"
+             "m=settings.stt_model();e=settings.stt_engine();"
              "print(consent.granted('dictation', consent.capture_digest("
-             "settings.stt_model(), settings.stt_engine())))"],
+             "m, e, consent.payload_digest(m, e))))"],
             cwd=ROOT, capture_output=True, text=True, env=env)
         self.assertEqual(probe.stdout.strip(), "True", probe.stderr[:300])
 

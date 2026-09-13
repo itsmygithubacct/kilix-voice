@@ -1594,7 +1594,8 @@ def _consent_command(args) -> None:
     """Record or withdraw dictation capture consent for this configuration."""
     model_id = settings.stt_model()
     engine = settings.stt_engine()
-    digest = model_consent.capture_digest(model_id, engine)
+    digest = model_consent.capture_digest(
+        model_id, engine, model_consent.payload_digest(model_id, engine))
     if args.revoke_consent:
         removed = model_consent.revoke("dictation")
         print("dictation consent withdrawn." if removed

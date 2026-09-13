@@ -928,3 +928,73 @@ class R2Findings3And5TestCase(unittest.TestCase):
         self.assertNotIn("Anything at or over this is refused", src)
         self.assertEqual(protocol.check_audio_bytes(protocol.MAX_AUDIO_BYTES),
                          protocol.MAX_AUDIO_BYTES)
+
+
+class PayloadBindingTestCase(unittest.TestCase):
+    """R2 finding 2: consent must bind the installed BYTES, not just the name."""
+
+    def setUp(self) -> None:
+        self.home = os.path.realpath(tempfile.mkdtemp(prefix="f104-payload-"))
+        self.env = mock.patch.dict(os.environ, {"HOME": self.home}, clear=True)
+        self.env.start(); self.addCleanup(self.env.stop)
+        self.addCleanup(shutil.rmtree, self.home, True)
+
+    def _install(self, model_id="small-en-us", body=b"payload"):
+        from voicelib import paths
+        root = paths.model_dir(model_id)
+        for relative in models.REQUIRED_FILES[models.ENGINE_VOSK]:
+            target = os.path.join(root, relative)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as handle:
+                handle.write(body)
+        return root
+
+    def test_absent_payload_yields_an_empty_digest(self) -> None:
+        self.assertEqual(consent.payload_digest("small-en-us", models.ENGINE_VOSK), "")
+
+    def test_an_installed_payload_yields_a_digest(self) -> None:
+        self._install()
+        digest = consent.payload_digest("small-en-us", models.ENGINE_VOSK)
+        self.assertRegex(digest, r"^[0-9a-f]{64}$")
+
+    def test_changed_bytes_change_the_digest(self) -> None:      # S03, the point
+        self._install(body=b"one")
+        before = consent.payload_digest("small-en-us", models.ENGINE_VOSK)
+        self._install(body=b"two")
+        after = consent.payload_digest("small-en-us", models.ENGINE_VOSK)
+        self.assertNotEqual(before, after)
+        # and therefore the consent digest changes too
+        self.assertNotEqual(
+            consent.capture_digest("small-en-us", "vosk", before),
+            consent.capture_digest("small-en-us", "vosk", after))
+
+    def test_truncation_changes_the_digest(self) -> None:
+        self._install(body=b"aaaa")
+        before = consent.payload_digest("small-en-us", models.ENGINE_VOSK)
+        self._install(body=b"")
+        self.assertNotEqual(before,
+                            consent.payload_digest("small-en-us", models.ENGINE_VOSK))
+
+    def test_equal_length_content_change_is_still_detected(self) -> None:
+        # The reason there is no stat cache. Two writes of equal length in
+        # quick succession share size AND st_mtime_ns -- measured -- so a
+        # (size, mtime) key returns the previous digest for changed bytes,
+        # which is exactly the substitution this digest exists to catch.
+        self._install(body=b"one")
+        before = consent.payload_digest("small-en-us", models.ENGINE_VOSK)
+        self._install(body=b"two")          # same length, same tick
+        self.assertNotEqual(before,
+                            consent.payload_digest("small-en-us", models.ENGINE_VOSK))
+
+    def test_unchanged_bytes_give_a_stable_digest(self) -> None:   # control
+        self._install()
+        a = consent.payload_digest("small-en-us", models.ENGINE_VOSK)
+        b = consent.payload_digest("small-en-us", models.ENGINE_VOSK)
+        self.assertEqual(a, b)
+
+    def test_production_callers_supply_the_payload_digest(self) -> None:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for name in ("kilix-voiced", "kilix-stt"):
+            with self.subTest(tool=name):
+                source = open(os.path.join(root, name)).read()
+                self.assertIn("payload_digest(model_id, engine)", source)

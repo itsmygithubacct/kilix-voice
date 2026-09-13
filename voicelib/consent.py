@@ -184,6 +184,49 @@ def revoke(subject: str) -> bool:
     return True
 
 
+def payload_digest(model_id: str, engine: str) -> str:
+    """Return a digest of the INSTALLED model bytes, or "" when absent.
+
+    S03 requires that a changed artefact invalidates consent. Binding only the
+    model NAME cannot do that: the same name over different bytes is exactly the
+    case the requirement is about, and hashing an empty string binds nothing.
+
+    Only the engine's REQUIRED_FILES are hashed -- the files the installer
+    already treats as the payload -- each as (relative path, size, contents), so
+    a rename or a truncation changes the digest as surely as an edit does.
+
+    THE BYTES ARE READ EVERY TIME, ON PURPOSE. A (size, mtime_ns) cache was
+    written first and then removed: two writes of equal length in quick
+    succession produce an identical size AND an identical st_mtime_ns, so the
+    cache returned the previous digest for changed content -- measured, not
+    theorised. That is precisely the substitution this digest exists to catch,
+    so no cheaper key is admissible here. The cost is one sequential read of the
+    payload at dictation start; correctness of a consent gate outranks it.
+    """
+    from . import models, paths
+    required = models.REQUIRED_FILES.get(engine)
+    if not required:
+        return ""
+    try:
+        root = paths.model_dir(model_id)
+    except Exception:
+        return ""
+    parts = []
+    for relative in required:
+        target = os.path.join(root, relative)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with open(target, "rb") as handle:
+                for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    size += len(block)
+                    digest.update(block)
+        except OSError:
+            return ""            # not installed: nothing to bind yet
+        parts.append(f"{relative}:{size}:{digest.hexdigest()}")
+    return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
+
+
 def capture_digest(model_id: str, engine: str, payload_digest: str = "") -> str:
     """Return the digest a dictation consent is bound to.
 
