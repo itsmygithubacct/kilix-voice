@@ -396,6 +396,39 @@ class ConsentTestCase(unittest.TestCase):
         h.join(timeout=5); c.join(timeout=5)
         self.assertTrue(second_entered.is_set(), "the lock was never released")
 
+    def test_a_grant_missing_an_s02_field_is_refused(self) -> None:
+        # The previous malformed-grant test used a STRING, which the
+        # isinstance(dict) check catches on its own -- so removing the S02
+        # field requirement survived it. This one is a well-formed dict with
+        # one field missing, which is the case that distinguishes them.
+        consent.grant("dictation", self.A)
+        full = json.load(open(consent.consent_path()))
+        for field in ("digest", "granted_utc", "allowed_use",
+                      "output_identity", "model_id", "model_revision"):
+            with self.subTest(missing=field):
+                broken = json.loads(json.dumps(full))
+                del broken["grants"]["dictation"][field]
+                with open(consent.consent_path(), "w") as handle:
+                    json.dump(broken, handle)
+                with self.assertRaises(consent.ConsentError) as caught:
+                    consent.granted("dictation", self.A)
+                self.assertIn(field, str(caught.exception))
+
+    def test_a_legacy_bare_digest_grant_is_refused(self) -> None:
+        # The shape this branch replaced. It must not be read as a valid grant.
+        consent.grant("seed", self.A)          # creates the private directory
+        with open(consent.consent_path(), "w") as handle:
+            json.dump({"schema": consent.CONSENT_SCHEMA,
+                       "grants": {"dictation": self.A}}, handle)
+        with self.assertRaises(consent.ConsentError):
+            consent.granted("dictation", self.A)
+
+    def test_regranting_the_same_consent_keeps_its_timestamp(self) -> None:
+        first = consent.grant("dictation", self.A)
+        stamp = first["grants"]["dictation"]["granted_utc"]
+        again = consent.grant("dictation", self.A)
+        self.assertEqual(again["grants"]["dictation"]["granted_utc"], stamp)
+
     def test_a_malformed_grant_entry_is_refused_not_read_as_absent(self) -> None:
         consent.grant("dictation", self.A)
         with open(consent.consent_path(), "w") as handle:
