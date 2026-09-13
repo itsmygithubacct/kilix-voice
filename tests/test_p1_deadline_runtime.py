@@ -676,3 +676,141 @@ class TruncatedTranscriptTestCase(unittest.TestCase):
 
     def test_a_clean_turn_still_delivers(self) -> None:          # positive control
         self._run(overruns=0)                                     # must not raise
+
+
+class R3SurvivorTestCase(unittest.TestCase):
+    """The eight R3 mutations that survived all 504 tests.
+
+    Every one is a lifetime, ordering or correlation property: the mechanisms
+    were each correct and did not agree with one another at their boundaries.
+    """
+
+    def _turn(self, chunks=("a", "b", "c")):
+        engine = mock.Mock()
+        engine.voice, engine.model, engine.rate, engine.seed = "en-us", "m1", 170, 7
+        engine.effective_model = None
+        t = voiced._SpeechTurn("speak-7", list(chunks), engine)
+        t.receiver = mock.Mock()
+        return t
+
+    def _daemon(self, turn=None):
+        import threading
+        d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._warn = lambda *a, **k: None
+        d._send = lambda receiver, msg: captured.append(msg) or True
+        d._speech = turn
+        return d
+
+    # M01 -----------------------------------------------------------------
+    def test_dispatch_connects_the_requested_chunk_receiver(self) -> None:
+        source = open(os.path.join(ROOT, "kilix-voiced")).read()
+        body = source[source.index("def _op_speak(self, request: dict)"):]
+        body = body[:body.index("\n    def ", 10)]
+        self.assertIn('request.get("chunk_sock")', body)
+        self.assertIn("_connect_dictation(request[\"chunk_sock\"])", body)
+
+    # M02 -----------------------------------------------------------------
+    def test_the_chunk_receiver_is_closed_when_the_turn_ends(self) -> None:
+        source = open(os.path.join(ROOT, "kilix-voiced")).read()
+        body = source[source.index("def _run_speech(self"):]
+        body = body[:body.index("\n    def ", 10)]
+        self.assertIn("turn.receiver.close()", body)
+        # and in the finally, so a failing turn still releases it
+        self.assertLess(body.index("finally:"), body.index("turn.receiver.close()"))
+
+    # M03 -----------------------------------------------------------------
+    def test_every_chunk_carries_its_turn_identity(self) -> None:
+        global captured; captured = []
+        turn = self._turn(); daemon = self._daemon(turn)
+        voiced.Daemon._play_if_current(daemon, turn, mock.Mock(), b"\x00\x00", 24000)
+        self.assertEqual(captured[0]["settings"]["turn"], "speak-7")
+
+    # M04 -----------------------------------------------------------------
+    def test_the_clip_is_queued_before_it_is_announced(self) -> None:
+        # Announcing first would tell a subscriber audio is playing that the
+        # player has not accepted yet.
+        order = []
+        global captured; captured = []
+        turn = self._turn(); daemon = self._daemon(turn)
+        daemon._send = lambda r, m: order.append("announce") or True
+        player = mock.Mock()
+        player.play.side_effect = lambda *a, **k: order.append("queue")
+        voiced.Daemon._play_if_current(daemon, turn, player, b"\x00\x00", 24000)
+        self.assertEqual(order, ["queue", "announce"])
+
+    # M07 + M09 -----------------------------------------------------------
+    def test_every_clip_of_a_turn_is_announced_exactly_once(self) -> None:
+        global captured; captured = []
+        turn = self._turn(("a", "b", "c")); daemon = self._daemon(turn)
+        for _ in range(3):
+            voiced.Daemon._play_if_current(daemon, turn, mock.Mock(), b"\x00\x00", 24000)
+        self.assertEqual(len(captured), len(turn.chunks))          # M07
+        self.assertEqual([c["sequence"] for c in captured], [0, 1, 2])
+        self.assertEqual(sum(1 for c in captured if c["final"]), 1)  # M09
+        self.assertIs(captured[-1]["final"], True)
+
+    # M10 -----------------------------------------------------------------
+    def test_the_recogniser_is_closed_when_dictation_ends(self) -> None:
+        source = open(os.path.join(ROOT, "kilix-voiced")).read()
+        body = source[source.index("def _dictate(self"):]
+        body = body[:body.index("\n    def ", 10)]
+        self.assertIn("engine.close()", body)
+        self.assertLess(body.index("finally:"), body.index("engine.close()"))
+
+    # M11 -----------------------------------------------------------------
+    def test_a_finished_dictation_turn_is_not_retained(self) -> None:
+        # Behavioural, not a source grep: the cleanup goes through
+        # _clear_dictation, and my first attempt asserted a literal assignment
+        # that does not appear -- a test that would have failed on correct code.
+        import threading
+        daemon = object.__new__(voiced.Daemon)
+        daemon._lock = threading.RLock()
+        daemon._warn = lambda *a, **k: None
+        daemon._touch = lambda: None
+        daemon._send = lambda *a, **k: True
+        daemon._dictate = lambda turn: None
+        daemon._arbiter = mock.Mock()          # _clear_dictation ends the lease
+        turn = voiced._DictationTurn("d5", mock.Mock())
+        daemon._dictation = turn
+        voiced.Daemon._run_dictation(daemon, turn)
+        self.assertIsNone(daemon._dictation,
+                          "the finished turn is still referenced")
+
+
+class MultiClipTurnTestCase(unittest.TestCase):
+    """R3 M07: no test drove _run_speech's loop, so 'synthesise only the first
+    clip' passed the entire suite."""
+
+    def _run(self, chunks):
+        import threading
+        engine = mock.Mock()
+        engine.voice, engine.model, engine.rate, engine.seed = "en-us", "m1", 170, 7
+        engine.effective_model = None
+        engine.synth.side_effect = lambda text: (b"\x00\x00", 24000)
+        turn = voiced._SpeechTurn("speak-m", list(chunks), engine)
+        turn.receiver = None
+        daemon = object.__new__(voiced.Daemon)
+        daemon._lock = threading.RLock()
+        daemon._speech = turn
+        daemon._warn = lambda *a, **k: None
+        daemon._touch = lambda: None
+        daemon._arbiter = mock.Mock()
+        daemon._report_speech_failure = lambda t, m: None
+        player = mock.Mock()
+        player.playing = False
+        player.error = ""
+        daemon._get_player = lambda: player
+        voiced.Daemon._run_speech(daemon, turn)
+        return engine, player
+
+    def test_every_clip_of_a_turn_is_synthesised(self) -> None:
+        engine, player = self._run(("one", "two", "three"))
+        self.assertEqual([c.args[0] for c in engine.synth.call_args_list],
+                         ["one", "two", "three"])
+        self.assertEqual(player.play.call_count, 3)
+
+    def test_a_single_clip_turn_still_works(self) -> None:      # control
+        engine, player = self._run(("only",))
+        self.assertEqual(engine.synth.call_count, 1)
+        self.assertEqual(player.play.call_count, 1)
