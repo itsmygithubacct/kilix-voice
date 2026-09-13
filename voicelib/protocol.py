@@ -248,7 +248,28 @@ def decode(raw: bytes | str) -> dict:
     # frame costs no UTF-8 pass and no parser allocation.
     measured = None
     if isinstance(raw, str):
-        measured = len(raw.encode("utf-8"))
+        # The comment above was not true for str: measuring by encoding the
+        # whole string allocated a frame-sized bytes object before the size
+        # refusal, and a lone surrogate made that encode raise
+        # UnicodeEncodeError, which is not a ProtocolError. Every character
+        # is at least one UTF-8 byte, so a string longer than the limit in
+        # CHARACTERS is refused with no allocation at all; below that, ASCII
+        # is measured by its length and anything else in bounded slices.
+        if len(raw) > MAX_REQUEST_BYTES:
+            raise MessageTooLarge(
+                f"message is at least {len(raw)} bytes; the limit is "
+                f"{MAX_REQUEST_BYTES}. Refused before decoding.",
+                size=len(raw), limit=MAX_REQUEST_BYTES)
+        if raw.isascii():
+            measured = len(raw)
+        else:
+            try:
+                measured = sum(len(raw[start:start + 4096].encode("utf-8"))
+                               for start in range(0, len(raw), 4096))
+            except UnicodeEncodeError as error:
+                raise ProtocolError(
+                    "message contains text that is not valid UTF-8 (a lone "
+                    "surrogate). Send UTF-8 text.") from error
     elif isinstance(raw, (bytes, bytearray, memoryview)):
         measured = len(raw)
     # Anything else falls through to the type handling below, which raises a

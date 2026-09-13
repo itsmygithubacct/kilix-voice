@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import tempfile
+import tracemalloc
 import unittest
 
 from voicelib import protocol
@@ -391,6 +392,41 @@ class ValidateRequestTestCase(SessionTestCase):
         before = dict(msg)
         protocol.validate_request(msg, self.session)
         self.assertEqual(msg, before)
+
+
+class StrDecodeAllocationTestCase(unittest.TestCase):
+    """decode(str) refuses an over-size string without a frame-sized copy."""
+
+    PEAK_BOUND = 64 * 1024          # against a 192 KiB input: 3x separation
+
+    def refusal_peak(self, text: str) -> int:
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            baseline = tracemalloc.get_traced_memory()[0]
+            with self.assertRaises(protocol.MessageTooLarge):
+                protocol.decode(text)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        return peak - baseline
+
+    def test_an_over_size_ascii_string_is_refused_without_a_copy(self) -> None:
+        text = "x" * (protocol.MAX_REQUEST_BYTES + 1)
+        self.assertLess(self.refusal_peak(text), self.PEAK_BOUND)
+
+    def test_an_over_size_multibyte_string_is_refused_without_a_copy(self) -> None:
+        text = "€" * (protocol.MAX_REQUEST_BYTES // 3 + 1)
+        self.assertLessEqual(len(text), protocol.MAX_REQUEST_BYTES)  # not the char shortcut
+        self.assertLess(self.refusal_peak(text), self.PEAK_BOUND)
+
+    def test_a_lone_surrogate_in_a_str_frame_is_a_protocol_error(self) -> None:
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.decode('{"op":"\ud800"}')
+
+    def test_a_multibyte_string_under_the_limit_still_decodes(self) -> None:  # control
+        self.assertEqual(protocol.decode('{"op":"status","id":"café"}')["id"],
+                         "café")
 
 
 class HostileRequestTestCase(SessionTestCase):
