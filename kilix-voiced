@@ -821,7 +821,8 @@ class Daemon:
             self._dictate(turn)
         except (DaemonError, audio.AudioError, stt_lib.SttError,
                 paths.PathError, OSError, ValueError) as error:
-            self._send(turn.receiver, protocol.dictation_error(str(error)))
+            self._send(turn.receiver, protocol.dictation_error(
+                str(error), protocol.ERR_UNAVAILABLE))
         except Exception as error:  # a worker thread must not die silently
             self._warn(f"dictation failed: {error!r}")
             self._send(turn.receiver, protocol.dictation_error(

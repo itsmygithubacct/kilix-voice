@@ -176,6 +176,13 @@ class CatalogError(ValueError):
 # precisely what C13 forbids -- so unknown keys are preserved and ignored, and
 # only these are checked.
 _RECORD_REQUIRED = ("id", "engine")
+# C15: fields a consumer may ACT on, as opposed to inert metadata it merely
+# carries forward. Preserving an unknown field is forward compatibility;
+# handing back an unvalidated command vector is not. install_and_default_argv
+# is emitted by the producer and is literally an argv.
+_ACTIONABLE = ("install_and_default_argv",)
+_ARGV_HEAD = "kilix"
+_ARGV_OPTIONS = ("--install", "--default")
 _RECORD_TYPES = {
     "id": str, "engine": str, "download_bytes": int, "download_size": str,
     "installed": bool, "runtime_supported": bool, "selected": bool,
@@ -253,6 +260,31 @@ def read_catalog(document: object) -> dict:
                 raise CatalogError(
                     f"model record {index} resource_profile is invalid: "
                     f"{error}") from error
+        if "install_and_default_argv" in record:
+            argv = record["install_and_default_argv"]
+            if not isinstance(argv, list) or not argv:
+                raise CatalogError(
+                    f"model record {index} install_and_default_argv must be a "
+                    f"non-empty list, got {type(argv).__name__}.")
+            if any(not isinstance(a, str) for a in argv):
+                raise CatalogError(
+                    f"model record {index} install_and_default_argv must hold "
+                    "only strings; a nested structure is not an argv.")
+            if argv[0] != _ARGV_HEAD:
+                raise CatalogError(
+                    f"model record {index} install_and_default_argv starts "
+                    f"with {argv[0]!r}; only {_ARGV_HEAD!r} is accepted. A "
+                    "catalog may not name the program a consumer runs.")
+            for a in argv:
+                if a.startswith("-") and a not in _ARGV_OPTIONS:
+                    raise CatalogError(
+                        f"model record {index} install_and_default_argv "
+                        f"carries option {a!r}; only "
+                        f"{' and '.join(_ARGV_OPTIONS)} are accepted.")
+                if "\x00" in a or "\n" in a:
+                    raise CatalogError(
+                        f"model record {index} install_and_default_argv holds "
+                        "a control character.")
         catalog_id = record["id"]
         if catalog_id in seen:
             raise CatalogError(

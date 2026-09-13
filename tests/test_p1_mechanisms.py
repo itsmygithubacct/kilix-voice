@@ -807,3 +807,60 @@ class R2SurvivorTestCase(unittest.TestCase):
         self.assertIn('records[-1]["resource_profile"] = spec.resource_profile',
                       source)
         self.assertIn("if spec.resource_profile is not None:", source)
+
+
+class R2Findings4And6TestCase(unittest.TestCase):
+    """R2 finding 4 (dictation errors prose-only) and 6 (actionable fields)."""
+
+    def test_the_bare_dictation_error_shape_is_unchanged(self) -> None:
+        # The pinned test at tests/test_protocol.py:419 asserts exactly {"error"}.
+        # Defaulting a code in would change a shipped wire shape.
+        self.assertEqual(set(protocol.dictation_error("x")), {"error"})
+
+    def test_a_dictation_error_can_carry_a_closed_code(self) -> None:
+        out = protocol.dictation_error("x", protocol.ERR_UNAVAILABLE)
+        self.assertEqual(out["code"], protocol.ERR_UNAVAILABLE)
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.dictation_error("x", "bogus")
+
+    def test_the_runtime_dictation_error_supplies_a_code(self) -> None:
+        source = open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "kilix-voiced")).read()
+        self.assertIn("protocol.ERR_UNAVAILABLE", source)
+
+    # --- finding 6: install_and_default_argv is action-bearing -------------
+    def _doc(self, argv):
+        return {"schema": models.CATALOG_SCHEMA,
+                "models": [{"id": "m", "engine": "vosk",
+                            "install_and_default_argv": argv}]}
+
+    def test_the_producers_own_argv_is_accepted(self) -> None:      # control
+        good = ["kilix", "stt", "--install", "small-en-us",
+                "--default", "small-en-us"]
+        self.assertEqual(
+            models.read_catalog(self._doc(good))["models"][0]
+            ["install_and_default_argv"], good)
+
+    def test_an_argv_naming_another_program_is_refused(self) -> None:
+        for head in ("sh", "/bin/sh", "curl", "python3", ""):
+            with self.subTest(head=head):
+                with self.assertRaises(models.CatalogError) as caught:
+                    models.read_catalog(self._doc([head, "-c", "id"]))
+                self.assertIn("only 'kilix' is accepted", str(caught.exception))
+
+    def test_unexpected_options_are_refused(self) -> None:
+        with self.assertRaises(models.CatalogError) as caught:
+            models.read_catalog(self._doc(["kilix", "stt", "--exec", "id"]))
+        self.assertIn("only --install and --default", str(caught.exception))
+
+    def test_a_non_argv_shape_is_refused(self) -> None:
+        for argv in ("kilix stt", [], [["kilix"]], [1], {"a": 1}, None):
+            with self.subTest(argv=argv):
+                with self.assertRaises(models.CatalogError):
+                    models.read_catalog(self._doc(argv))
+
+    def test_control_characters_are_refused(self) -> None:
+        with self.assertRaises(models.CatalogError) as caught:
+            models.read_catalog(self._doc(["kilix", "stt\nid"]))
+        self.assertIn("control character", str(caught.exception))

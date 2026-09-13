@@ -463,9 +463,24 @@ def _speaker(raw: object) -> dict:
     return {"label": label, "confidence": float(confidence)}
 
 
-def dictation_error(message: str) -> dict:
-    """Return a dictation failure datagram."""
-    return {"error": message}
+def dictation_error(message: str, code: str | None = None) -> dict:
+    """Return a dictation failure datagram, with a closed code when given.
+
+    P12 applies to this channel too, and it was left prose-only when
+    reply_error was closed. The code is OPTIONAL rather than defaulted, for one
+    reason: the pinned regression test at tests/test_protocol.py:419 asserts
+    that an error datagram has exactly the key {"error"}. Defaulting a code in
+    would change that shipped wire shape, which is a contract change belonging
+    to the successor seam freeze, not to this commit. Runtime callers pass one;
+    the bare form is unchanged.
+    """
+    if code is None:
+        return {"error": message}
+    if code not in ERROR_CODES:
+        raise ProtocolError(
+            f"unknown error code {code!r}. Use one of: "
+            f"{', '.join(ERROR_CODES)}.")
+    return {"error": message, "code": code}
 
 
 def synthesis_chunk(sequence: int, *, pcm_bytes: int, sample_rate: int,
