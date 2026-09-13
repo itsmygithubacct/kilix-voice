@@ -658,9 +658,43 @@ class Daemon:
             # R4 finding 2: this probe has its own 5 s ceiling, which could
             # outlive a sub-second request. It runs before the turn exists, so
             # the budget is computed from the deadline taken at entry.
-            engine.check_available(
-                budget=(None if deadline is None
-                        else max(0.0, deadline - time.monotonic())))
+            probe_budget = (None if deadline is None
+                            else max(0.0, deadline - time.monotonic()))
+            # R5 finding A: bounding the probe was not enough. check_available
+            # raises TtsError, and _dispatch maps every TtsError to the default
+            # ERR_INTERNAL -- so a Piper request whose budget died in the probe
+            # was reported as an internal daemon bug, while the identical
+            # request on espeak reached turn.expired() and correctly said
+            # ERR_DEADLINE. Two engines disagreeing on the code for one
+            # condition is the same defect class as R4 finding 3.
+            if probe_budget is not None and probe_budget <= 0:
+                return protocol.reply_error(
+                    f"the request deadline of {deadline_ms} ms elapsed before "
+                    "the speech provider could be checked; nothing was spoken.",
+                    protocol.ERR_DEADLINE)
+            try:
+                engine.check_available(budget=probe_budget)
+            except tts_lib.TtsError:
+                # Distinguish "the provider is broken" from "we ran out of
+                # time asking it", which look identical from inside.
+                #
+                # The test is WHOSE ceiling bounded the probe, not what the
+                # clock says now: re-reading the clock is a race, because a
+                # 1 ms budget need not have elapsed across the handful of
+                # calls between taking the deadline and getting here. If the
+                # caller's budget was shorter than the probe's own
+                # PIPER_STATUS_TIMEOUT_S, then the caller's deadline is what
+                # cut the probe short and the deadline is the honest reason.
+                # A generous budget leaves a probe failure a real provider
+                # failure, which keeps ERR_INTERNAL for the case that means it.
+                if probe_budget is not None and (
+                        probe_budget < tts_lib.PIPER_STATUS_TIMEOUT_S
+                        or time.monotonic() >= deadline):
+                    return protocol.reply_error(
+                        f"the request deadline of {deadline_ms} ms elapsed "
+                        "while checking the speech provider; nothing was "
+                        "spoken.", protocol.ERR_DEADLINE)
+                raise
         chunks = self._speech_chunks(request["text"])
         if not chunks:
             # A pane of nothing but box drawing conditions down to nothing;
@@ -990,9 +1024,19 @@ class Daemon:
                 paths.PathError, OSError, ValueError) as error:
             # A refusal that knows its own code keeps it. Everything else is
             # still `unavailable`, which R4 confirmed is the right default.
-            self._send(turn.receiver, protocol.dictation_error(
-                str(error),
-                getattr(error, "code", None) or protocol.ERR_UNAVAILABLE))
+            #
+            # R5 finding B: the carried code MUST be validated here. This arm
+            # catches OSError and ValueError -- large families -- and
+            # dictation_error refuses a code outside the closed vocabulary by
+            # raising ProtocolError. Raised inside this except arm, that is not
+            # caught by the sibling `except Exception`, so the caller would
+            # receive NO datagram at all: strictly worse than the flattening
+            # this replaced.
+            carried = getattr(error, "code", None)
+            if carried not in protocol.ERROR_CODES:
+                carried = protocol.ERR_UNAVAILABLE
+            self._send(turn.receiver,
+                       protocol.dictation_error(str(error), carried))
         except Exception as error:  # a worker thread must not die silently
             self._warn(f"dictation failed: {error!r}")
             # F08: this arm called dictation_error with NO code at all, so an

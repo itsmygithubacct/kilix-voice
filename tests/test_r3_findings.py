@@ -485,6 +485,99 @@ class R4SurvivorCoverageTestCase(unittest.TestCase):
         self.assertFalse(
             any("final" in str(c) for c in engine.method_calls))
 
+    def test_a_spent_budget_never_starts_the_piper_probe_at_all(self) -> None:
+        # The final battery caught this: deleting the zero-budget early return
+        # SURVIVED, because check_available(budget=0) raises and the except
+        # path maps it to ERR_DEADLINE anyway -- same code, same message. The
+        # branch is redundant in OUTCOME but not in EFFECT: without it the
+        # daemon spawns a provider probe subprocess for a request whose budget
+        # is already gone. That is the observable difference, so pin it.
+        engine = tts_lib.PiperTts(rate=170)
+        engine.check_available = mock.Mock()
+        d = object.__new__(voiced.Daemon)
+        d._session_dir = "/tmp"
+        d._cfg = {}
+        # deadline_ms=0 is refused by validation ("must be greater than
+        # zero"), so the zero-budget branch is reachable only by elapsed time.
+        # That IS the production case: the deadline is taken before
+        # _refresh_config, and a real settings read can outlast a 1 ms budget.
+        import time as _t
+        d._refresh_config = lambda: _t.sleep(0.005)      # 5 ms vs a 1 ms budget
+        d._touch = lambda: None
+        with mock.patch.object(voiced.tts_lib, "make_tts",
+                               lambda *a, **k: engine):
+            reply = voiced.Daemon._dispatch(
+                d, protocol.encode({"op": "speak", "text": "hi",
+                                    "deadline_ms": 1}))
+        self.assertFalse(reply["ok"])
+        self.assertEqual(reply["code"], protocol.ERR_DEADLINE)
+        engine.check_available.assert_not_called()
+
+    def test_an_explicit_stop_ends_the_recording_loop(self) -> None:
+        # R5B survived: the shipped _record tests covered expiry, mid-recording
+        # expiry and daemon shutdown, but NOT an explicit stop-dictation. A
+        # regression from done() to expired() would silently break stop
+        # responsiveness during recording and no named check would object.
+        engine = mock.Mock()
+        engine.supports_partials = False
+        capture = mock.Mock()
+        capture.frame_bytes = 320
+        capture.overruns = 0
+        capture.error = ""
+        capture.read.side_effect = lambda *a, **k: b"\x00" * 320
+        d = object.__new__(voiced.Daemon)
+        d._cfg = {"stt": {"max_seconds": 120}, "vad": {"silence_ms": 1}}
+        d._stopping = threading.Event()
+        d._warn = d._debug = lambda *a, **k: None
+        d._send = lambda *a, **k: True
+        turn = voiced._DictationTurn("d-stop", mock.Mock())   # no deadline
+        turn.stop.set()                                       # explicit stop
+        with mock.patch.object(voiced, "Vad",
+                               lambda cfg: mock.Mock(feed=lambda f: "")):
+            voiced.Daemon._record(d, turn, capture, engine)
+        engine.feed.assert_not_called()
+
+    def test_a_stop_that_also_expired_still_delivers_its_transcript(self) -> None:
+        # R5A survived. reason() puts an explicit cancel above expiry, so a
+        # turn the user STOPPED must deliver what it heard rather than be
+        # refused as a deadline -- pressing stop is a request for the words so
+        # far, not an abandonment. Nothing pinned it.
+        clock = _Clock()
+        turn = voiced._DictationTurn("d-both", mock.Mock(),
+                                     clock() + 10.0, clock)
+
+        def _read(*a, **k):
+            clock.advance(20.0)        # budget dies...
+            turn.stop.set()            # ...and the user pressed stop
+            return b"\x00" * 320
+
+        capture = mock.Mock()
+        capture.frame_bytes = 320
+        capture.overruns = 0
+        capture.error = ""
+        capture.read.side_effect = _read
+        engine = mock.Mock()
+        engine.supports_partials = False
+        engine.end_utterance.return_value = "hello there"
+        sent = []
+        d = object.__new__(voiced.Daemon)
+        d._cfg = {"stt": {"engine": "vosk", "model_path": "/nonexistent",
+                          "max_seconds": 120},
+                  "vad": {"silence_ms": 1}}
+        d._stopping = threading.Event()
+        d._warn = d._debug = lambda *a, **k: None
+        d._send = lambda receiver, msg: sent.append(msg) or True
+        d._require_capture_consent = lambda resolved=None: None
+        with mock.patch.object(voiced.audio, "MicCapture", lambda cfg: capture), \
+             mock.patch.object(voiced.stt_lib, "make_stt",
+                               lambda *a, **k: engine), \
+             mock.patch.object(voiced, "Vad",
+                               lambda cfg: mock.Mock(feed=lambda f: "")), \
+             mock.patch.object(voiced, "clean_for_injection", lambda t: t):
+            voiced.Daemon._dictate(d, turn)      # must NOT raise
+        self.assertEqual(turn.stop.reason(), "cancelled")
+        self.assertTrue(any("final" in m for m in sent), sent)
+
     def test_an_unbounded_caller_still_gets_an_unbounded_fallback(self) -> None:
         seen = []                                                    # control
         engine = tts_lib.EspeakTts.__new__(tts_lib.EspeakTts)
