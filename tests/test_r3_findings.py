@@ -121,9 +121,30 @@ class F01SpeechExpiryTestCase(unittest.TestCase):
             tts_lib._bounded(210.0, 0.0)
 
     def test_piper_status_keeps_its_contract_on_a_spent_budget(self) -> None:
-        ok, detail = tts_lib.piper_status(budget=0.0)
-        self.assertFalse(ok)
-        self.assertIn("deadline", detail)
+        # Made hermetic (R6 finding 8). As first written this asked whatever
+        # provider the host had, and it passed only where kilix-piper-tts was
+        # installed: elsewhere the PATH lookup ran before the budget check and
+        # the detail read "not installed", so the suite's result depended on
+        # the machine. The contract does not depend on install state, so it is
+        # checked both ways -- a provider that would record having run, and no
+        # provider at all -- and a spent budget must never start the provider.
+        import stat
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "provider-ran")
+            provider = os.path.join(tmp, "kilix-piper-tts")
+            with open(provider, "w") as handle:
+                handle.write(f"#!/bin/sh\ntouch '{marker}'\nexit 99\n")
+            os.chmod(provider, stat.S_IRWXU)
+            for command in (provider, os.path.join(tmp, "not-installed")):
+                with self.subTest(provider=os.path.basename(command)), \
+                     mock.patch.dict(os.environ,
+                                     {tts_lib.PIPER_ENV_COMMAND: command}):
+                    ok, detail = tts_lib.piper_status(budget=0.0)
+                    self.assertFalse(ok)
+                    self.assertIn("deadline", detail)
+            self.assertFalse(os.path.exists(marker),
+                             "a spent budget started the provider")
 
 
 class F02DictationDeadlineTestCase(unittest.TestCase):
