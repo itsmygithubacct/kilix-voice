@@ -201,10 +201,30 @@ class CaptureConsentGateTestCase(unittest.TestCase):
         self.assertIn("self._require_capture_consent()",
                       body[:body.index("def _require_capture_consent")])
 
-    def test_the_gate_is_off_unless_explicitly_required(self) -> None:
-        # Deployment default: upgrading must not silently break existing callers.
+    def test_the_gate_is_ON_by_default(self) -> None:
+        # Owner decision 2026-09-13: mandatory, not opt-in. An earlier revision
+        # defaulted it off so upgrading would not break existing callers; that
+        # meant S02 had no runtime meaning anywhere, which R2 said plainly.
         with mock.patch.dict(os.environ, {"HOME": self.home}, clear=True):
+            with self.assertRaises(voiced.DaemonError):
+                voiced.Daemon._require_capture_consent(self.daemon)
+
+    def test_it_can_be_disabled_only_deliberately(self) -> None:
+        with mock.patch.dict(os.environ,
+                             {"HOME": self.home,
+                              "KILIX_VOICE_REQUIRE_CONSENT": "0"}, clear=True):
             voiced.Daemon._require_capture_consent(self.daemon)  # must not raise
+
+    def test_the_daemon_never_auto_grants(self) -> None:
+        # A grant recorded without asking is not consent, whatever the file
+        # says afterwards. The daemon has no terminal; it must refuse, not
+        # write a grant on the user's behalf.
+        from voicelib import consent
+        with mock.patch.dict(os.environ, {"HOME": self.home}, clear=True):
+            with self.assertRaises(voiced.DaemonError):
+                voiced.Daemon._require_capture_consent(self.daemon)
+            self.assertFalse(os.path.exists(consent.consent_path()),
+                             "the daemon wrote a consent record by itself")
 
 
 class DispatchBindingTestCase(unittest.TestCase):
@@ -248,7 +268,13 @@ class DispatchBindingTestCase(unittest.TestCase):
         import json as _json, shutil, subprocess as _sp, tempfile
         home = tempfile.mkdtemp(prefix="f104-cli-")
         self.addCleanup(shutil.rmtree, home, True)
-        env = dict(os.environ, HOME=home)
+        # HOME alone does NOT isolate the store: KILIX_STORAGE_HOME and
+        # KILIX_DATA_HOME override it, and a live Kilix session exports both.
+        # An earlier version of this test wrote into the real user store
+        # because of that. Strip every stack variable.
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith(("KILIX", "GPU_TERMINAL_", "PLEB_"))}
+        env["HOME"] = home
         out = _sp.run([sys.executable, "kilix-stt", "--grant-consent"],
                       cwd=ROOT, capture_output=True, text=True, env=env)
         self.assertEqual(out.returncode, 0, out.stderr[:300])
@@ -262,6 +288,14 @@ class DispatchBindingTestCase(unittest.TestCase):
              "m, e, consent.payload_digest(m, e))))"],
             cwd=ROOT, capture_output=True, text=True, env=env)
         self.assertEqual(probe.stdout.strip(), "True", probe.stderr[:300])
+        # and the record must carry the S02 fields, not just a digest
+        import json as _j
+        store = _j.loads(open(os.path.join(
+            home, ".local/gpu_terminal/kilix/data/voice/consent.json")).read())
+        entry = store["grants"]["dictation"]
+        for field in ("digest", "granted_utc", "allowed_use",
+                      "output_identity", "model_id", "model_revision"):
+            self.assertIn(field, entry)
 
     def test_engine_identity_is_part_of_the_capture_digest(self) -> None:
         # R2 survivor: dropping engine from the digest left the suite green.

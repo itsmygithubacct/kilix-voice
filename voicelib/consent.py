@@ -16,6 +16,7 @@ Importing this module performs no filesystem work.
 
 from __future__ import annotations
 
+import datetime
 import fcntl
 import hashlib
 import json
@@ -111,25 +112,71 @@ def _load() -> dict:
         for key, value in grants.items():
             # A malformed entry must not read as "no grant for that subject":
             # that would silently downgrade to unconsented and hide tampering.
-            if not isinstance(key, str) or not _SUBJECT.fullmatch(key) \
-                    or not isinstance(value, str) or not _DIGEST.fullmatch(value):
+            if not isinstance(key, str) or not _SUBJECT.fullmatch(key):
+                raise ConsentError(
+                    f"consent record at {consent_path()} has a malformed "
+                    f"subject {key!r}. Remove it and grant consent again.")
+            if not isinstance(value, dict):
                 raise ConsentError(
                     f"consent record at {consent_path()} has a malformed grant "
-                    f"for {key!r}. Remove it and grant consent again.")
+                    f"for {key!r}: expected an object with the S02 fields. "
+                    "Remove it and grant consent again.")
+            for field in ("digest", "granted_utc", "allowed_use",
+                          "output_identity", "model_id", "model_revision"):
+                if not isinstance(value.get(field), str):
+                    raise ConsentError(
+                        f"consent record at {consent_path()} is missing "
+                        f"{field!r} for {key!r}. A grant that cannot say what "
+                        "was agreed to is not a record of consent. Remove it "
+                        "and grant consent again.")
+            if not _DIGEST.fullmatch(value["digest"]):
+                raise ConsentError(
+                    f"consent record at {consent_path()} has a malformed "
+                    f"digest for {key!r}. Remove it and grant consent again.")
     return record
 
 
-def grant(subject: str, digest: str) -> dict:
+# S02 requires the record to say WHAT was agreed to, not merely that something
+# was. A bare {subject: digest} cannot be read back by a person, cannot be
+# audited, and cannot answer "consent to do what, with which model, when".
+ALLOWED_USE = {
+    "dictation": "capture microphone audio and transcribe it locally; the "
+                 "transcript is delivered to the granting user's own session "
+                 "and is not stored or sent anywhere else",
+}
+OUTPUT_IDENTITY = {
+    "dictation": "local-session-delivery",
+}
+
+
+def grant(subject: str, digest: str, *, model_id: str = "",
+          model_revision: str = "", granted_utc: str | None = None) -> dict:
     """Record consent for ``subject`` at ``digest``; return the record.
 
-    Idempotent for the same pair: granting twice does not change the recorded
-    grant, which is what S02's "reuse" means.
+    Idempotent for the same digest: re-granting an identical consent leaves the
+    recorded grant, including its timestamp, untouched -- that is what S02's
+    "reuse" means, and refreshing the time on every check would make the record
+    say the user agreed again when they did not.
     """
     subject, digest = _checked(subject, digest)
     with _transaction():
         existing = _load()
         grants = dict(existing.get("grants") or {})
-        grants[subject] = digest
+        previous = grants.get(subject)
+        if isinstance(previous, dict) and previous.get("digest") == digest:
+            return {"schema": CONSENT_SCHEMA, "grants": grants}   # reuse
+        grants[subject] = {
+            "digest": digest,
+            "granted_utc": granted_utc or datetime.datetime.now(
+                datetime.timezone.utc).replace(microsecond=0).isoformat(),
+            "allowed_use": ALLOWED_USE.get(subject, "unspecified"),
+            "output_identity": OUTPUT_IDENTITY.get(subject, "unspecified"),
+            "model_id": model_id,
+            # The payload digest, or "" when nothing is installed. Recorded
+            # separately from `digest` so a reader can see WHICH artefact was
+            # agreed to without recomputing the combined identity.
+            "model_revision": model_revision,
+        }
         record = {"schema": CONSENT_SCHEMA, "grants": grants}
         _write(record)
     return record
@@ -167,7 +214,10 @@ def granted(subject: str, digest: str) -> bool:
     invalidation. It is not an error -- the caller's job is to ask again.
     """
     subject, digest = _checked(subject, digest)
-    return (_load().get("grants") or {}).get(subject) == digest
+    entry = (_load().get("grants") or {}).get(subject)
+    if not isinstance(entry, dict):
+        return False
+    return entry.get("digest") == digest
 
 
 def revoke(subject: str) -> bool:

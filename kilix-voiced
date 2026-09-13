@@ -876,7 +876,9 @@ class Daemon:
         a DEPLOYMENT decision and not a statement that the gate is optional:
         with it set, capture does not start without a grant.
         """
-        if os.environ.get("KILIX_VOICE_REQUIRE_CONSENT", "") != "1":
+        # Default ON. Set KILIX_VOICE_REQUIRE_CONSENT=0 to disable, which is a
+        # deliberate deployment choice rather than the absence of one.
+        if os.environ.get("KILIX_VOICE_REQUIRE_CONSENT", "1") == "0":
             return
         # settings.stt_model()/stt_engine(), NOT self._cfg.get("stt_model"):
         # those keys do not exist in the config mapping, so the digest bound
@@ -889,6 +891,10 @@ class Daemon:
         digest = consent.capture_digest(
             model_id, engine, consent.payload_digest(model_id, engine))
         if not consent.granted("dictation", digest):
+            # No silent auto-grant. A grant recorded without the user being
+            # asked is not consent, whatever the file says afterwards. The
+            # daemon has no terminal, so it refuses and names the command that
+            # does ask.
             raise DaemonError(
                 "dictation has no recorded consent for this configuration "
                 f"(model {model_id!r}, engine {engine!r}). The microphone was "

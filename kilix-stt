@@ -1601,7 +1601,9 @@ def _consent_command(args) -> None:
         print("dictation consent withdrawn." if removed
               else "no dictation consent was recorded.")
         return
-    model_consent.grant("dictation", digest)
+    model_consent.grant("dictation", digest, model_id=model_id,
+                        model_revision=model_consent.payload_digest(
+                            model_id, engine))
     print(f"dictation consent recorded for model {model_id!r} "
           f"(engine {engine!r}).")
     print("Changing the model, or the installed payload beneath it, asks again.")
