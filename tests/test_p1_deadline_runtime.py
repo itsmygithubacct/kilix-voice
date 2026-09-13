@@ -269,3 +269,65 @@ class DispatchBindingTestCase(unittest.TestCase):
                             consent.capture_digest("m", "vibevoice"))
         self.assertNotEqual(consent.capture_digest("m", "vosk"),
                             consent.capture_digest("other", "vosk"))
+
+
+class R2DeadlineSurvivorTestCase(unittest.TestCase):
+    """deadline_exact_instant and deadline_terminal_report."""
+
+    class _Clock:
+        def __init__(self): self.t = 100.0
+        def __call__(self): return self.t
+
+    def test_expiry_is_at_the_exact_instant_not_after_it(self) -> None:
+        # `>=` vs `>`: one tick either side of the boundary.
+        clock = self._Clock()
+        turn = voiced._SpeechTurn("t", ["a"], mock.Mock(), 100.5, clock)
+        clock.t = 100.499
+        self.assertFalse(turn.expired())
+        clock.t = 100.5                      # exactly the instant
+        self.assertTrue(turn.expired())
+
+    def test_expiry_is_reported_by_the_worker_as_the_terminal_reason(self) -> None:
+        # deadline_terminal_report: without this the run ends quietly, or a
+        # player error stands in for a deadline the caller set.
+        source = open(os.path.join(ROOT, "kilix-voiced")).read()
+        block = source[source.index("def _run_speech"):]
+        block = block[:block.index("def _synth")]
+        self.assertIn("if turn.expired():", block)
+        self.assertIn("the request deadline elapsed", block)
+        # and it must take precedence over the player error, not follow it
+        self.assertLess(block.index("if turn.expired():"),
+                        block.index("elif player.error:"))
+
+
+class R2ConsentDurabilityTestCase(unittest.TestCase):
+    """consent_fsync: a write error must not leave the lock held or the record gone."""
+
+    def setUp(self) -> None:
+        import shutil, tempfile
+        self.home = os.path.realpath(tempfile.mkdtemp(prefix="f104-enospc-"))
+        self.env = mock.patch.dict(os.environ, {"HOME": self.home}, clear=True)
+        self.env.start(); self.addCleanup(self.env.stop)
+        self.addCleanup(shutil.rmtree, self.home, True)
+
+    def test_a_write_failure_keeps_the_previous_record_and_frees_the_lock(self) -> None:
+        from voicelib import consent
+        good = "a" * 64
+        consent.grant("dictation", good)
+        real_fsync = os.fsync
+
+        def boom(fd):
+            raise OSError(28, "No space left on device")
+
+        with mock.patch.object(os, "fsync", boom):
+            with self.assertRaises(OSError):
+                consent.grant("dictation", "b" * 64)
+        # the earlier grant must survive: a failed write is not a revocation
+        self.assertTrue(consent.granted("dictation", good))
+        # and the lock must be free, or every later call deadlocks
+        consent.grant("other", good)
+        self.assertTrue(consent.granted("other", good))
+        # no partial temporary left behind
+        leftovers = [n for n in os.listdir(os.path.dirname(consent.consent_path()))
+                     if n.startswith(".consent-")]
+        self.assertEqual(leftovers, [])

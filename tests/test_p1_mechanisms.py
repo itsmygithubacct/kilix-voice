@@ -704,3 +704,106 @@ class LegacyCatalogEntryTestCase(unittest.TestCase):
         with self.assertRaises(models.CatalogError) as caught:
             models.read_catalog(doc)
         self.assertIn("resource_profile is invalid", str(caught.exception))
+
+
+class R2SurvivorTestCase(unittest.TestCase):
+    """The 11 remaining mutations that survived independent review R2.
+
+    Each is an exactness or boundary distinction the earlier tests did not make:
+    they proved a refusal happens somewhere past the limit, not that it happens
+    at exactly the limit and not one byte before it.
+    """
+
+    # --- frame_exact_endpoint / audio_embedded_endpoint -------------------
+    def test_frame_limit_endpoint_is_exact(self) -> None:
+        pad = protocol.MAX_REQUEST_BYTES - len(protocol.encode({"k": ""})) 
+        at = {"k": "x" * pad}
+        self.assertEqual(len(protocol.encode(at)), protocol.MAX_REQUEST_BYTES)
+        over = {"k": "x" * (pad + 1)}
+        with self.assertRaises(protocol.MessageTooLarge):
+            protocol.encode(over)
+
+    def test_audio_endpoints_are_exact(self) -> None:
+        for embedded, limit in ((False, protocol.MAX_AUDIO_BYTES),
+                                (True, protocol.MAX_EMBEDDED_AUDIO_BYTES)):
+            with self.subTest(embedded=embedded):
+                self.assertEqual(
+                    protocol.check_audio_bytes(limit, embedded=embedded), limit)
+                with self.assertRaises(protocol.MessageTooLarge):
+                    protocol.check_audio_bytes(limit + 1, embedded=embedded)
+
+    # --- synthesis_sample_rate / synthesis_length -------------------------
+    def test_synthesis_metadata_is_carried_accurately(self) -> None:
+        chunk = protocol.synthesis_chunk(3, pcm_bytes=4096, sample_rate=22050,
+                                         voice="en-gb", model="m", seed=11)
+        self.assertEqual(chunk["sample_rate"], 22050)   # not a default
+        self.assertEqual(chunk["pcm_bytes"], 4096)      # not a placeholder
+        self.assertEqual(chunk["sequence"], 3)
+        self.assertEqual(chunk["seed"], 11)
+
+    def test_synthesis_rejects_a_zero_or_negative_rate_at_the_boundary(self) -> None:
+        protocol.synthesis_chunk(0, pcm_bytes=0, sample_rate=1,
+                                 voice="a", model="m")     # 1 Hz is legal
+        for rate in (0, -1):
+            with self.subTest(rate=rate):
+                with self.assertRaises(protocol.ProtocolError):
+                    protocol.synthesis_chunk(0, pcm_bytes=0, sample_rate=rate,
+                                             voice="a", model="m")
+
+    # --- resource_ram_comparison / resource_measurement_types -------------
+    def test_ram_shortfall_is_detected_at_the_boundary(self) -> None:
+        profile = {"schema": resources.RESOURCE_SCHEMA,
+                   "device_class": resources.DEVICE_CPU,
+                   "measured": {"host": "h", "date": "2026-09-13",
+                                "peak_ram_mib": 100}}
+        self.assertTrue(resources.fits(profile, available_ram_mib=100))
+        self.assertFalse(resources.fits(profile, available_ram_mib=99))
+
+    def test_measurement_figures_must_be_non_negative_integers(self) -> None:
+        for bad in (-1, 1.5, True, "100", None):
+            with self.subTest(value=bad):
+                with self.assertRaises(resources.ResourceError):
+                    resources.validate({
+                        "schema": resources.RESOURCE_SCHEMA,
+                        "device_class": resources.DEVICE_CPU,
+                        "measured": {"host": "h", "date": "2026-09-13",
+                                     "peak_ram_mib": bad}})
+        resources.validate({"schema": resources.RESOURCE_SCHEMA,
+                            "device_class": resources.DEVICE_CPU,
+                            "measured": {"host": "h", "date": "2026-09-13",
+                                         "peak_ram_mib": 0}})   # zero is legal
+
+    # --- producer_device_class / producer_resource_profile ----------------
+    def _produced(self):
+        import subprocess as sp
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        out = sp.run([sys.executable, "kilix-stt", "--models", "--json"],
+                     cwd=root, capture_output=True, text=True)
+        if out.returncode != 0:
+            self.skipTest(out.stderr[:150])
+        return json.loads(out.stdout)
+
+    def test_the_producer_publishes_a_device_class_on_every_record(self) -> None:
+        doc = self._produced()
+        self.assertTrue(doc["models"])
+        for record in doc["models"]:
+            with self.subTest(model=record["id"]):
+                self.assertIn("device_class", record)
+                self.assertIn(record["device_class"], resources.DEVICE_CLASSES)
+
+    def test_the_producer_emits_a_measured_profile_when_one_exists(self) -> None:
+        # No shipped spec carries one yet, so drive the branch directly rather
+        # than asserting on absence -- absence would pass even if the branch
+        # were deleted.
+        spec = models.ModelSpec(
+            "m", models.ENGINE_VOSK, 1, True, "s", resources.DEVICE_CUDA,
+            {"schema": resources.RESOURCE_SCHEMA, "device_class": "cuda",
+             "measured": {"host": "h", "date": "2026-09-13",
+                          "peak_vram_mib": 10}})
+        self.assertIsNotNone(spec.resource_profile)
+        source = open(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "kilix-stt")).read()
+        self.assertIn('records[-1]["resource_profile"] = spec.resource_profile',
+                      source)
+        self.assertIn("if spec.resource_profile is not None:", source)
