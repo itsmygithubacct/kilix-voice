@@ -961,6 +961,14 @@ class Daemon:
         last_audio = time.monotonic()
         heard = False
         speaking = False
+        # A06 on the CAPTURE side. The time limit above bounds a WELL-BEHAVED
+        # stream; it does not bound bytes, and a device reporting an absurd
+        # rate or width delivers far more than max_seconds implies. R2: "Capture
+        # has no corresponding total byte counter/refusal; its queue can discard
+        # old frames." Discarding old frames silently truncates what the user
+        # said, which is the same wrong-answer-wearing-a-success this contract
+        # refuses elsewhere -- so this counts and REFUSES rather than trimming.
+        captured_bytes = 0
         while not turn.stop.is_set() and not self._stopping.is_set():
             if time.monotonic() >= deadline:
                 self._debug(f"{turn.id}: hit the {max_seconds:.0f}s ceiling")
@@ -981,6 +989,8 @@ class Daemon:
                 continue
             last_audio = time.monotonic()
             heard = True
+            captured_bytes += len(frame)
+            protocol.check_audio_bytes(captured_bytes)
             event = detector.feed(frame)
             text = engine.feed(frame)
             if partials and text is not None:

@@ -506,3 +506,64 @@ class StreamedSynthesisTestCase(unittest.TestCase):
         out = protocol.validate_request(
             {"op": "speak", "text": "hi", "sock": "/etc/evil.sock"}, session)
         self.assertNotIn("sock", out)
+
+
+class CaptureAccountingTestCase(unittest.TestCase):
+    """A06 on the capture side: total bytes are counted and refused, not trimmed."""
+
+    def _daemon(self, cfg=None):
+        import threading
+        d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._stopping = threading.Event()
+        d._cfg = cfg or {}
+        d._send = lambda *a, **k: True
+        d._warn = lambda *a, **k: None
+        return d
+
+    class _Capture:
+        rate = 16000
+        error = ""
+        def __init__(self, frame, count): self._f, self._n = frame, count
+        def read(self, *a, **k):
+            if self._n <= 0:
+                return None
+            self._n -= 1
+            return self._f
+        def stop(self): pass
+
+    class _Engine:
+        supports_partials = False
+        def feed(self, frame): return None
+        def start_utterance(self): pass
+        def end_utterance(self): return ""
+
+    def test_a_flood_of_capture_bytes_is_refused(self) -> None:
+        from voicelib import protocol
+        import threading
+        turn = voiced._DictationTurn("d1", mock.Mock())
+        daemon = self._daemon()
+        big = b"\x00" * (1024 * 1024)
+        frames = protocol.MAX_AUDIO_BYTES // len(big) + 2
+        capture = self._Capture(big, frames)
+        with mock.patch.object(voiced, "Vad", lambda cfg: mock.Mock(
+                feed=lambda f: None)):
+            with self.assertRaises(protocol.MessageTooLarge):
+                voiced.Daemon._record(daemon, turn, capture, self._Engine())
+
+    def test_an_ordinary_turn_is_not_refused(self) -> None:      # positive control
+        from voicelib import protocol
+        turn = voiced._DictationTurn("d2", mock.Mock())
+        daemon = self._daemon()
+        capture = self._Capture(b"\x00" * 3200, 5)
+        with mock.patch.object(voiced, "Vad", lambda cfg: mock.Mock(
+                feed=lambda f: None)):
+            heard = voiced.Daemon._record(daemon, turn, capture, self._Engine())
+        self.assertTrue(heard)
+
+    def test_the_counter_is_reached_from_the_capture_loop(self) -> None:
+        source = open(os.path.join(ROOT, "kilix-voiced")).read()
+        body = source[source.index("def _record(self"):]
+        body = body[:body.index("\n    def ", 10)]
+        self.assertIn("captured_bytes += len(frame)", body)
+        self.assertIn("protocol.check_audio_bytes(captured_bytes)", body)
