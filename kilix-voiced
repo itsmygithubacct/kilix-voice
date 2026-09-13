@@ -121,6 +121,19 @@ class DaemonError(RuntimeError):
     """The daemon cannot serve a request; the message says what to do."""
 
 
+class ConsentDenied(DaemonError):
+    """Capture refused because no grant covers this configuration.
+
+    R4 finding 3: the consent refusal reached the caller as ERR_UNAVAILABLE,
+    the same code as a missing microphone, while the purpose-built ERR_DENIED
+    was dead code. "You have not consented" and "there is no device" call for
+    different things from a caller, and this is the most important refusal in
+    the system to be able to name.
+    """
+
+    code = protocol.ERR_DENIED
+
+
 def clean_for_injection(text: str) -> str:
     """Return recognised text that is safe to type into a terminal."""
     return " ".join(_UNSAFE_FOR_PTY.sub(" ", str(text)).split())
@@ -642,7 +655,12 @@ class Daemon:
             # The provider status contract loads no model and starts no
             # service, but confirms both the isolated runtime and pinned
             # Kristin artifacts before this request is acknowledged.
-            engine.check_available()
+            # R4 finding 2: this probe has its own 5 s ceiling, which could
+            # outlive a sub-second request. It runs before the turn exists, so
+            # the budget is computed from the deadline taken at entry.
+            engine.check_available(
+                budget=(None if deadline is None
+                        else max(0.0, deadline - time.monotonic())))
         chunks = self._speech_chunks(request["text"])
         if not chunks:
             # A pane of nothing but box drawing conditions down to nothing;
@@ -970,8 +988,11 @@ class Daemon:
                 f"dictation stopped: {error}.", protocol.ERR_CANCELLED))
         except (DaemonError, audio.AudioError, stt_lib.SttError,
                 paths.PathError, OSError, ValueError) as error:
+            # A refusal that knows its own code keeps it. Everything else is
+            # still `unavailable`, which R4 confirmed is the right default.
             self._send(turn.receiver, protocol.dictation_error(
-                str(error), protocol.ERR_UNAVAILABLE))
+                str(error),
+                getattr(error, "code", None) or protocol.ERR_UNAVAILABLE))
         except Exception as error:  # a worker thread must not die silently
             self._warn(f"dictation failed: {error!r}")
             # F08: this arm called dictation_error with NO code at all, so an
@@ -1009,6 +1030,13 @@ class Daemon:
             capture.start()
             engine.start_utterance()
             heard = self._record(turn, capture, engine)
+            # Recording stopping because the budget ran out is not a completed
+            # turn. Without this the caller gets a `final` transcript, or the
+            # misleading "no audio arrived from the microphone", for a request
+            # it had already given up on.
+            if turn.stop.reason() == "deadline":
+                raise DeadlineExceeded(
+                    "the request deadline elapsed while recording")
             # The microphone closes the moment the turn ends, before anything
             # is recognised or delivered: click-to-talk means the recorder is
             # not still running while the last words are being turned into
@@ -1079,7 +1107,7 @@ class Daemon:
             # asked is not consent, whatever the file says afterwards. The
             # daemon has no terminal, so it refuses and names the command that
             # does ask.
-            raise DaemonError(
+            raise ConsentDenied(
                 "dictation has no recorded consent for this configuration "
                 f"(model {model_id!r}, engine {engine!r}). The microphone was "
                 "not opened. Grant it once with `kilix stt --grant-consent`; a "
@@ -1111,7 +1139,11 @@ class Daemon:
         # refuses elsewhere -- so this counts and REFUSES rather than trimming.
         captured_bytes = 0
         dropped_frames = 0
-        while not turn.stop.is_set() and not self._stopping.is_set():
+        # R4 finding 1: this read is_set() only, so an accepted deadline_ms
+        # bounded nothing here -- recording ran to max_seconds, VAD silence or
+        # an explicit stop while the caller's budget had long since elapsed.
+        # done() is "stopped OR expired".
+        while not turn.stop.done() and not self._stopping.is_set():
             if time.monotonic() >= deadline:
                 self._debug(f"{turn.id}: hit the {max_seconds:.0f}s ceiling")
                 break

@@ -381,5 +381,130 @@ class F08WorkerErrorCodeTestCase(unittest.TestCase):
         self.assertEqual(msg["code"], protocol.ERR_UNAVAILABLE)
 
 
+class R4SurvivorCoverageTestCase(unittest.TestCase):
+    """The four mutations R4 wrote that survived all 540 tests.
+
+    Each is correct code with nothing guarding it, which is the same class of
+    hole as an untested fix: it can be deleted and no named check objects.
+    """
+
+    def test_an_explicit_cancel_outranks_expiry_in_the_reason(self) -> None:
+        # R4 N1. A turn that was stopped and then sat past its deadline was
+        # STOPPED; reporting "deadline" misattributes it. The docstring
+        # insisted on this ordering and nothing enforced it.
+        clock = _Clock()
+        token = Cancellation(clock() + 0.001, clock)
+        clock.advance(1.0)
+        self.assertEqual(token.reason(), "deadline")
+        token.set()
+        self.assertEqual(token.reason(), "cancelled")
+
+    def test_recording_stops_when_the_daemon_is_shutting_down(self) -> None:
+        # R4 N3. Deleting the _stopping check left every test green.
+        engine = mock.Mock()
+        engine.supports_partials = False
+        capture = mock.Mock()
+        capture.frame_bytes = 320
+        capture.overruns = 0
+        capture.error = ""
+        capture.read.side_effect = lambda *a, **k: b"\x00" * 320
+        d = object.__new__(voiced.Daemon)
+        d._cfg = {"stt": {"max_seconds": 120}, "vad": {"silence_ms": 1}}
+        d._stopping = threading.Event()
+        d._stopping.set()                     # daemon is going down
+        d._warn = d._debug = lambda *a, **k: None
+        d._send = lambda *a, **k: True
+        turn = voiced._DictationTurn("d-shut", mock.Mock())
+        with mock.patch.object(voiced, "Vad",
+                               lambda cfg: mock.Mock(feed=lambda f: "")):
+            voiced.Daemon._record(d, turn, capture, engine)
+        engine.feed.assert_not_called()
+
+    def test_the_mbrola_fallback_does_not_get_a_fresh_budget(self) -> None:
+        # R4 N4. Giving the retry the original budget lets one request take
+        # twice as long as it asked for.
+        seen = []
+        engine = tts_lib.EspeakTts.__new__(tts_lib.EspeakTts)
+        engine._cfg = {}
+        engine.voice = "en-us"
+        engine.rate = 170
+        engine._mbrola_ok = True
+        engine._mbrola_fallback = True
+        engine.mbrola_error = ""
+
+        def _fake_run(text, voice, *, budget=None):
+            seen.append(budget)
+            if voice.startswith("mb-"):
+                import time as _t
+                _t.sleep(0.02)                # the failed attempt costs time
+                raise tts_lib.TtsError("mbrola voice not installed")
+            return b"", 22050
+
+        engine._run = _fake_run
+        engine.synth("hello", budget=1.0)
+        self.assertEqual(len(seen), 2, seen)
+        self.assertEqual(seen[0], 1.0)
+        self.assertIsNotNone(seen[1])
+        self.assertLess(seen[1], 1.0)         # the retry inherits the remainder
+
+    def test_a_budget_that_expires_mid_recording_refuses_the_turn(self) -> None:
+        # Found by re-running R4's mutations after the fix: removing this
+        # report SURVIVED all 551 tests. An expired recording must not deliver
+        # a `final` transcript as though the turn completed -- and the earlier
+        # boundary checks cannot cover it, because the budget is still live
+        # when recording STARTS. The clock advances on the first read.
+        clock = _Clock()
+        turn = voiced._DictationTurn("d-mid", mock.Mock(),
+                                     clock() + 10.0, clock)
+        capture = mock.Mock()
+        capture.frame_bytes = 320
+        capture.overruns = 0
+        capture.error = ""
+        capture.read.side_effect = (
+            lambda *a, **k: (clock.advance(20.0), b"\x00" * 320)[1])
+        engine = mock.Mock()
+        engine.supports_partials = False
+        engine.end_utterance.return_value = ""
+        d = object.__new__(voiced.Daemon)
+        d._cfg = {"stt": {"engine": "vosk", "model_path": "/nonexistent",
+                          "max_seconds": 120},
+                  "vad": {"silence_ms": 1}}
+        d._stopping = threading.Event()
+        d._warn = d._debug = lambda *a, **k: None
+        d._send = lambda *a, **k: True
+        d._require_capture_consent = lambda resolved=None: None
+        with mock.patch.object(voiced.audio, "MicCapture", lambda cfg: capture), \
+             mock.patch.object(voiced.stt_lib, "make_stt",
+                               lambda *a, **k: engine), \
+             mock.patch.object(voiced, "Vad",
+                               lambda cfg: mock.Mock(feed=lambda f: "")), \
+             mock.patch.object(voiced, "clean_for_injection", lambda t: t):
+            with self.assertRaises(DeadlineExceeded):
+                voiced.Daemon._dictate(d, turn)
+        # and nothing was delivered as a completed turn
+        self.assertFalse(
+            any("final" in str(c) for c in engine.method_calls))
+
+    def test_an_unbounded_caller_still_gets_an_unbounded_fallback(self) -> None:
+        seen = []                                                    # control
+        engine = tts_lib.EspeakTts.__new__(tts_lib.EspeakTts)
+        engine._cfg = {}
+        engine.voice = "en-us"
+        engine.rate = 170
+        engine._mbrola_ok = True
+        engine._mbrola_fallback = True
+        engine.mbrola_error = ""
+
+        def _fake_run(text, voice, *, budget=None):
+            seen.append(budget)
+            if voice.startswith("mb-"):
+                raise tts_lib.TtsError("nope")
+            return b"", 22050
+
+        engine._run = _fake_run
+        engine.synth("hello")
+        self.assertEqual(seen, [None, None])
+
+
 if __name__ == "__main__":
     unittest.main()
