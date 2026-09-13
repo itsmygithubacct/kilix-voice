@@ -1323,7 +1323,10 @@ class Daemon:
         # device that wedged all mean the same thing to a listener.
         stall_s = silence_s + 1.0
         partials = engine.supports_partials
-        deadline = time.monotonic() + max_seconds
+        # The max_seconds instant is the recording CEILING. It is not the
+        # caller's deadline, which lives on turn.stop; calling both "deadline"
+        # in one loop left them a single misreading away from being swapped.
+        ceiling = time.monotonic() + max_seconds
         last_audio = time.monotonic()
         heard = False
         speaking = False
@@ -1341,11 +1344,20 @@ class Daemon:
         # an explicit stop while the caller's budget had long since elapsed.
         # done() is "stopped OR expired".
         while not turn.stop.done() and not self._stopping.is_set():
-            if time.monotonic() >= deadline:
+            if time.monotonic() >= ceiling:
                 self._debug(f"{turn.id}: hit the {max_seconds:.0f}s ceiling")
                 break
             asked = time.monotonic()
-            frame = capture.read(timeout=CAPTURE_POLL_S)
+            # R6 finding 5: the loop honoured the budget by rounding it. A
+            # blocking read on a quiet microphone waited its full poll
+            # interval past the deadline, so a 30 ms budget ended recording
+            # after 200 ms. The read is clipped to the budget that is left.
+            # Not budget(): that raises Cancelled on an explicit stop, and a
+            # stop during recording means "finish now and deliver".
+            left = turn.stop.remaining()
+            read_timeout = (CAPTURE_POLL_S if left is None
+                            else max(0.0, min(CAPTURE_POLL_S, left)))
+            frame = capture.read(timeout=read_timeout)
             if frame is None:
                 if capture.error:
                     raise DaemonError(capture.error)
@@ -1353,10 +1365,11 @@ class Daemon:
                     break
                 # A read that returned no frame *and* took no time is an ended
                 # stream rather than a timeout, and asking again immediately
-                # would spin a core until the stall window closes. Waiting on
-                # the stop flag keeps the turn cancellable meanwhile.
-                turn.stop.wait(max(0.0, CAPTURE_POLL_S
-                                   - (time.monotonic() - asked)))
+                # would spin a core until the stall window closes. The wait
+                # ends on a stop OR at the deadline: the deadline-blind
+                # wait() slept a whole poll interval past an expiry.
+                turn.stop.wait_done(max(0.0, CAPTURE_POLL_S
+                                        - (time.monotonic() - asked)))
                 continue
             last_audio = time.monotonic()
             heard = True

@@ -12,6 +12,7 @@ import importlib.machinery
 import importlib.util
 import os
 import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -142,6 +143,65 @@ class DeliveryBoundaryTestCase(unittest.TestCase):
         self.assertEqual(len(sent), 1, sent)
         self.assertEqual(sent[0]["code"], protocol.ERR_UNAVAILABLE, sent)
         self.assertIn("no audio", sent[0]["error"])
+
+
+class RecordingHonoursTheBudgetTestCase(unittest.TestCase):
+    """R6 finding 5: recording ends AT the deadline, not a poll interval past it.
+
+    Real time, because what is measured is how long the loop blocks. The
+    budget is 40 ms against a 200 ms poll interval, so a rounded deadline and
+    an honoured one are far apart.
+    """
+
+    BUDGET = 0.04
+    BOUND = 0.15
+
+    def record(self, read, deadline=True):
+        turn = voiced._DictationTurn(
+            "listen-1", mock.Mock(),
+            deadline=(time.monotonic() + self.BUDGET) if deadline else None)
+        capture = mock.Mock(frame_bytes=320, overruns=0, error="")
+        capture.read.side_effect = lambda timeout=None: read(turn, timeout)
+        d = object.__new__(voiced.Daemon)
+        d._cfg = {"stt": {"max_seconds": 120}, "vad": {"silence_ms": 900}}
+        d._stopping = threading.Event()
+        d._warn = d._debug = lambda *a, **k: None
+        d._send = lambda *a, **k: True
+        engine = mock.Mock(supports_partials=False)
+        with mock.patch.object(voiced, "Vad", lambda cfg: types.SimpleNamespace(
+                feed=lambda frame: "")):
+            started = time.monotonic()
+            voiced.Daemon._record(d, turn, capture, engine)
+            return time.monotonic() - started, capture
+
+    def test_an_ended_stream_stops_waiting_at_the_deadline(self) -> None:
+        # read() returns at once: the loop then waits out the rest of the
+        # poll interval, and that wait must wake at the deadline.
+        elapsed, _capture = self.record(lambda turn, timeout: None)
+        self.assertLess(elapsed, self.BOUND,
+                        f"a 40 ms budget ended recording after {elapsed:.3f} s")
+
+    def test_a_quiet_microphone_read_is_clipped_to_the_budget(self) -> None:
+        def quiet(turn, timeout):
+            time.sleep(timeout or 0)         # blocks as queue.get does
+            return None
+
+        elapsed, capture = self.record(quiet)
+        self.assertLess(elapsed, self.BOUND,
+                        f"a 40 ms budget ended recording after {elapsed:.3f} s")
+        for call in capture.read.call_args_list:
+            self.assertLessEqual(call.kwargs["timeout"], self.BUDGET)
+
+    def test_an_unbounded_turn_still_polls_at_the_capture_interval(self) -> None:
+        seen = []                                                       # control
+
+        def one_poll(turn, timeout):
+            seen.append(timeout)
+            turn.stop.set()                  # stop-dictation ends the loop
+            return None
+
+        self.record(one_poll, deadline=False)
+        self.assertEqual(seen, [voiced.CAPTURE_POLL_S])
 
 
 if __name__ == "__main__":
