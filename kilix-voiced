@@ -502,11 +502,21 @@ class Daemon:
             selector.register(self._socket, selectors.EVENT_READ)
             selector.register(self._wake_r, selectors.EVENT_READ)
             while not self._stopping.is_set():
+                # select() itself stays unguarded on purpose: a listening
+                # socket that has died should end the daemon.
                 for key, _mask in selector.select(timeout=ACCEPT_POLL_S):
-                    if key.fileobj is self._socket:
-                        self._accept_one()
-                    else:
-                        self._drain_wakeups()
+                    try:
+                        if key.fileobj is self._socket:
+                            self._accept_one()
+                        else:
+                            self._drain_wakeups()
+                    except Exception as error:
+                        # The last net. No bytes a peer sends may end this
+                        # loop, and a failure reaching here has already
+                        # escaped every narrower guard. Only the type is
+                        # logged: a message can carry request content.
+                        self._warn(f"a connection failed unexpectedly "
+                                   f"({type(error).__name__}); still serving")
                 self._check_idle()
 
     def _drain_wakeups(self) -> None:
@@ -595,14 +605,26 @@ class Daemon:
                 self._warn(f"cannot accept a connection: {error}")
             return
         with conn:
-            conn.settimeout(REQUEST_TIMEOUT_S)
-            reply = self._answer(conn)
-            if reply is None:
-                return
             try:
-                conn.send(protocol.encode(reply))
-            except OSError as error:
-                self._debug(f"client left before the reply: {error}")
+                conn.settimeout(REQUEST_TIMEOUT_S)
+                reply = self._answer(conn)
+                if reply is None:
+                    return
+                # Bounded before it is sent. Four same-user requests below
+                # MAX_REQUEST_BYTES built refusals too large to encode, and the
+                # MessageTooLarge that raised here ended the serve loop -- one
+                # request, and the voice session was gone.
+                frame = protocol.encode_reply(reply)
+                try:
+                    conn.send(frame)
+                except OSError as error:
+                    self._debug(f"client left before the reply: {error}")
+            except Exception as error:
+                # BaseException still propagates: a signal or SystemExit
+                # keeps its meaning. Only the type is logged, never the
+                # message, which can carry what the request said.
+                self._warn(f"a connection failed unexpectedly "
+                           f"({type(error).__name__}); still serving")
 
     def _answer(self, conn: socket.socket) -> dict | None:
         """Return the reply for one connection, or None to just hang up."""
@@ -654,6 +676,17 @@ class Daemon:
             # op or an incompatible protocol major.
             return protocol.reply_error(
                 str(error), _carried_code(error, protocol.ERR_MALFORMED))
+        except Exception as error:
+            # decode and validate_request are meant to raise only
+            # ProtocolError for anything a caller sends. Three payloads proved
+            # otherwise -- a 5000-digit integer, a lone surrogate in a path,
+            # nesting past the recursion limit -- and each escaped this arm.
+            # Those are fixed at their source; this is the net for the next.
+            self._warn(f"could not read a request ({type(error).__name__})")
+            return protocol.reply_error(
+                "kilix-voiced could not read that request. This is a bug -- "
+                "the daemon is still running, and its stderr names the "
+                "failure.", protocol.ERR_INTERNAL)
         self._touch()
         handlers: dict[str, Callable[[dict], dict]] = {
             protocol.OP_SPEAK: self._op_speak,
@@ -950,11 +983,13 @@ class Daemon:
                 seed=getattr(engine, "seed", None),
                 final=final, turn=turn.id,
                 rate_wpm=getattr(engine, "rate", None))
+            # Inside the guard: _send refuses a datagram over MAX_REPLY_BYTES,
+            # and a descriptor too large to deliver must not take the audio
+            # down any more than a malformed one may.
+            self._send(turn.receiver, chunk)
         except protocol.ProtocolError as error:
             # A malformed descriptor must not take the audio down with it.
             self._warn(f"synthesis chunk {turn.sequence} not published: {error}")
-            return
-        self._send(turn.receiver, chunk)
 
     def _await_clip(self, turn: _SpeechTurn, player: audio.Player) -> bool:
         """Wait out the queued clip; False when the turn was cancelled."""
@@ -1282,9 +1317,15 @@ class Daemon:
         return heard
 
     def _send(self, receiver: socket.socket, message: dict) -> bool:
-        """Send one dictation datagram; False when the receiver has gone."""
+        """Send one dictation datagram; False when the receiver has gone.
+
+        Encoded against MAX_REPLY_BYTES, the size the kitty fork's receiver
+        reads: a larger datagram would arrive truncated and fail to decode.
+        MessageTooLarge propagates, so an over-size transcript is REFUSED with
+        a too-large datagram by _run_dictation rather than cut short.
+        """
         try:
-            receiver.send(protocol.encode(message))
+            receiver.send(protocol.encode(message, limit=protocol.MAX_REPLY_BYTES))
             return True
         except OSError as error:
             # The message itself is never logged: it is what the user said.

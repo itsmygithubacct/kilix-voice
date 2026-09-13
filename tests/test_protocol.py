@@ -393,6 +393,68 @@ class ValidateRequestTestCase(SessionTestCase):
         self.assertEqual(msg, before)
 
 
+class HostileRequestTestCase(SessionTestCase):
+    """Caller input raises only ProtocolError, and every reply fits a client."""
+
+    def test_nesting_past_the_recursion_limit_is_a_protocol_error(self) -> None:
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.decode(b"[" * 100_000)
+
+    def test_an_integer_past_the_digit_limit_is_a_protocol_error(self) -> None:
+        for field in ("deadline_ms", "id"):
+            with self.subTest(field=field):
+                with self.assertRaises(protocol.ProtocolError):
+                    protocol.decode(b'{"op":"status","%s":%s}'
+                                    % (field.encode(), b"9" * 5000))
+
+    def test_a_lone_surrogate_in_a_socket_path_is_a_protocol_error(self) -> None:
+        for field, op in (("sock", "dictate"), ("chunk_sock", "speak")):
+            with self.subTest(field=field):
+                with self.assertRaises(protocol.ProtocolError) as caught:
+                    protocol.validate_request(
+                        {"op": op, "text": "hi", field: self.sock("a\ud800.sock")},
+                        self.session)
+                self.assertIn("UTF-8", str(caught.exception))
+
+    def test_a_socket_path_past_path_max_is_refused(self) -> None:
+        with self.assertRaises(protocol.ProtocolError) as caught:
+            self.dictate(self.sock("d" * 5000 + ".sock"))
+        self.assertIn("PATH_MAX", str(caught.exception))
+
+    def test_a_refusal_never_quotes_a_value_at_full_length(self) -> None:
+        for msg in ({"op": "\\" * 95_000}, {"op": "status", "v": "\\" * 95_000},
+                    {"op": "dictate", "sock": '"' * 94_000}):
+            with self.subTest(field=next(iter(set(msg) - {"op"}), "op")):
+                with self.assertRaises(protocol.ProtocolError) as caught:
+                    protocol.validate_request(msg, self.session)
+                self.assertLess(len(str(caught.exception)), 1000)
+
+    def test_an_error_reply_with_huge_prose_keeps_its_code_and_fits(self) -> None:
+        for filler in ("x", "\\", "\x01", "é"):
+            with self.subTest(filler=filler):
+                reply = {"ok": False, "error": filler * 300_000, "code": "busy"}
+                frame = protocol.encode_reply(reply)
+                self.assertLessEqual(len(frame), protocol.MAX_REPLY_BYTES)
+                self.assertEqual(protocol.decode(frame)["code"], "busy")
+
+    def test_an_over_size_success_reply_becomes_internal_not_partial(self) -> None:
+        frame = protocol.encode_reply(protocol.reply_ok("", status="y" * 300_000))
+        self.assertLessEqual(len(frame), protocol.MAX_REPLY_BYTES)
+        reply = protocol.decode(frame)
+        self.assertIs(reply["ok"], False)
+        self.assertEqual(reply["code"], protocol.ERR_INTERNAL)
+
+    def test_an_unserialisable_reply_becomes_internal(self) -> None:
+        reply = protocol.decode(protocol.encode_reply({"ok": True, "x": object()}))
+        self.assertEqual(reply["code"], protocol.ERR_INTERNAL)
+
+    def test_message_too_large_carries_its_size_and_limit(self) -> None:
+        with self.assertRaises(protocol.MessageTooLarge) as caught:
+            protocol.encode({"text": "x" * 70_000}, limit=protocol.MAX_REPLY_BYTES)
+        self.assertEqual(caught.exception.limit, protocol.MAX_REPLY_BYTES)
+        self.assertGreater(caught.exception.size, protocol.MAX_REPLY_BYTES)
+
+
 class ReplyTestCase(unittest.TestCase):
 
     def test_ok_reply_carries_the_request_id_and_fields(self) -> None:
@@ -410,6 +472,14 @@ class ReplyTestCase(unittest.TestCase):
         self.assertIs(reply["ok"], False)
         self.assertIn("apt install", reply["error"])
         self.assertEqual(protocol.decode(protocol.encode(reply)), reply)
+
+    def test_error_prose_is_capped_at_construction(self) -> None:
+        limit = protocol.MAX_ERROR_PROSE_CHARS + len(" …[truncated]")
+        self.assertLessEqual(len(protocol.reply_error("x" * 10_000)["error"]), limit)
+        self.assertLessEqual(
+            len(protocol.dictation_error("x" * 10_000, "busy")["error"]), limit)
+        short = "espeak-ng is not installed."
+        self.assertEqual(protocol.reply_error(short)["error"], short)
 
     def test_dictation_datagrams_round_trip(self) -> None:
         for datagram, key in ((protocol.dictation_partial("the quick"), "partial"),

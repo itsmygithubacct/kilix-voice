@@ -47,6 +47,19 @@ MAX_ID_CHARS = 64
 # at send(2) with an opaque EMSGSIZE.
 MAX_REQUEST_BYTES = 192 * 1024
 
+# Every reply and every dictation datagram fits the SMALLEST receive buffer a
+# shipped client uses. kilix-tts, kilix-stt and the kitty fork read 1 << 16;
+# kilix-avatar's speech.c reads 65535 and treats a full buffer as truncated.
+# A reply bounded only by MAX_REQUEST_BYTES would still be cut off at every one
+# of them and fail to decode there.
+MAX_REPLY_BYTES = 64 * 1024 - 1
+
+# Error prose is for a human. No message the daemon writes comes near this, so
+# only text a caller inflated -- a quoted value, an exception carrying one --
+# is ever cut.
+MAX_ERROR_PROSE_CHARS = 4096
+_TRUNCATED = " …[truncated]"
+
 # A caller may bound how long it is willing to wait.  Relative milliseconds,
 # not an absolute instant: the two ends do not share a clock, and a monotonic
 # offset cannot be invalidated by a wall-clock step.  The ceiling keeps a typo
@@ -89,6 +102,14 @@ ERROR_CODES = (ERR_MALFORMED, ERR_UNSUPPORTED, ERR_BUSY, ERR_DEADLINE,
 TTS_RATE_CHOICES = (120, 150, 170, 200, 240)
 _VOICE_TOKEN = re.compile(r"^[A-Za-z0-9_+-]{1,32}$")
 
+# Linux PATH_MAX, counting the terminating NUL: a longer path cannot name a
+# socket, and resolving one only produces a longer error.
+_PATH_MAX = 4096
+# Paths are quoted back at more length than other values: a refusal that cut
+# the session directory off at 80 characters would hide the one thing a user
+# needs to see, and PATH_MAX already bounds them.
+_PATH_ECHO_CHARS = 512
+
 
 class ProtocolError(ValueError):
     """A malformed or unsafe message; the text says what to send instead.
@@ -128,9 +149,43 @@ class MessageTooLarge(ProtocolError):
 
     code = ERR_TOO_LARGE
 
+    def __init__(self, message: str = "", *, size: int | None = None,
+                 limit: int | None = None) -> None:
+        super().__init__(message)
+        self.size = size
+        self.limit = limit
 
-def encode(msg: dict) -> bytes:
-    """Return one UTF-8 line, newline-terminated, for ``msg``."""
+
+def _echo(value: object, limit: int = 80) -> str:
+    """Return ``repr(value)`` cut to ``limit`` characters, for quoting in prose.
+
+    A refusal quotes the caller's value back so it says what was wrong -- but
+    the size of that quote must not be the caller's to choose. An op of 95000
+    backslashes repr'd to 190000 characters, JSON-escaped again into a reply
+    of 380 KB, and that reply's MessageTooLarge ended the daemon's serve loop.
+    """
+    if isinstance(value, str) and len(value) > limit:
+        return f"{value[:limit]!r}…({len(value)} chars)"
+    try:
+        text = repr(value)
+    except ValueError:          # an int past the interpreter's digit limit
+        return f"<{type(value).__name__} too large to show>"
+    return text if len(text) <= limit else f"{text[:limit]}…({len(text)} chars)"
+
+
+def _cut_prose(message: object, limit: int) -> object:
+    """Return error prose no longer than ``limit`` characters plus a marker."""
+    if isinstance(message, str) and len(message) > limit:
+        return message[:limit] + _TRUNCATED
+    return message
+
+
+def encode(msg: dict, *, limit: int = MAX_REQUEST_BYTES) -> bytes:
+    """Return one UTF-8 line, newline-terminated, for ``msg``.
+
+    ``limit`` is the largest frame accepted: MAX_REQUEST_BYTES for a request,
+    MAX_REPLY_BYTES for anything the daemon sends to a client.
+    """
     if not isinstance(msg, dict):
         raise ProtocolError(
             f"a protocol message must be a dict, got {type(msg).__name__}. "
@@ -146,11 +201,45 @@ def encode(msg: dict) -> bytes:
     # it in there would be caught by this very handler and re-reported as
     # "not JSON-serialisable" -- a wrong diagnosis for a correct message that is
     # merely too big. The existing suite caught exactly that.
-    if len(frame) > MAX_REQUEST_BYTES:
+    if len(frame) > limit:
         raise MessageTooLarge(
-            f"message is {len(frame)} bytes; the limit is {MAX_REQUEST_BYTES}. "
-            "Send the payload as a file path or split it across messages.")
+            f"message is {len(frame)} bytes; the limit is {limit}. "
+            "Send the payload as a file path or split it across messages.",
+            size=len(frame), limit=limit)
     return frame
+
+
+def encode_reply(reply: dict, limit: int = MAX_REPLY_BYTES) -> bytes:
+    """Return ONE frame of at most ``limit`` bytes for ``reply``, always.
+
+    A request must never be able to leave the daemon holding a reply it cannot
+    send, because every reply that failed to encode used to raise straight out
+    of the connection handler. So: the reply as built; failing that, an error
+    reply with its prose cut far enough that it must fit (6 bytes per
+    character is JSON's worst case); failing that, a constant `internal` reply
+    that names the failure's type. An over-size SUCCESS reply is never
+    trimmed -- a partial status is a wrong answer wearing a success -- so it
+    becomes that constant as well.
+    """
+    try:
+        return encode(reply, limit=limit)
+    except ProtocolError as error:
+        failure = error
+    if (isinstance(failure, MessageTooLarge) and isinstance(reply, dict)
+            and reply.get("ok") is False and isinstance(reply.get("error"), str)):
+        shorter = dict(reply)
+        shorter["error"] = _cut_prose(reply["error"], MAX_ERROR_PROSE_CHARS // 2)
+        try:
+            return encode(shorter, limit=limit)
+        except ProtocolError as error:
+            failure = error
+    return encode({
+        "ok": False,
+        "error": (f"kilix-voiced built a reply it could not send "
+                  f"({type(failure).__name__}); this is a bug, and the daemon "
+                  "is still running."),
+        "code": ERR_INTERNAL,
+    }, limit=limit)
 
 
 def decode(raw: bytes | str) -> dict:
@@ -168,7 +257,7 @@ def decode(raw: bytes | str) -> dict:
     if measured is not None and measured > MAX_REQUEST_BYTES:
         raise MessageTooLarge(
             f"message is {measured} bytes; the limit is {MAX_REQUEST_BYTES}. "
-            "Refused before decoding.")
+            "Refused before decoding.", size=measured, limit=MAX_REQUEST_BYTES)
     if isinstance(raw, str):
         text = raw
     else:
@@ -189,6 +278,16 @@ def decode(raw: bytes | str) -> dict:
         raise ProtocolError(
             f"invalid JSON at column {error.colno}: {error.msg}. Send one "
             'JSON object per line, for example {"op":"status"}.') from error
+    except (ValueError, RecursionError) as error:
+        # Not every parser refusal is a JSONDecodeError. An integer literal
+        # past the interpreter's digit limit raises a plain ValueError, and
+        # nesting deeper than the scanner's recursion limit raises
+        # RecursionError. Neither is a ProtocolError, so each escaped the
+        # daemon's validation arm and ended its serve loop.
+        raise ProtocolError(
+            f"invalid JSON ({type(error).__name__}): {_echo(str(error))}. "
+            'Send one JSON object per line, for example {"op":"status"}.'
+        ) from error
     if not isinstance(msg, dict):
         raise ProtocolError(
             f"expected a JSON object, got {type(msg).__name__}. Send a "
@@ -235,28 +334,45 @@ def _validated_socket(raw: object, session_dir: str) -> str:
     if "\x00" in raw:
         raise ProtocolError(
             "'sock' must not contain NUL bytes. Pass the plain socket path.")
+    # Both checked BEFORE the path reaches the filesystem layer. A lone
+    # surrogate made os.path.realpath raise UnicodeEncodeError, which is not a
+    # ProtocolError and ended the serve loop; a path longer than PATH_MAX
+    # cannot name a socket and only grows the refusal that quotes it.
+    try:
+        encoded = raw.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ProtocolError(
+            "'sock' is not a valid UTF-8 path: it contains a lone surrogate. "
+            "Pass the socket path as UTF-8 text.") from error
+    if len(encoded) >= _PATH_MAX:
+        raise ProtocolError(
+            f"'sock' is {len(encoded)} bytes, longer than PATH_MAX "
+            f"({_PATH_MAX}). Pass the <session>/dictate-<pane>.sock path.")
+    shown = _echo(raw, _PATH_ECHO_CHARS)
     if not os.path.isabs(raw):
         # A relative path would be resolved against the daemon's cwd, which the
         # sender does not know; refuse rather than guess what it meant.
         raise ProtocolError(
-            f"'sock' must be an absolute path, got {raw!r}. Pass the full "
+            f"'sock' must be an absolute path, got {shown}. Pass the full "
             "<session>/dictate-<pane>.sock path.")
-    root = os.path.realpath(os.path.expanduser(str(session_dir)))
-    target = os.path.realpath(raw)
     try:
+        root = os.path.realpath(os.path.expanduser(str(session_dir)))
+        target = os.path.realpath(raw)
         contained = os.path.commonpath((root, target)) == root
-    except ValueError as error:
-        # Mixed absolute/relative roots only; both are absolute here, so this
-        # means the session directory itself was passed in unusable.
+    except (ValueError, OSError) as error:
+        # Mixed absolute/relative roots, or a path the filesystem layer will
+        # not resolve. Both inputs are checked above, so this means the
+        # session directory itself was passed in unusable.
         raise ProtocolError(
-            f"cannot compare {raw!r} against the session directory "
-            f"{session_dir!r}: {error}.") from error
+            f"cannot compare {shown} against the session directory "
+            f"{_echo(session_dir, _PATH_ECHO_CHARS)}: "
+            f"{_echo(str(error), _PATH_ECHO_CHARS)}.") from error
     if not contained or target == root:
         raise ProtocolError(
-            f"refusing 'sock' outside the session directory: {raw!r} resolves "
-            f"to {target!r}, which is not a path inside {root!r}. Dictation "
-            "sockets are created by the kitty fork as "
-            "<session>/dictate-<pane>.sock.")
+            f"refusing 'sock' outside the session directory: {shown} resolves "
+            f"to {_echo(target, _PATH_ECHO_CHARS)}, which is not a path inside "
+            f"{_echo(root, _PATH_ECHO_CHARS)}. Dictation sockets are created "
+            "by the kitty fork as <session>/dictate-<pane>.sock.")
     return target
 
 
@@ -274,7 +390,7 @@ def _protocol_version(raw: object) -> str:
     match = _VERSION_TOKEN.fullmatch(text)
     if match is None:
         raise ProtocolError(
-            f"'v' is {text!r}; expected MAJOR or MAJOR.MINOR, for example "
+            f"'v' is {_echo(text)}; expected MAJOR or MAJOR.MINOR, for example "
             f"{PROTOCOL_VERSION!r}.")
     major = int(match.group(1))
     if major != PROTOCOL_MAJOR:
@@ -298,12 +414,12 @@ def _deadline_ms(raw: object) -> int:
             f"{type(raw).__name__}. Send for example 5000 for five seconds.")
     if raw <= 0:
         raise ProtocolError(
-            f"'deadline_ms' must be greater than zero, got {raw}. A deadline "
-            "that has already passed cannot be met; omit it to wait "
+            f"'deadline_ms' must be greater than zero, got {_echo(raw)}. A "
+            "deadline that has already passed cannot be met; omit it to wait "
             "indefinitely.")
     if raw > MAX_DEADLINE_MS:
         raise ProtocolError(
-            f"'deadline_ms' is {raw}; the ceiling is {MAX_DEADLINE_MS} "
+            f"'deadline_ms' is {_echo(raw)}; the ceiling is {MAX_DEADLINE_MS} "
             "(24 hours). Use a shorter bound.")
     return raw
 
@@ -329,7 +445,7 @@ def validate_request(msg: dict, session_dir: str) -> dict:
             f"{type(op).__name__}. Use one of: {', '.join(OPS)}.")
     if op not in OPS:
         raise ProtocolError(
-            f"unknown op {op!r}. Use one of: {', '.join(OPS)}.",
+            f"unknown op {_echo(op)}. Use one of: {', '.join(OPS)}.",
             code=ERR_UNSUPPORTED)
     request: dict = {"op": op, "id": _request_id(msg.get("id"))}
     if "v" in msg:
@@ -404,7 +520,8 @@ def reply_error(message: str, code: str = ERR_INTERNAL) -> dict:
         raise ProtocolError(
             f"unknown error code {code!r}. Use one of: "
             f"{', '.join(ERROR_CODES)}.")
-    return {"ok": False, "error": message, "code": code}
+    return {"ok": False, "error": _cut_prose(message, MAX_ERROR_PROSE_CHARS),
+            "code": code}
 
 
 def check_audio_bytes(length: int, *, embedded: bool = False) -> int:
@@ -531,6 +648,7 @@ def dictation_error(message: str, code: str | None = None) -> dict:
     to the successor seam freeze, not to this commit. Runtime callers pass one;
     the bare form is unchanged.
     """
+    message = _cut_prose(message, MAX_ERROR_PROSE_CHARS)
     if code is None:
         return {"error": message}
     if code not in ERROR_CODES:

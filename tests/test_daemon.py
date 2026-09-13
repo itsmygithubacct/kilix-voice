@@ -376,6 +376,49 @@ class DaemonTestCase(unittest.TestCase):
         self.assertIn("status", reply["error"])   # lists what it does accept
         self.assertTrue(self.request({"op": "status"})["ok"])
 
+    def _exchange_raw(self, payload: bytes) -> bytes:
+        """Send raw bytes as one record and return the first reply record."""
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        client.settimeout(REPLY_TIMEOUT_S)
+        with client:
+            client.connect(self.control)
+            client.send(payload)
+            return client.recv(MAX_REPLY_BYTES)
+
+    def test_no_single_request_ends_the_daemon(self) -> None:
+        # Each of these made the daemon raise out of its connection handler
+        # and end the serve loop: refusals that quoted the request back into a
+        # reply too large to encode, parser failures that were not
+        # ProtocolError, and a path the filesystem layer could not encode.
+        def frame(message: dict) -> bytes:
+            return json.dumps(message).encode("ascii") + b"\n"
+
+        payloads = (
+            ("op of 95000 backslashes", frame({"op": "\\" * 95000}), "unsupported"),
+            ("v of 95000 backslashes",
+             frame({"op": "status", "v": "\\" * 95000}), "malformed"),
+            ("sock of 47000 quote pairs",
+             frame({"op": "dictate", "sock": '""' * 47000}), "malformed"),
+            ("100000 '['", b"[" * 100000, "malformed"),
+            ("5000-digit deadline_ms",
+             b'{"op":"status","deadline_ms":' + b"9" * 5000 + b"}\n", "malformed"),
+            ("5000-digit id", b'{"op":"status","id":' + b"9" * 5000 + b"}\n",
+             "malformed"),
+            ("lone surrogate in sock",
+             frame({"op": "dictate", "sock": "/tmp/\ud800"}), "malformed"),
+        )
+        for label, payload, code in payloads:
+            with self.subTest(payload=label):
+                self.assertLessEqual(len(payload), 192 * 1024)
+                raw = self._exchange_raw(payload)
+                self.assertTrue(0 < len(raw) <= 65535,
+                                f"{len(raw)}-byte reply:\n{self._log_tail()}")
+                reply = json.loads(raw.decode("utf-8"))
+                self.assertIs(reply["ok"], False, reply)
+                self.assertEqual(reply["code"], code, reply)
+                self.assertIsNone(self.daemon.poll(), self._log_tail())
+                self.assertTrue(self.request({"op": "status"})["ok"])
+
     # -- shutdown -----------------------------------------------------------
 
     def test_sigterm_removes_the_control_socket(self) -> None:
