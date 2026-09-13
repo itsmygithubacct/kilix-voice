@@ -620,12 +620,15 @@ class ResourceProfileTestCase(unittest.TestCase):
         cpu_only_disk = {
             "schema": resources.RESOURCE_SCHEMA,
             "device_class": resources.DEVICE_CPU,
-            "measured": {"host": "h", "date": "2026-09-13", "model_bytes": 10},
+            "measured": {"host": "h", "date": "2026-09-13", "model_bytes": 10,
+                         "peak_ram_mib": 1},
         }
         self.assertFalse(resources.fits(cpu_only_disk))
         self.assertFalse(resources.fits(cpu_only_disk, available_vram_mib=99))
-        self.assertTrue(resources.fits(cpu_only_disk, available_disk_bytes=10))
-        self.assertFalse(resources.fits(cpu_only_disk, available_disk_bytes=9))
+        self.assertTrue(resources.fits(cpu_only_disk, available_disk_bytes=10,
+                                       available_ram_mib=1))
+        self.assertFalse(resources.fits(cpu_only_disk, available_disk_bytes=9,
+                                        available_ram_mib=1))
 
     def test_malformed_headroom_is_refused_not_certified(self) -> None:
         # NaN in particular makes every comparison false, which reads as "fits".
@@ -670,7 +673,8 @@ class LegacyCatalogEntryTestCase(unittest.TestCase):
                                "schema": resources.RESOURCE_SCHEMA,
                                "device_class": "cuda",
                                "measured": {"host": "pleon", "date": "2026-09-13",
-                                            "peak_vram_mib": 3629}}}]}
+                                            "peak_vram_mib": 3629,
+                                            "peak_ram_mib": 2048}}}]}
         self.assertEqual(models.read_catalog(doc)["models"][0]["device_class"], "cuda")
 
     def test_contradictory_device_declarations_are_refused(self) -> None:
@@ -682,7 +686,8 @@ class LegacyCatalogEntryTestCase(unittest.TestCase):
                                "schema": resources.RESOURCE_SCHEMA,
                                "device_class": "cuda",
                                "measured": {"host": "h", "date": "2026-09-13",
-                                            "peak_vram_mib": 100}}}]}
+                                            "peak_vram_mib": 100,
+                                            "peak_ram_mib": 64}}}]}
         with self.assertRaises(models.CatalogError) as caught:
             models.read_catalog(doc)
         self.assertIn("they must", str(caught.exception))
@@ -694,7 +699,8 @@ class LegacyCatalogEntryTestCase(unittest.TestCase):
                                "schema": resources.RESOURCE_SCHEMA,
                                "device_class": "cuda",
                                "measured": {"host": "h", "date": "2026-09-13",
-                                            "peak_vram_mib": 100}}}]}
+                                            "peak_vram_mib": 100,
+                                            "peak_ram_mib": 64}}}]}
         self.assertEqual(models.read_catalog(doc)["models"][0]["device_class"], "cuda")
 
     def test_a_malformed_profile_is_refused_at_the_catalog_boundary(self) -> None:
@@ -799,7 +805,7 @@ class R2SurvivorTestCase(unittest.TestCase):
             "m", models.ENGINE_VOSK, 1, True, "s", resources.DEVICE_CUDA,
             {"schema": resources.RESOURCE_SCHEMA, "device_class": "cuda",
              "measured": {"host": "h", "date": "2026-09-13",
-                          "peak_vram_mib": 10}})
+                          "peak_vram_mib": 10, "peak_ram_mib": 8}})
         self.assertIsNotNone(spec.resource_profile)
         source = open(os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -864,3 +870,61 @@ class R2Findings4And6TestCase(unittest.TestCase):
         with self.assertRaises(models.CatalogError) as caught:
             models.read_catalog(self._doc(["kilix", "stt\nid"]))
         self.assertIn("control character", str(caught.exception))
+
+
+class R2Findings3And5TestCase(unittest.TestCase):
+    """R2 findings 3 and 5, the parts that are code rather than judgement."""
+
+    def _cuda(self, **measured):
+        base = {"host": "pleon", "date": "2026-09-13",
+                "peak_vram_mib": 100, "peak_ram_mib": 64}
+        base.update(measured)
+        return {"schema": resources.RESOURCE_SCHEMA,
+                "device_class": resources.DEVICE_CUDA, "measured": base}
+
+    def test_a_profile_missing_ram_is_refused(self) -> None:
+        # R2: "No subject refusal covers missing RAM measurement." Now there is.
+        bad = self._cuda()
+        del bad["measured"]["peak_ram_mib"]
+        with self.assertRaises(resources.ResourceError) as caught:
+            resources.validate(bad)
+        self.assertIn("must report peak_ram_mib", str(caught.exception))
+
+    def test_a_cpu_profile_missing_ram_is_refused(self) -> None:
+        with self.assertRaises(resources.ResourceError):
+            resources.validate({
+                "schema": resources.RESOURCE_SCHEMA,
+                "device_class": resources.DEVICE_CPU,
+                "measured": {"host": "h", "date": "2026-09-13",
+                             "model_bytes": 10}})
+
+    def test_an_accelerator_missing_vram_is_still_refused(self) -> None:
+        bad = self._cuda()
+        del bad["measured"]["peak_vram_mib"]
+        with self.assertRaises(resources.ResourceError) as caught:
+            resources.validate(bad)
+        self.assertIn("must report peak_vram_mib", str(caught.exception))
+
+    def test_a_complete_profile_is_accepted(self) -> None:          # control
+        self.assertEqual(resources.validate(self._cuda())["device_class"], "cuda")
+
+    def test_an_unmapped_measured_demand_refuses_rather_than_being_dropped(self) -> None:
+        # R2: the comment promised refusal for an unmapped demand while the
+        # dictionary filter silently dropped it. Simulate a future figure by
+        # declaring one the map does not know.
+        profile = self._cuda()
+        with mock.patch.object(resources, "_MEASURED_INTS",
+                               resources._MEASURED_INTS + ("peak_npu_mib",)):
+            profile["measured"]["peak_npu_mib"] = 5
+            self.assertFalse(resources.fits(profile, available_vram_mib=1000,
+                                            available_ram_mib=1000))
+
+    def test_the_audio_ceilings_are_inclusive_as_documented(self) -> None:
+        # R2: the comment said "at or over ... is refused" while the code used
+        # `>`. The code was right; the comment is now corrected. Pin both ends.
+        src = open(os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "voicelib", "protocol.py")).read()
+        self.assertIn("The ceiling is INCLUSIVE", src)
+        self.assertNotIn("Anything at or over this is refused", src)
+        self.assertEqual(protocol.check_audio_bytes(protocol.MAX_AUDIO_BYTES),
+                         protocol.MAX_AUDIO_BYTES)

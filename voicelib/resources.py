@@ -30,6 +30,15 @@ DEVICE_CLASSES = (DEVICE_CPU, DEVICE_CUDA, DEVICE_VULKAN)
 # Measured, so each carries the host it was measured on and the date.
 _REQUIRED = ("schema", "device_class", "measured")
 _MEASURED_INTS = ("peak_vram_mib", "peak_ram_mib", "model_bytes")
+# Necessary dimensions per device class. RAM is required of every profile:
+# every engine holds its working set in host memory whatever else it uses, so a
+# profile that omits it has not been measured, it has been partially measured.
+# An accelerator must additionally report VRAM.
+_REQUIRED_DIMENSIONS = {
+    DEVICE_CPU: ("peak_ram_mib",),
+    DEVICE_CUDA: ("peak_ram_mib", "peak_vram_mib"),
+    DEVICE_VULKAN: ("peak_ram_mib", "peak_vram_mib"),
+}
 _HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -92,10 +101,14 @@ def validate(profile: object) -> dict:
             "a cpu profile reports peak_vram_mib "
             f"{measured['peak_vram_mib']}; VRAM on a cpu device class is a "
             "measurement error, not a small number.")
-    if device != DEVICE_CPU and "peak_vram_mib" not in measured:
-        raise ResourceError(
-            f"a {device} profile must report peak_vram_mib; that figure is the "
-            "whole reason an accelerator profile exists.")
+    for dimension in _REQUIRED_DIMENSIONS[device]:
+        if dimension not in measured:
+            raise ResourceError(
+                f"a {device} profile must report {dimension}. R1 asked for the "
+                "necessary demand dimensions per device class; a profile that "
+                "omits one has not been measured, it has been partially "
+                "measured, and fits() would then answer about a subset while "
+                "reading as an answer about the model.")
     return dict(profile)
 
 
@@ -145,6 +158,14 @@ def fits(profile: dict, *, available_vram_mib: int | None = None,
         "available_disk_bytes": _headroom("available_disk_bytes", available_disk_bytes),
     }
     measured = checked["measured"]
+    # Every measured figure must be MAPPED, not merely those that happen to be.
+    # The dictionary filter used here before silently dropped an unmapped
+    # demand, which contradicted the comment above it: adding a measured field
+    # without adding its headroom made fits() ignore it rather than refuse.
+    unmapped = [k for k in measured
+                if k in _MEASURED_INTS and k not in _DEMAND_TO_HEADROOM]
+    if unmapped:
+        return False
     demands = {k: v for k, v in measured.items() if k in _DEMAND_TO_HEADROOM}
     if not demands:                      # validate() forbids this, belt and braces
         return False

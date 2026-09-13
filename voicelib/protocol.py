@@ -56,7 +56,11 @@ MAX_DEADLINE_MS = 24 * 60 * 60 * 1000
 # A06: a DECLARED audio byte limit that REFUSES. The capture path bounds a live
 # stream by truncating it, which is right for a microphone and wrong for a
 # request: silently handing back a prefix of what the caller asked about is a
-# wrong answer wearing a success reply. Anything at or over this is refused.
+# wrong answer wearing a success reply.
+#
+# The ceiling is INCLUSIVE: exactly this many bytes is accepted, one more is
+# refused. An earlier comment here said "at or over this is refused", which
+# contradicted the `>` in the code; the tests check both endpoints.
 MAX_AUDIO_BYTES = 32 * 1024 * 1024
 
 # A07: large audio is never embedded in JSON. A JSON message may carry a short
