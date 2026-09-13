@@ -46,23 +46,33 @@ class Cancellation:
     `clock` is injectable so tests can drive expiry without sleeping.
     """
 
-    __slots__ = ("_event", "deadline", "_clock")
+    __slots__ = ("_event", "deadline", "_clock", "_set_at", "_mutex")
 
     def __init__(self, deadline: float | None = None, clock=time.monotonic) -> None:
         self._event = threading.Event()
         self.deadline = deadline
         self._clock = clock
+        # When the FIRST explicit stop arrived, on this token's own clock.
+        # reason() needs the order of stop and expiry, and a flag alone
+        # cannot say which came first.
+        self._set_at: float | None = None
+        self._mutex = threading.Lock()
 
     # -- threading.Event surface (unchanged meaning: EXPLICIT cancel only) ---
 
     def set(self) -> None:
-        self._event.set()
+        with self._mutex:
+            if self._set_at is None:
+                self._set_at = self._clock()
+            self._event.set()
 
     def is_set(self) -> bool:
         return self._event.is_set()
 
     def clear(self) -> None:
-        self._event.clear()
+        with self._mutex:
+            self._event.clear()
+            self._set_at = None
 
     def wait(self, timeout: float | None = None) -> bool:
         """Block for an explicit cancel.  Deliberately deadline-blind.
@@ -89,14 +99,25 @@ class Cancellation:
         return self._event.is_set() or self.expired()
 
     def reason(self) -> str | None:
-        """Why the turn must stop.  Explicit cancel outranks expiry.
+        """Why the turn must stop: whichever cause came FIRST.
 
-        Ordering matters: a turn that was stopped and then sat past its
-        deadline was stopped, and reporting a deadline would misattribute it.
+        A turn stopped before its deadline and then left to sit past it was
+        stopped, and reporting a deadline would misattribute it. A turn whose
+        budget ran out before anyone pressed stop had already failed its
+        caller, and reporting it cancelled would misattribute that. Both are
+        judged on this token's own clock. A stop at exactly the deadline is a
+        deadline, matching expired()'s `>=`.
+
+        This used to be a priority -- set meant "cancelled" however late the
+        stop came -- while this docstring justified it by order. A client
+        whose own timer sent stop-dictation as its budget ran out was handed a
+        transcript it had given up on.
         """
-        if self._event.is_set():
+        with self._mutex:
+            at = self._set_at if self._event.is_set() else None
+        if at is not None and (self.deadline is None or at < self.deadline):
             return "cancelled"
-        if self.expired():
+        if at is not None or self.expired():
             return "deadline"
         return None
 

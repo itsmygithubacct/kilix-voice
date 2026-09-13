@@ -413,12 +413,24 @@ class R4SurvivorCoverageTestCase(unittest.TestCase):
         # R4 N1. A turn that was stopped and then sat past its deadline was
         # STOPPED; reporting "deadline" misattributes it. The docstring
         # insisted on this ordering and nothing enforced it.
+        #
+        # CORRECTED (the order-versus-priority adjudication). As first written
+        # this let the budget expire FIRST and stopped SECOND, then demanded
+        # "cancelled" -- the opposite of the comment above -- so it pinned a
+        # priority, and with it a transcript delivered to a caller whose budget
+        # had already run out when its stop arrived. It now pins the order the
+        # comment describes: a cancel outranks an expiry that comes after it,
+        # and an expiry that came first stays the reason.
         clock = _Clock()
-        token = Cancellation(clock() + 0.001, clock)
+        stopped_first = Cancellation(clock() + 1.0, clock)
+        stopped_first.set()
+        clock.advance(5.0)
+        self.assertEqual(stopped_first.reason(), "cancelled")
+        expired_first = Cancellation(clock() + 0.001, clock)
         clock.advance(1.0)
-        self.assertEqual(token.reason(), "deadline")
-        token.set()
-        self.assertEqual(token.reason(), "cancelled")
+        self.assertEqual(expired_first.reason(), "deadline")
+        expired_first.set()
+        self.assertEqual(expired_first.reason(), "deadline")
 
     def test_recording_stops_when_the_daemon_is_shutting_down(self) -> None:
         # R4 N3. Deleting the _stopping check left every test green.
@@ -558,11 +570,16 @@ class R4SurvivorCoverageTestCase(unittest.TestCase):
             voiced.Daemon._record(d, turn, capture, engine)
         engine.feed.assert_not_called()
 
-    def test_a_stop_that_also_expired_still_delivers_its_transcript(self) -> None:
-        # R5A survived. reason() puts an explicit cancel above expiry, so a
-        # turn the user STOPPED must deliver what it heard rather than be
-        # refused as a deadline -- pressing stop is a request for the words so
-        # far, not an abandonment. Nothing pinned it.
+    def test_a_stop_pressed_after_the_budget_died_reports_the_deadline(self) -> None:
+        # CORRECTED, and renamed from
+        # test_a_stop_that_also_expired_still_delivers_its_transcript. It was
+        # written for R5A when reason() put an explicit cancel above expiry
+        # regardless of order, and it pinned exactly the late delivery that
+        # adjudication found: the budget dies on the read, the stop arrives
+        # after it, and a `final` went to a caller that had already given up.
+        # The first cause now wins, so this turn ended on its deadline. A stop
+        # pressed while the budget is live still delivers its words; that arm
+        # is pinned in tests/test_cancel_order.py.
         clock = _Clock()
         turn = voiced._DictationTurn("d-both", mock.Mock(),
                                      clock() + 10.0, clock)
@@ -595,9 +612,10 @@ class R4SurvivorCoverageTestCase(unittest.TestCase):
              mock.patch.object(voiced, "Vad",
                                lambda cfg: mock.Mock(feed=lambda f: "")), \
              mock.patch.object(voiced, "clean_for_injection", lambda t: t):
-            voiced.Daemon._dictate(d, turn)      # must NOT raise
-        self.assertEqual(turn.stop.reason(), "cancelled")
-        self.assertTrue(any("final" in m for m in sent), sent)
+            with self.assertRaises(DeadlineExceeded):
+                voiced.Daemon._dictate(d, turn)
+        self.assertEqual(turn.stop.reason(), "deadline")
+        self.assertFalse(any("final" in m for m in sent), sent)
 
     def test_an_unbounded_caller_still_gets_an_unbounded_fallback(self) -> None:
         seen = []                                                    # control

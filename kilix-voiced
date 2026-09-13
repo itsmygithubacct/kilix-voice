@@ -1208,7 +1208,11 @@ class Daemon:
             # turn. Without this the caller gets a `final` transcript, or the
             # misleading "no audio arrived from the microphone", for a request
             # it had already given up on.
-            if turn.stop.reason() == "deadline":
+            #
+            # The question here is "has the caller given up?", which is
+            # expired(), not reason(): a stop pressed in time does not make a
+            # budget that has since run out any less spent.
+            if turn.stop.expired():
                 raise DeadlineExceeded(
                     "the request deadline elapsed while recording")
             # The microphone closes the moment the turn ends, before anything
@@ -1238,6 +1242,14 @@ class Daemon:
             # dictation never presses Enter (DESIGN.md safety rule 2).
             # Same segment id as this turn's partials, marked stable: the
             # consumer replaces the running text rather than appending to it.
+            #
+            # The delivery boundary. Final decoding and the recorder shutting
+            # down can both outlast the budget after recording ended, and no
+            # `final` is delivered once it has.
+            if turn.stop.expired():
+                raise DeadlineExceeded(
+                    "the request deadline elapsed before the transcript was "
+                    "ready")
             self._send(turn.receiver, protocol.dictation_final(text, turn.id))
         finally:
             capture.stop()
