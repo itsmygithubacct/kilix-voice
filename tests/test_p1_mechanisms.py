@@ -1030,4 +1030,11 @@ class PayloadBindingTestCase(unittest.TestCase):
         for name in ("kilix-voiced", "kilix-stt"):
             with self.subTest(tool=name):
                 source = open(os.path.join(root, name)).read()
-                self.assertIn("payload_digest(model_id, engine)", source)
+                # F03: kilix-voiced now digests the RESOLVED directory, so the
+                # identity hashed is the artefact the recogniser opens rather
+                # than the catalogue's guess. kilix-stt still binds by
+                # model_id because it has no resolved turn to speak of.
+                self.assertTrue(
+                    "payload_digest(model_id, engine)" in source
+                    or "payload_digest_at(resolved.model_dir, engine)" in source,
+                    f"{name} does not bind the installed payload at all")

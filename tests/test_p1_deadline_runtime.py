@@ -7,6 +7,7 @@ no real audio, thread or timer is involved.
 """
 import importlib.util
 import os
+import threading
 import sys
 import unittest
 from unittest import mock
@@ -75,7 +76,10 @@ class DeadlineRuntimeTestCase(unittest.TestCase):
         daemon = object.__new__(voiced.Daemon)
         self.assertEqual(voiced.Daemon._synth(daemon, turn, "one"),
                          (b"\x00\x00", 24000))
-        engine.synth.assert_called_once_with("one")
+        # F01: the engine must RECEIVE the remaining budget, not just be
+        # called. Without it a 210 s Piper ceiling outlives a 5 s request and
+        # no deadline poll can run while communicate() blocks.
+        engine.synth.assert_called_once_with("one", budget=5.0)
 
     def test_expiry_stops_delivery_not_only_generation(self) -> None:
         # A clip synthesised just before the budget ran out must not be played.
@@ -196,10 +200,28 @@ class CaptureConsentGateTestCase(unittest.TestCase):
 
     def test_the_gate_is_reached_from_dictate(self) -> None:
         # The point of the finding: the helper existed and nothing called it.
-        source = open(os.path.join(ROOT, "kilix-voiced")).read()
-        body = source[source.index("def _dictate(self"):]
-        self.assertIn("self._require_capture_consent()",
-                      body[:body.index("def _require_capture_consent")])
+        # Asserted BEHAVIOURALLY. The previous version grepped for the exact
+        # string "self._require_capture_consent()", so adding the resolved
+        # identity argument broke a test of correct code -- and, worse, it
+        # would have passed against a call that was present but unreachable.
+        started = []
+        daemon = object.__new__(voiced.Daemon)
+        daemon._cfg = {"stt": {"engine": "vosk"}}
+        refused = voiced.DaemonError("no recorded consent (test)")
+
+        def _refuse(resolved=None):
+            raise refused
+
+        daemon._require_capture_consent = _refuse
+        turn = voiced._DictationTurn("d-gate", mock.Mock())
+        with mock.patch.object(voiced.audio, "MicCapture",
+                               lambda cfg: started.append("mic")), \
+             mock.patch.object(voiced.stt_lib, "make_stt",
+                               lambda *a, **k: started.append("stt")):
+            with self.assertRaises(voiced.DaemonError):
+                voiced.Daemon._dictate(daemon, turn)
+        # Not merely called: called BEFORE anything opens the device.
+        self.assertEqual(started, [])
 
     def test_the_gate_is_ON_by_default(self) -> None:
         # Owner decision 2026-09-13: mandatory, not opt-in. An earlier revision
@@ -325,14 +347,36 @@ class R2DeadlineSurvivorTestCase(unittest.TestCase):
     def test_expiry_is_reported_by_the_worker_as_the_terminal_reason(self) -> None:
         # deadline_terminal_report: without this the run ends quietly, or a
         # player error stands in for a deadline the caller set.
-        source = open(os.path.join(ROOT, "kilix-voiced")).read()
-        block = source[source.index("def _run_speech"):]
-        block = block[:block.index("def _synth")]
-        self.assertIn("if turn.expired():", block)
-        self.assertIn("the request deadline elapsed", block)
-        # and it must take precedence over the player error, not follow it
-        self.assertLess(block.index("if turn.expired():"),
-                        block.index("elif player.error:"))
+        # Behavioural: the old version grepped for "if turn.expired():" and so
+        # tested a spelling rather than the report, and would have failed
+        # against correct code that phrased the check differently.
+        clock = _Clock()
+        engine = mock.Mock()
+        engine.voice, engine.model, engine.rate, engine.seed = "en-us", "m1", 170, 7
+        engine.effective_model = None
+        engine.synth.side_effect = lambda text, **kw: (b"\x00\x00", 24000)
+        turn = voiced._SpeechTurn("speak-r2", ["one"], engine,
+                                  clock() + 0.001, clock)
+        turn.receiver = None
+        clock.advance(1.0)                       # budget spent
+        reports = []
+        daemon = object.__new__(voiced.Daemon)
+        daemon._lock = threading.RLock()
+        daemon._speech = turn
+        daemon._warn = lambda *a, **k: None
+        daemon._touch = lambda: None
+        daemon._arbiter = mock.Mock()
+        daemon._report_speech_failure = lambda t, m: reports.append(m)
+        player = mock.Mock()
+        player.playing = False
+        # A player error is ALSO pending: the deadline must win, because the
+        # caller's budget is the reason the turn stopped.
+        player.error = "the sink went away"
+        daemon._get_player = lambda: player
+        voiced.Daemon._run_speech(daemon, turn)
+        self.assertEqual(len(reports), 1, reports)
+        self.assertIn("the request deadline elapsed", reports[0])
+        self.assertNotIn("the sink went away", reports[0])
 
 
 class R2ConsentDurabilityTestCase(unittest.TestCase):
@@ -658,15 +702,22 @@ class TruncatedTranscriptTestCase(unittest.TestCase):
         # correct order; it just is not what this test is about.
         turn = voiced._DictationTurn("d9", mock.Mock())
         capture = self._Capture(overruns)
+        # Pin the engine. Without this resolve_stt falls through to whatever
+        # is in the DEVELOPER'S real settings file -- which on this machine
+        # said vibevoice, so the test failed on the host's configuration
+        # rather than on the code. A test must not read the user's settings.
+        self._daemon_cfg = {"stt": {"engine": "vosk", "model_path": "/nonexistent"}}
         with mock.patch.dict(os.environ,
                              {"KILIX_VOICE_REQUIRE_CONSENT": "0"}), \
              mock.patch.object(voiced.audio, "MicCapture", lambda cfg: capture), \
              mock.patch.object(voiced.stt_lib, "make_stt",
-                               lambda cfg, rate: self._Engine()), \
+                               lambda cfg, rate, **kw: self._Engine()), \
              mock.patch.object(voiced, "Vad", lambda cfg: mock.Mock(
                  feed=lambda f: None)), \
              mock.patch.object(voiced, "clean_for_injection", lambda t: t):
-            return voiced.Daemon._dictate(self._daemon(), turn)
+            daemon = self._daemon()
+            daemon._cfg = self._daemon_cfg
+            return voiced.Daemon._dictate(daemon, turn)
 
     def test_a_turn_that_lost_frames_is_refused(self) -> None:
         with self.assertRaises(voiced.DaemonError) as caught:
@@ -787,7 +838,10 @@ class MultiClipTurnTestCase(unittest.TestCase):
         engine = mock.Mock()
         engine.voice, engine.model, engine.rate, engine.seed = "en-us", "m1", 170, 7
         engine.effective_model = None
-        engine.synth.side_effect = lambda text: (b"\x00\x00", 24000)
+        # **kw, not a bare `text`: _synth now passes the remaining budget,
+        # and a positional-only fake raised TypeError that _run_speech's
+        # broad handler swallowed -- the turn looked like it stopped early.
+        engine.synth.side_effect = lambda text, **kw: (b"\x00\x00", 24000)
         turn = voiced._SpeechTurn("speak-m", list(chunks), engine)
         turn.receiver = None
         daemon = object.__new__(voiced.Daemon)
