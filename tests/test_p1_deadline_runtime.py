@@ -98,3 +98,46 @@ class DeadlineRuntimeTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RuntimeAudioAndTranscriptTestCase(unittest.TestCase):
+    """Finding 5: the helpers must be reached from the RUNTIME, not only tests."""
+
+    def test_synth_refuses_an_absurd_clip_from_the_engine(self) -> None:
+        from voicelib import protocol
+        engine = mock.Mock()
+        oversized = b"\x00" * (protocol.MAX_AUDIO_BYTES + 2)
+        engine.synth.return_value = (oversized, 24000)
+        turn = voiced._SpeechTurn("speak-1", ["one"], engine)
+        daemon = object.__new__(voiced.Daemon)
+        with self.assertRaises(protocol.MessageTooLarge):
+            voiced.Daemon._synth(daemon, turn, "one")
+
+    def test_synth_passes_a_normal_clip_through(self) -> None:      # control
+        engine = mock.Mock()
+        engine.synth.return_value = (b"\x00\x00" * 100, 24000)
+        turn = voiced._SpeechTurn("speak-1", ["one"], engine)
+        daemon = object.__new__(voiced.Daemon)
+        self.assertEqual(voiced.Daemon._synth(daemon, turn, "one"),
+                         (b"\x00\x00" * 100, 24000))
+
+    def test_dictation_datagrams_carry_a_segment_id_from_the_runtime(self) -> None:
+        # Finding 5 is precisely that the helper existed and the runtime did
+        # not call it, so this asserts the CALL SITES. It is a source check and
+        # says so: driving the real path needs a microphone. A regex over the
+        # call was tried first and matched only as far as the inner
+        # clean_for_injection(text) paren -- exact call text is less clever and
+        # actually correct.
+        source = open(os.path.join(ROOT, "kilix-voiced")).read()
+        self.assertIn("clean_for_injection(text), turn.id)", source)
+        self.assertIn("protocol.dictation_final(text, turn.id)", source)
+        # and neither bare form survives anywhere
+        self.assertNotIn("protocol.dictation_final(text)", source)
+
+    def test_partial_and_final_of_one_turn_share_a_stable_pairing(self) -> None:
+        from voicelib import protocol
+        p = protocol.dictation_partial("the qu", "dictate-1")
+        f = protocol.dictation_final("the quick", "dictate-1")
+        self.assertEqual(p["segment"], f["segment"])
+        self.assertIs(p["stable"], False)
+        self.assertIs(f["stable"], True)

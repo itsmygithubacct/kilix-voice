@@ -709,7 +709,12 @@ class Daemon:
         """Synthesise one clip, unless cancelled or out of budget."""
         if turn.cancel.is_set() or turn.expired():
             return None
-        return turn.engine.synth(chunk)
+        pcm, rate = turn.engine.synth(chunk)
+        # A06 reaches real output here, not only the helper's unit tests. An
+        # engine that returns an absurd clip is refused rather than queued:
+        # playing a truncated prefix would be a wrong answer wearing a success.
+        protocol.check_audio_bytes(len(pcm))
+        return pcm, rate
 
     def _play_if_current(self, turn: _SpeechTurn, player: audio.Player,
                          pcm: bytes, rate: int) -> bool:
@@ -838,7 +843,9 @@ class Daemon:
                     "listed by `pactl list sources short`.")
             # No trailing newline is added here or anywhere downstream:
             # dictation never presses Enter (DESIGN.md safety rule 2).
-            self._send(turn.receiver, protocol.dictation_final(text))
+            # Same segment id as this turn's partials, marked stable: the
+            # consumer replaces the running text rather than appending to it.
+            self._send(turn.receiver, protocol.dictation_final(text, turn.id))
         finally:
             capture.stop()
             engine.close()
@@ -884,7 +891,7 @@ class Daemon:
             text = engine.feed(frame)
             if partials and text is not None:
                 if not self._send(turn.receiver, protocol.dictation_partial(
-                        clean_for_injection(text))):
+                        clean_for_injection(text), turn.id)):
                     break
             if event == events.VAD_SPEECH_START:
                 speaking = True
