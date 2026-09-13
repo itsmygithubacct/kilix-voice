@@ -22,7 +22,9 @@ import json
 import os
 import re
 
-from . import models, paths, protocol, settings
+from typing import NamedTuple
+
+from . import consent, models, paths, protocol, settings
 from .util import cfg_get
 
 DEFAULT_RATE = 16000
@@ -508,6 +510,30 @@ def resolve_stt(cfg: dict | None = None) -> ResolvedStt:
     return ResolvedStt(
         engine=engine, model_id=model_id, model_dir=model_dir,
         settings_path=settings_path, lib_path=cfg_get(config, "stt.lib_path"))
+
+
+class ConsentIdentity(NamedTuple):
+    """What a dictation consent is bound to, for one resolved recogniser."""
+
+    digest: str
+    payload_digest: str
+    model_id: str
+    engine: str
+    model_dir: str | None
+
+
+def consent_identity(resolved: ResolvedStt) -> ConsentIdentity:
+    """Return the consent identity of ``resolved`` -- for grant and gate alike.
+
+    R6 finding 7: the daemon's gate hashed the directory the recogniser opens,
+    and kilix-stt --grant-consent hashed the catalogue directory, so under a
+    model override no grant could ever satisfy the gate. There is now one
+    function, and both call it with a configuration resolved the same way.
+    """
+    payload = consent.payload_digest_at(resolved.model_dir, resolved.engine)
+    return ConsentIdentity(
+        consent.capture_digest(resolved.model_id, resolved.engine, payload),
+        payload, resolved.model_id, resolved.engine, resolved.model_dir)
 
 
 def make_stt(cfg: dict | None = None, rate: int | None = None, *,

@@ -73,19 +73,16 @@ for _package_root in (_INSTALLED_LIB, _HERE):
 
 from voicelib import (
     consent,  # noqa: E402  (the import follows the path bootstrap)
-    __version__, audio, events, models, paths, protocol, settings, stt as stt_lib,
-    tts as tts_lib, util)
+    __version__, audio, daemon_config, events, models, paths, protocol,
+    settings, stt as stt_lib, tts as tts_lib, util)
 from voicelib.arbiter import Arbiter, ArbiterError  # noqa: E402
 from voicelib.cancel import (  # noqa: E402
     Cancellation, Cancelled, CancellationError, DeadlineExceeded)
 from voicelib.vad import Vad  # noqa: E402
 
-ENV_CONFIG = "KILIX_VOICE_CONFIG"
-
-# Nothing in flight for this long and the daemon exits: it is started on demand
-# by the terminal, and a voice session nobody is using should not keep a
-# process — or an audio device — reserved.
-IDLE_SECONDS = 300.0
+# Both live with the config builder kilix-stt shares (see _refresh_config).
+ENV_CONFIG = daemon_config.ENV_CONFIG
+IDLE_SECONDS = daemon_config.IDLE_SECONDS
 
 LISTEN_BACKLOG = 8
 ACCEPT_POLL_S = 1.0          # also the resolution of the idle timer
@@ -253,39 +250,6 @@ class _DictationTurn:
         return self.stop.expired()
 
 
-def _load_overrides(path: str) -> dict:
-    """Return the JSON config layered over the shared settings."""
-    try:
-        with open(path, encoding="utf-8") as handle:
-            raw = handle.read()
-    except OSError as error:
-        raise DaemonError(
-            f"cannot read the daemon config {path}: {error}. Point --config "
-            f"(or {ENV_CONFIG}) at a readable JSON file, or drop it to use the "
-            "shared Kilix settings alone.") from error
-    try:
-        data = json.loads(raw)
-    except ValueError as error:
-        raise DaemonError(
-            f"{path} is not valid JSON: {error}. It must hold a single "
-            'object, for example {"audio": {"play_cmd": ["cat"]}}.') from error
-    if not isinstance(data, dict):
-        raise DaemonError(
-            f"{path} must contain a JSON object, got {type(data).__name__}. "
-            'Wrap the settings, for example {"daemon": {"idle_seconds": 30}}.')
-    return data
-
-
-def _merge(base: dict, extra: dict) -> dict:
-    """Return ``base`` with ``extra`` merged into it, dict by dict."""
-    for key, value in extra.items():
-        if isinstance(value, dict) and isinstance(base.get(key), dict):
-            _merge(base[key], value)
-        else:
-            base[key] = value
-    return base
-
-
 def _connect_dictation(path: str) -> socket.socket:
     """Connect to the dictation socket the kitty fork created for a pane."""
     try:
@@ -323,7 +287,12 @@ class Daemon:
     def __init__(self, *, config_path: str | None = None,
                  idle_seconds: float | None = None,
                  verbose: bool = False) -> None:
-        self._overrides = _load_overrides(config_path) if config_path else {}
+        try:
+            self._overrides = (daemon_config.load_overrides(config_path)
+                               if config_path else {})
+        except daemon_config.ConfigError as error:
+            # Still a DaemonError to main() and to every existing caller.
+            raise DaemonError(str(error)) from error
         self._verbose = verbose
         # One config object for the whole process, refreshed in place before
         # each turn: a Player built at the first speak request then reads the
@@ -388,23 +357,10 @@ class Daemon:
 
     def _refresh_config(self) -> None:
         """Re-read the shared settings into the live config object."""
-        fresh: dict = {
-            "audio": {
-                "rate": audio.DEFAULT_RATE,
-                "frame_ms": audio.DEFAULT_FRAME_MS,
-                "device_in": settings.device_in(),
-                "device_out": settings.device_out(),
-            },
-            "vad": {"silence_ms": settings.stt_silence_ms()},
-            "stt": {
-                "engine": settings.stt_engine(),
-                "model": settings.stt_model(),
-                "max_seconds": settings.stt_max_seconds(),
-            },
-            "tts": {},
-            "daemon": {"idle_seconds": IDLE_SECONDS},
-        }
-        _merge(fresh, self._overrides)
+        # Built by daemon_config, which kilix-stt --grant-consent uses too:
+        # the model directory consent is granted for must be the directory
+        # this daemon's gate hashes, under every override (R6 finding 7).
+        fresh = daemon_config.effective_config(self._overrides)
         # Replaced in place rather than rebound: the engines hold a reference
         # to this dict and read it per clip.
         self._cfg.clear()
@@ -1291,16 +1247,14 @@ class Daemon:
         # be the identity opened. The caller now resolves once and passes it.
         if resolved is None:
             resolved = stt_lib.resolve_stt(self._cfg)
-        model_id = resolved.model_id
-        engine = resolved.engine
         # The installed bytes, not just the model NAME: S03 is about the same
         # name over different bytes -- and the bytes in the directory the
         # recogniser will actually open, not the catalogue's guess at it.
+        # stt_lib.consent_identity is the one function kilix-stt's grant also
+        # uses, so grant and gate cannot hash different directories.
         try:
-            digest = consent.capture_digest(
-                model_id, engine,
-                consent.payload_digest_at(resolved.model_dir, engine))
-            allowed = consent.granted("dictation", digest)
+            identity = stt_lib.consent_identity(resolved)
+            allowed = consent.granted("dictation", identity.digest)
         except consent.ConsentError as error:
             # R6 finding 6: R4 finding 3 was closed for ONE refusal this gate
             # makes, the absent grant. A record that cannot be read or does not
@@ -1318,9 +1272,12 @@ class Daemon:
             # does ask.
             raise ConsentDenied(
                 "dictation has no recorded consent for this configuration "
-                f"(model {model_id!r}, engine {engine!r}). The microphone was "
-                "not opened. Grant it once with `kilix stt --grant-consent`; a "
-                "change of model or of the installed payload asks again.")
+                f"(model {identity.model_id!r}, engine {identity.engine!r}, "
+                f"directory {identity.model_dir!r}). The microphone was not "
+                "opened. Grant it once with `kilix-stt --grant-consent`, run "
+                f"with the same {stt_lib.ENV_MODEL} and {ENV_CONFIG} as the "
+                "daemon; a change of model or of the installed payload asks "
+                "again.")
 
     def _record(self, turn: _DictationTurn, capture: audio.MicCapture,
                 engine: SttEngine) -> bool:

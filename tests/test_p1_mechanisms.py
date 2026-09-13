@@ -1026,15 +1026,48 @@ class PayloadBindingTestCase(unittest.TestCase):
         self.assertEqual(a, b)
 
     def test_production_callers_supply_the_payload_digest(self) -> None:
+        # CORRECTED (R6 finding 7). This grepped both tools for the exact call
+        # text "payload_digest(model_id, engine)" or "payload_digest_at(
+        # resolved.model_dir, engine)". That pinned an implementation -- the
+        # very two divergent computations finding 7 was about -- and it would
+        # have passed against a call whose result was never used. Both tools
+        # now take the identity from stt.consent_identity, so the property is
+        # asserted as an effect: the real grant records the installed
+        # payload's digest, the real gate accepts those bytes, and the same
+        # model over different bytes is refused.
+        import argparse
+        import importlib.machinery
+        import importlib.util
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        for name in ("kilix-voiced", "kilix-stt"):
-            with self.subTest(tool=name):
-                source = open(os.path.join(root, name)).read()
-                # F03: kilix-voiced now digests the RESOLVED directory, so the
-                # identity hashed is the artefact the recogniser opens rather
-                # than the catalogue's guess. kilix-stt still binds by
-                # model_id because it has no resolved turn to speak of.
-                self.assertTrue(
-                    "payload_digest(model_id, engine)" in source
-                    or "payload_digest_at(resolved.model_dir, engine)" in source,
-                    f"{name} does not bind the installed payload at all")
+
+        def load(name, filename):
+            spec = importlib.util.spec_from_loader(
+                name, importlib.machinery.SourceFileLoader(
+                    name, os.path.join(root, filename)))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+
+        stt_tool = load("kilix_stt_payload_binding", "kilix-stt")
+        voiced = load("kilix_voiced_payload_binding", "kilix-voiced")
+        settings_file = os.path.join(self.home, "settings")
+        with open(settings_file, "w") as handle:
+            handle.write("KILIX_VOICE_STT_ENGINE=vosk\n"
+                         "KILIX_VOICE_STT_MODEL=small-en-us\n")
+        self._install(body=b"one")
+        with mock.patch.dict(os.environ, {
+                "GPU_TERMINAL_SETTINGS_FILE": settings_file,
+                "KILIX_VOICE_REQUIRE_CONSENT": "1"}):
+            stt_tool._consent_command(
+                argparse.Namespace(revoke_consent=False, config=None))
+            with open(consent.consent_path()) as handle:
+                entry = json.load(handle)["grants"]["dictation"]
+            self.assertEqual(entry["model_revision"],
+                             consent.payload_digest("small-en-us", "vosk"))
+            self.assertRegex(entry["model_revision"], r"^[0-9a-f]{64}$")
+            d = object.__new__(voiced.Daemon)
+            d._cfg = {"stt": {"engine": "vosk", "model": "small-en-us"}}
+            voiced.Daemon._require_capture_consent(d)        # these bytes
+            self._install(body=b"two")                        # other bytes
+            with self.assertRaises(voiced.ConsentDenied):
+                voiced.Daemon._require_capture_consent(d)
