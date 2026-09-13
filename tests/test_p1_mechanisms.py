@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from voicelib import consent, models, protocol
+from voicelib import consent, models, protocol, resources
 
 
 class FrameLimitTestCase(unittest.TestCase):
@@ -451,3 +451,106 @@ class SynthesisChunkTestCase(unittest.TestCase):
 
     def test_a_final_chunk_is_marked(self) -> None:             # A15
         self.assertIs(self._chunk(sequence=9, final=True)["final"], True)
+
+
+class ResourceProfileTestCase(unittest.TestCase):
+    """C06/C12/C18 -- a device class and a MEASURED resource profile."""
+
+    def _p(self, **over):
+        profile = {
+            "schema": resources.RESOURCE_SCHEMA,
+            "device_class": resources.DEVICE_CUDA,
+            "measured": {"host": "pleon", "date": "2026-09-13",
+                         "peak_vram_mib": 3629, "peak_ram_mib": 2048},
+        }
+        profile.update(over)
+        return profile
+
+    def test_a_conforming_profile_validates(self) -> None:
+        self.assertEqual(resources.validate(self._p())["device_class"], "cuda")
+
+    def test_a_figure_without_a_host_or_date_is_refused(self) -> None:
+        for drop in ("host", "date"):
+            with self.subTest(drop=drop):
+                bad = self._p()
+                del bad["measured"][drop]
+                with self.assertRaises(resources.ResourceError):
+                    resources.validate(bad)
+
+    def test_an_empty_measurement_is_refused(self) -> None:
+        # An empty profile would certify a model as measured when it is not.
+        with self.assertRaises(resources.ResourceError) as caught:
+            resources.validate(self._p(measured={"host": "pleon", "date": "2026-09-13"}))
+        self.assertIn("carries no figure at all", str(caught.exception))
+
+    def test_an_accelerator_must_report_vram(self) -> None:
+        bad = self._p()
+        del bad["measured"]["peak_vram_mib"]
+        with self.assertRaises(resources.ResourceError) as caught:
+            resources.validate(bad)
+        self.assertIn("must report peak_vram_mib", str(caught.exception))
+
+    def test_a_cpu_profile_reporting_vram_is_a_measurement_error(self) -> None:
+        with self.assertRaises(resources.ResourceError) as caught:
+            resources.validate(self._p(device_class=resources.DEVICE_CPU))
+        self.assertIn("measurement error", str(caught.exception))
+
+    def test_unknown_device_classes_are_refused(self) -> None:
+        for bad in ("gpu", "CUDA", "", None, 1):
+            with self.subTest(device=bad):
+                with self.assertRaises(resources.ResourceError):
+                    resources.validate(self._p(device_class=bad))
+
+    def test_absent_headroom_is_unknown_not_infinite(self) -> None:
+        profile = self._p()
+        self.assertFalse(resources.fits(profile))                       # nothing known
+        self.assertFalse(resources.fits(profile, available_vram_mib=8192))  # ram unknown
+        self.assertTrue(resources.fits(profile, available_vram_mib=8192,
+                                       available_ram_mib=46000))
+        self.assertFalse(resources.fits(profile, available_vram_mib=2048,
+                                        available_ram_mib=46000))
+
+    def test_pleon_measurements_fit_its_measured_headroom(self) -> None:
+        # The figures actually measured on pleon under the H2 fixture.
+        self.assertTrue(resources.fits(self._p(), available_vram_mib=8192,
+                                       available_ram_mib=46000))
+
+
+class LegacyCatalogEntryTestCase(unittest.TestCase):
+    """V01/C01 -- a legacy entry stays valid though optional fields now exist."""
+
+    def test_a_five_field_spec_still_constructs(self) -> None:
+        # This, not an exact _fields tuple, is what "remains valid without new
+        # optional fields" means. Asserting the tuple length would forbid C06
+        # and C12 from ever being added, which is not what C01 asks.
+        spec = models.ModelSpec("legacy-id", models.ENGINE_VOSK, 1, True, "s")
+        self.assertEqual(spec.catalog_id, "legacy-id")
+        self.assertEqual(spec.device_class, resources.DEVICE_CPU)
+        self.assertIsNone(spec.resource_profile)
+
+    def test_the_shipped_legacy_entries_are_untouched(self) -> None:
+        for legacy in ("small-en-us", "lgraph-en-us"):
+            with self.subTest(legacy=legacy):
+                spec = models.MODEL_BY_ID[legacy]
+                self.assertEqual(spec.engine, models.ENGINE_VOSK)
+                self.assertEqual(spec.device_class, resources.DEVICE_CPU)
+                self.assertIsNone(spec.resource_profile)
+
+    def test_a_catalog_record_may_carry_a_profile(self) -> None:
+        doc = {"schema": models.CATALOG_SCHEMA, "default_model": "m",
+               "models": [{"id": "m", "engine": "vosk",
+                           "device_class": "cuda",
+                           "resource_profile": {
+                               "schema": resources.RESOURCE_SCHEMA,
+                               "device_class": "cuda",
+                               "measured": {"host": "pleon", "date": "2026-09-13",
+                                            "peak_vram_mib": 3629}}}]}
+        self.assertEqual(models.read_catalog(doc)["models"][0]["device_class"], "cuda")
+
+    def test_a_malformed_profile_is_refused_at_the_catalog_boundary(self) -> None:
+        doc = {"schema": models.CATALOG_SCHEMA,
+               "models": [{"id": "m", "engine": "vosk",
+                           "resource_profile": {"schema": "wrong/v1"}}]}
+        with self.assertRaises(models.CatalogError) as caught:
+            models.read_catalog(doc)
+        self.assertIn("resource_profile is invalid", str(caught.exception))

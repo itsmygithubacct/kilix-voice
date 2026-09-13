@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
+from . import resources
+
 
 CATALOG_SCHEMA = "kilix.speech.models/v1"
 
@@ -27,13 +29,22 @@ PIPER_KRISTIN_MODEL = "piper-en-us-kristin-medium"
 
 
 class ModelSpec(NamedTuple):
-    """One immutable entry in the local speech-model catalog."""
+    """One immutable entry in the local speech-model catalog.
+
+    C06 adds a device class and C12 a measured resource profile. Both are
+    OPTIONAL with defaults, which is precisely what C01/V01 require: a legacy
+    entry written before these existed stays constructible and valid. Adding
+    them as required fields would have invalidated every legacy entry, which is
+    the outcome V01 exists to prevent.
+    """
 
     catalog_id: str
     engine: str
     size: int
     runtime_supported: bool
     summary: str
+    device_class: str = resources.DEVICE_CPU
+    resource_profile: dict | None = None
 
 
 class TtsModelSpec(NamedTuple):
@@ -168,7 +179,7 @@ _RECORD_REQUIRED = ("id", "engine")
 _RECORD_TYPES = {
     "id": str, "engine": str, "download_bytes": int, "download_size": str,
     "installed": bool, "runtime_supported": bool, "selected": bool,
-    "path": str, "summary": str,
+    "path": str, "summary": str, "device_class": str,
 }
 
 
@@ -215,6 +226,21 @@ def read_catalog(document: object) -> dict:
                 raise CatalogError(
                     f"model record {index} field {key!r} must be "
                     f"{want.__name__}, got {type(record[key]).__name__}.")
+        if "device_class" in record and record["device_class"] not in resources.DEVICE_CLASSES:
+            raise CatalogError(
+                f"model record {index} device_class must be one of: "
+                f"{', '.join(resources.DEVICE_CLASSES)}, got "
+                f"{record['device_class']!r}.")
+        if "resource_profile" in record:
+            # C18: conformance is checked here, at the boundary, so a
+            # malformed profile cannot reach a consumer that would size
+            # hardware from it.
+            try:
+                resources.validate(record["resource_profile"])
+            except resources.ResourceError as error:
+                raise CatalogError(
+                    f"model record {index} resource_profile is invalid: "
+                    f"{error}") from error
         catalog_id = record["id"]
         if catalog_id in seen:
             raise CatalogError(
