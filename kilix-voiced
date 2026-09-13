@@ -131,12 +131,22 @@ class _SpeechTurn:
     """One read-aloud turn: its clips, its thread, and its cancel flag."""
 
     def __init__(self, turn_id: str, chunks: list[str],
-                 engine: TtsEngine) -> None:
+                 engine: TtsEngine, deadline: float | None = None,
+                 clock=time.monotonic) -> None:
         self.id = turn_id
         self.chunks = chunks
         self.engine = engine
         self.cancel = threading.Event()
         self.thread: threading.Thread | None = None
+        # Absolute MONOTONIC instant, not a duration: a duration would have to
+        # be re-based at every check and a wall-clock instant would move under
+        # an NTP step. None means the caller set no bound.
+        self.deadline = deadline
+        self._clock = clock
+
+    def expired(self) -> bool:
+        """True once the caller's budget has run out."""
+        return self.deadline is not None and self._clock() >= self.deadline
 
 
 class _DictationTurn:
@@ -601,7 +611,18 @@ class Daemon:
             return protocol.reply_ok(
                 request["id"], chunks=0, model=engine.model,
                 voice=engine.voice, rate=engine.rate)
-        turn = _SpeechTurn(self._next_turn_id("speak"), chunks, engine)
+        deadline_ms = request.get("deadline_ms")
+        deadline = (time.monotonic() + deadline_ms / 1000.0
+                    if deadline_ms is not None else None)
+        turn = _SpeechTurn(self._next_turn_id("speak"), chunks, engine, deadline)
+        if turn.expired():
+            # Refuse before any work starts. A budget that has already run out
+            # by the time we get here must not produce audio nobody is waiting
+            # for -- P08 is about not starting, not only about stopping.
+            return protocol.reply_error(
+                f"the request deadline of {deadline_ms} ms elapsed before "
+                "synthesis could start; nothing was spoken.",
+                protocol.ERR_DEADLINE)
         turn.thread = threading.Thread(
             target=self._run_speech, args=(turn,),
             name=f"kilix-voice-{turn.id}", daemon=True)
@@ -665,7 +686,10 @@ class Daemon:
                     index += 1
                 if not self._await_clip(turn, player):
                     break
-            if player.error:
+            if turn.expired():
+                self._report_speech_failure(
+                    turn, "read-aloud stopped: the request deadline elapsed.")
+            elif player.error:
                 self._report_speech_failure(turn, player.error)
         except tts_lib.TtsError as error:
             self._report_speech_failure(
@@ -682,8 +706,8 @@ class Daemon:
 
     def _synth(self, turn: _SpeechTurn,
                chunk: str) -> tuple[bytes, int] | None:
-        """Synthesise one clip, unless the turn was cancelled meanwhile."""
-        if turn.cancel.is_set():
+        """Synthesise one clip, unless cancelled or out of budget."""
+        if turn.cancel.is_set() or turn.expired():
             return None
         return turn.engine.synth(chunk)
 
@@ -692,6 +716,10 @@ class Daemon:
         """Queue a clip unless this turn was cancelled or already replaced."""
         with self._lock:
             if turn.cancel.is_set() or self._speech is not turn:
+                return False
+            if turn.expired():
+                # Stop DELIVERY too, not just generation: a clip synthesised
+                # just before the budget ran out must not still be played.
                 return False
             player.play(pcm, rate)
             return True
