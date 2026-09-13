@@ -1296,10 +1296,22 @@ class Daemon:
         # The installed bytes, not just the model NAME: S03 is about the same
         # name over different bytes -- and the bytes in the directory the
         # recogniser will actually open, not the catalogue's guess at it.
-        digest = consent.capture_digest(
-            model_id, engine,
-            consent.payload_digest_at(resolved.model_dir, engine))
-        if not consent.granted("dictation", digest):
+        try:
+            digest = consent.capture_digest(
+                model_id, engine,
+                consent.payload_digest_at(resolved.model_dir, engine))
+            allowed = consent.granted("dictation", digest)
+        except consent.ConsentError as error:
+            # R6 finding 6: R4 finding 3 was closed for ONE refusal this gate
+            # makes, the absent grant. A record that cannot be read or does not
+            # verify raises ConsentError, a ValueError, which the worker's
+            # broad arm coded `unavailable` -- the "no microphone" code R4
+            # finding 3 was about. Every refusal the gate produces is a consent
+            # refusal, and the record's own remedy text is kept.
+            raise ConsentDenied(
+                f"dictation consent could not be verified: {error} The "
+                "microphone was not opened.") from error
+        if not allowed:
             # No silent auto-grant. A grant recorded without the user being
             # asked is not consent, whatever the file says afterwards. The
             # daemon has no terminal, so it refuses and names the command that
