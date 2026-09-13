@@ -17,6 +17,7 @@ opened when a :class:`VoskStt` is constructed, not before.
 from __future__ import annotations
 
 import ctypes
+import dataclasses
 import json
 import os
 import re
@@ -193,6 +194,32 @@ def _load_library(path: str) -> ctypes.CDLL:
         # that dereferences it crashes somewhere else entirely.
         function.restype = restype
     return lib
+
+
+def _intended_model_dir(model_id: str | None = None,
+                        model_path: str | None = None,
+                        settings_path: str | None = None) -> str | None:
+    """Where the recogniser WOULD look, with no check that it is there.
+
+    Split out of ``_resolve_model`` for F03.  Consent needs the identity a turn
+    is about to use, and it needs it even when the artefact is missing -- the
+    named refusal for "not installed" belongs to model loading, and the named
+    refusal for "not consented" belongs to the consent gate.  Folding the
+    existence check into resolution let a missing directory pre-empt the
+    consent gate, which changes WHICH check refuses.  The microphone stays shut
+    either way, but a refusal should say the true reason.
+
+    Returns None when even the catalogue lookup fails; construction then raises
+    with the specific message it already had.
+    """
+    candidate = model_path or os.environ.get(ENV_MODEL)
+    if not candidate:
+        catalog_id = model_id or settings.stt_model(settings_path)
+        try:
+            candidate = paths.model_dir(catalog_id)
+        except paths.PathError:
+            return None
+    return os.path.abspath(os.path.expanduser(str(candidate)))
 
 
 def _resolve_model(model_id: str | None = None, model_path: str | None = None,
@@ -425,14 +452,32 @@ class VoskStt:
         return _clean_text(text) if isinstance(text, str) else ""
 
 
-def make_stt(cfg: dict | None = None, rate: int | None = None) -> NullStt | VoskStt:
-    """Return the recogniser the shared settings select.
+@dataclasses.dataclass(frozen=True)
+class ResolvedStt:
+    """The recogniser identity a turn is committed to, resolved exactly once.
 
-    ``cfg`` may override the settings file for a caller that already knows what
-    it wants — ``stt.engine``, ``stt.model``, ``stt.model_path``,
-    ``stt.lib_path``, ``audio.rate`` and ``settings_path`` are read.  ``off``
-    and any value this release does not implement give a :class:`NullStt`, so a
-    missing engine disables dictation instead of blocking a launch.
+    R3 F03: ``_require_capture_consent`` resolved the model and engine its own
+    way while ``make_stt`` resolved them another, so nothing established that
+    the identity the user consented to was the identity that opened the
+    microphone.  A turn now resolves this ONCE and hands the same frozen object
+    to both.  ``model_dir`` is the directory that will actually be opened --
+    after ``stt.model_path`` and the environment override, not the catalogue
+    guess -- so the consent digest binds the artefact the recogniser loads.
+    """
+
+    engine: str
+    model_id: str
+    model_dir: str | None
+    settings_path: str | None
+    lib_path: str | None
+
+
+def resolve_stt(cfg: dict | None = None) -> ResolvedStt:
+    """Resolve the effective recogniser identity from ``cfg``.
+
+    This is the ONLY place that decides what dictation will run.  It reproduces
+    exactly what ``make_stt`` used to decide inline; ``make_stt`` now consumes
+    its result rather than deciding again.
     """
     config = cfg or {}
     settings_path = cfg_get(config, "settings_path")
@@ -447,14 +492,48 @@ def make_stt(cfg: dict | None = None, rate: int | None = None) -> NullStt | Vosk
             f"phase. Set it to {ENGINE_VOSK!r} for local recognition now, or "
             f"{ENGINE_OFF!r} to disable dictation; kilix-voice will not "
             "quietly run an engine other than the one you chose.")
-    if engine != ENGINE_VOSK:
+    model_id = str(cfg_get(config, "stt.model")
+                   or settings.stt_model(settings_path) or "")
+    model_dir = None
+    if engine == ENGINE_VOSK:
+        # The same lookup the recogniser will make, made once, here -- but
+        # WITHOUT the existence check, so that "not installed" is still
+        # reported by model loading rather than by consent resolution.
+        model_dir = _intended_model_dir(
+            model_id=cfg_get(config, "stt.model"),
+            model_path=cfg_get(config, "stt.model_path"),
+            settings_path=settings_path)
+    return ResolvedStt(
+        engine=engine, model_id=model_id, model_dir=model_dir,
+        settings_path=settings_path, lib_path=cfg_get(config, "stt.lib_path"))
+
+
+def make_stt(cfg: dict | None = None, rate: int | None = None, *,
+             resolved: ResolvedStt | None = None) -> NullStt | VoskStt:
+    """Return the recogniser the shared settings select.
+
+    ``cfg`` may override the settings file for a caller that already knows what
+    it wants — ``stt.engine``, ``stt.model``, ``stt.model_path``,
+    ``stt.lib_path``, ``audio.rate`` and ``settings_path`` are read.  ``off``
+    and any value this release does not implement give a :class:`NullStt`, so a
+    missing engine disables dictation instead of blocking a launch.
+    """
+    config = cfg or {}
+    # A caller that already resolved the identity (and consented to it) passes
+    # it in, so construction cannot pick a different one. Resolving again here
+    # is what F03 was.
+    target = resolved if resolved is not None else resolve_stt(config)
+    if target.engine != ENGINE_VOSK:
         return NullStt()
     if rate is None:
         rate = int(cfg_get(config, "audio.rate", DEFAULT_RATE))
     return VoskStt(
         rate,
-        model_id=cfg_get(config, "stt.model"),
-        model_path=cfg_get(config, "stt.model_path"),
-        lib_path=cfg_get(config, "stt.lib_path"),
-        settings_path=settings_path,
+        # model_path, not model_id: the directory is already resolved, so the
+        # recogniser opens the exact artefact whose bytes consent hashed.
+        # A None here means even the catalogue lookup failed; VoskStt then
+        # re-runs the full resolution and raises its own specific message.
+        model_path=target.model_dir,
+        lib_path=target.lib_path,
+        settings_path=target.settings_path,
     )

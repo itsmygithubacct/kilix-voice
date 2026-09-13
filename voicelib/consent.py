@@ -253,13 +253,26 @@ def payload_digest(model_id: str, engine: str) -> str:
     so no cheaper key is admissible here. The cost is one sequential read of the
     payload at dictation start; correctness of a consent gate outranks it.
     """
-    from . import models, paths
-    required = models.REQUIRED_FILES.get(engine)
-    if not required:
-        return ""
+    from . import paths
     try:
         root = paths.model_dir(model_id)
     except Exception:
+        return ""
+    return payload_digest_at(root, engine)
+
+
+def payload_digest_at(root: str | None, engine: str) -> str:
+    """Digest the installed payload in a GIVEN directory, or "" when absent.
+
+    R3 F03: the catalogue lookup above is not necessarily the directory the
+    recogniser opens -- ``stt.model_path`` and the environment override both
+    win over it. Hashing the catalogue guess bound consent to bytes that need
+    not be the bytes loaded. A caller holding a resolved identity passes its
+    ``model_dir`` here instead, so the digest and the recogniser cannot differ.
+    """
+    from . import models
+    required = models.REQUIRED_FILES.get(engine)
+    if not required or not root:
         return ""
     parts = []
     for relative in required:

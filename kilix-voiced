@@ -73,6 +73,8 @@ from voicelib import (
     __version__, audio, events, models, paths, protocol, settings, stt as stt_lib,
     tts as tts_lib, util)
 from voicelib.arbiter import Arbiter, ArbiterError  # noqa: E402
+from voicelib.cancel import (  # noqa: E402
+    Cancellation, Cancelled, CancellationError, DeadlineExceeded)
 from voicelib.vad import Vad  # noqa: E402
 
 ENV_CONFIG = "KILIX_VOICE_CONFIG"
@@ -137,32 +139,55 @@ class _SpeechTurn:
         self.id = turn_id
         self.chunks = chunks
         self.engine = engine
-        self.cancel = threading.Event()
+        # ONE token carries both the stop flag and the budget. R3 F01 was two
+        # notions of "should I stop" that could disagree; there is now one.
+        self.cancel = Cancellation(deadline, clock)
         self.thread: threading.Thread | None = None
-        # Absolute MONOTONIC instant, not a duration: a duration would have to
-        # be re-based at every check and a wall-clock instant would move under
-        # an NTP step. None means the caller set no bound.
-        self.deadline = deadline
-        self._clock = clock
         # A12-A15: where streamed chunk descriptors go, and the sequence they
         # carry. None means the caller did not ask for the stream, which stays
         # the default so an ordinary speak is unchanged.
         self.receiver: socket.socket | None = None
         self.sequence = 0
 
+    @property
+    def deadline(self) -> float | None:
+        """The token's deadline. A property so no copy can go stale."""
+        return self.cancel.deadline
+
+    @deadline.setter
+    def deadline(self, value: float | None) -> None:
+        self.cancel.deadline = value
+
     def expired(self) -> bool:
         """True once the caller's budget has run out."""
-        return self.deadline is not None and self._clock() >= self.deadline
+        return self.cancel.expired()
 
 
 class _DictationTurn:
-    """One dictation turn: the socket it delivers to, and its stop flag."""
+    """One dictation turn: the socket it delivers to, and its stop token."""
 
-    def __init__(self, turn_id: str, receiver: socket.socket) -> None:
+    def __init__(self, turn_id: str, receiver: socket.socket,
+                 deadline: float | None = None,
+                 clock=time.monotonic) -> None:
         self.id = turn_id
         self.receiver = receiver
-        self.stop = threading.Event()
+        # F02: dictation accepted a caller deadline and then read it nowhere.
+        # It is the same token type speech uses, so the budget reaches
+        # preparation, recogniser construction and recording alike.
+        self.stop = Cancellation(deadline, clock)
         self.thread: threading.Thread | None = None
+
+    @property
+    def deadline(self) -> float | None:
+        return self.stop.deadline
+
+    @deadline.setter
+    def deadline(self, value: float | None) -> None:
+        self.stop.deadline = value
+
+    def expired(self) -> bool:
+        """True once the caller's budget has run out."""
+        return self.stop.expired()
 
 
 def _load_overrides(path: str) -> dict:
@@ -628,26 +653,44 @@ class Daemon:
         turn = _SpeechTurn(self._next_turn_id("speak"), chunks, engine, deadline)
         if request.get("chunk_sock"):
             turn.receiver = _connect_dictation(request["chunk_sock"])
-        if turn.expired():
-            # Refuse before any work starts. A budget that has already run out
-            # by the time we get here must not produce audio nobody is waiting
-            # for -- P08 is about not starting, not only about stopping.
-            return protocol.reply_error(
-                f"the request deadline of {deadline_ms} ms elapsed before "
-                "synthesis could start; nothing was spoken.",
-                protocol.ERR_DEADLINE)
-        turn.thread = threading.Thread(
-            target=self._run_speech, args=(turn,),
-            name=f"kilix-voice-{turn.id}", daemon=True)
-        with self._lock:
-            self._cancel_speech()          # a new read replaces the old one
-            self._speech_error = ""
-            self._arbiter.begin_speech(turn.id)
-            self._speech = turn
-            self._start(turn.thread, self._cancel_speech)
-        return protocol.reply_ok(
-            request["id"], turn=turn.id, chunks=len(chunks),
-            model=engine.model, voice=engine.voice, rate=engine.rate)
+        # F07: the chunk receiver is connected before the expiry check, the
+        # arbiter claim and the worker start, but only _run_speech ever closed
+        # it. Every path that fails before the worker owns the turn -- an
+        # expired budget, an arbiter refusal, a thread the OS will not start --
+        # left the descriptor to reference counting or, once the Thread and
+        # the turn referenced each other, to cyclic collection. Ownership now
+        # transfers exactly once, and until it does this frame owns it.
+        handed_off = False
+        try:
+            if turn.expired():
+                # Refuse before any work starts. A budget that has already run
+                # out by the time we get here must not produce audio nobody is
+                # waiting for -- P08 is about not starting, not only stopping.
+                return protocol.reply_error(
+                    f"the request deadline of {deadline_ms} ms elapsed before "
+                    "synthesis could start; nothing was spoken.",
+                    protocol.ERR_DEADLINE)
+            turn.thread = threading.Thread(
+                target=self._run_speech, args=(turn,),
+                name=f"kilix-voice-{turn.id}", daemon=True)
+            with self._lock:
+                self._cancel_speech()      # a new read replaces the old one
+                self._speech_error = ""
+                self._arbiter.begin_speech(turn.id)
+                self._speech = turn
+                self._start(turn.thread, self._cancel_speech)
+                # Set INSIDE the lock and only after _start returned: the
+                # worker is running and its `finally` is now guaranteed to run.
+                handed_off = True
+            return protocol.reply_ok(
+                request["id"], turn=turn.id, chunks=len(chunks),
+                model=engine.model, voice=engine.voice, rate=engine.rate)
+        finally:
+            if not handed_off and turn.receiver is not None:
+                try:
+                    turn.receiver.close()
+                finally:
+                    turn.receiver = None
 
     def _speech_chunks(self, text: str) -> list[str]:
         """Condition pane text and split it into clips worth synthesising."""
@@ -682,6 +725,7 @@ class Daemon:
 
     def _run_speech(self, turn: _SpeechTurn) -> None:
         """Synthesise and play one turn, one clip ahead of the speakers."""
+        player: audio.Player | None = None
         try:
             player = self._get_player()
             # The next clip is synthesised while the current one plays: enough
@@ -699,7 +743,7 @@ class Daemon:
                     index += 1
                 if not self._await_clip(turn, player):
                     break
-            if turn.expired():
+            if turn.cancel.reason() == "deadline":
                 self._report_speech_failure(
                     turn, "read-aloud stopped: the request deadline elapsed.")
             elif player.error:
@@ -712,8 +756,24 @@ class Daemon:
                 turn, f"read-aloud failed: {error!r}")
         finally:
             with self._lock:
-                if self._speech is turn:
+                mine = self._speech is turn
+                if mine:
                     self._speech = None
+            # F01: releasing ownership never stopped the audio. The Player is a
+            # separate worker draining its own queue, so an expired turn kept
+            # speaking after the daemon had reported it stopped -- the commit
+            # titled "stop playback on expiry" did not do so.
+            #
+            # The identity guard is the whole subtlety: `mine` was read under
+            # the lock, so a worker whose turn has already been REPLACED will
+            # not silence its successor's audio. Only a turn that still owned
+            # the player when it finished may stop it.
+            if mine and player is not None and turn.cancel.done():
+                try:
+                    player.stop()
+                except Exception as error:      # never mask the real failure
+                    self._warn(
+                        f"could not stop playback for turn {turn.id}: {error!r}")
             if turn.receiver is not None:
                 try:
                     turn.receiver.close()
@@ -725,9 +785,14 @@ class Daemon:
     def _synth(self, turn: _SpeechTurn,
                chunk: str) -> tuple[bytes, int] | None:
         """Synthesise one clip, unless cancelled or out of budget."""
-        if turn.cancel.is_set() or turn.expired():
+        if turn.cancel.done():
             return None
-        pcm, rate = turn.engine.synth(chunk)
+        # F01: the engine used its OWN timeout -- about 20 s plus text cost for
+        # eSpeak, 210 s for Piper -- no matter how little caller budget was
+        # left, and no deadline poll can run while that synchronous call is in
+        # progress. Hand it the remaining budget so a 210 s engine ceiling
+        # cannot outlive a 2 s request.
+        pcm, rate = turn.engine.synth(chunk, budget=turn.cancel.remaining())
         # A06 reaches real output here, not only the helper's unit tests. An
         # engine that returns an absurd clip is refused rather than queued:
         # playing a truncated prefix would be a wrong answer wearing a success.
@@ -792,18 +857,25 @@ class Daemon:
     def _await_clip(self, turn: _SpeechTurn, player: audio.Player) -> bool:
         """Wait out the queued clip; False when the turn was cancelled."""
         while player.playing:
-            if turn.cancel.wait(SPEECH_POLL_S):
+            # wait_done clips the wait to the remaining budget, so expiry wakes
+            # the caller AT the deadline instead of up to one poll interval
+            # past it -- the difference between honouring a deadline and
+            # rounding it. It also covers the case the old code needed a
+            # second explicit check for: cancel and expiry are one question.
+            if turn.cancel.wait_done(SPEECH_POLL_S):
                 return False
-            if turn.expired():
-                # Without this an expired turn drains its already-playing clip
-                # and returns success from the wait, so the budget bounds
-                # generation but not the audio the listener actually hears.
-                return False
-        return not turn.cancel.is_set() and not turn.expired()
+        return not turn.cancel.done()
 
     # -- dictate ------------------------------------------------------------
 
     def _op_dictate(self, request: dict) -> dict:
+        # F02: protocol.validate_request preserved deadline_ms for every
+        # operation and dictation read it nowhere, so a caller's budget was
+        # accepted and silently ignored. Taken FIRST, like speak's, so
+        # preparation is spent from the budget rather than before it starts.
+        deadline_ms = request.get("deadline_ms")
+        deadline = (time.monotonic() + deadline_ms / 1000.0
+                    if deadline_ms is not None else None)
         self._refresh_config()
         engine = str(util.cfg_get(self._cfg, "stt.engine", "")).strip().lower()
         if engine == stt_lib.ENGINE_OFF:
@@ -822,7 +894,15 @@ class Daemon:
         # datagram that can never arrive. Nothing has been claimed yet, so a
         # failure leaves read-aloud playing.
         receiver = _connect_dictation(request["sock"])
-        turn = _DictationTurn(self._next_turn_id("listen"), receiver)
+        turn = _DictationTurn(self._next_turn_id("listen"), receiver, deadline)
+        if turn.expired():
+            # Same rule speak already followed: a budget spent before the
+            # microphone opens must not open it.
+            receiver.close()
+            return protocol.reply_error(
+                f"the request deadline of {deadline_ms} ms elapsed before "
+                "recording could start; the microphone was not opened.",
+                protocol.ERR_DEADLINE)
         turn.thread = threading.Thread(
             target=self._run_dictation, args=(turn,),
             name=f"kilix-voice-{turn.id}", daemon=True)
@@ -873,15 +953,33 @@ class Daemon:
         """Record one turn, stream partials, and deliver the final text."""
         try:
             self._dictate(turn)
+        # F08: these arms exist because the broad one below flattened every
+        # distinguishable failure into `unavailable`. A caller could not tell a
+        # payload too large from a missing microphone, and the vocabulary
+        # already had the codes. Order matters: MessageTooLarge is a
+        # ProtocolError and therefore a ValueError, so it must be caught before
+        # the tuple that contains ValueError, or it never reaches here.
+        except protocol.MessageTooLarge as error:
+            self._send(turn.receiver, protocol.dictation_error(
+                str(error), protocol.ERR_TOO_LARGE))
+        except DeadlineExceeded as error:
+            self._send(turn.receiver, protocol.dictation_error(
+                f"dictation stopped: {error}.", protocol.ERR_DEADLINE))
+        except Cancelled as error:
+            self._send(turn.receiver, protocol.dictation_error(
+                f"dictation stopped: {error}.", protocol.ERR_CANCELLED))
         except (DaemonError, audio.AudioError, stt_lib.SttError,
                 paths.PathError, OSError, ValueError) as error:
             self._send(turn.receiver, protocol.dictation_error(
                 str(error), protocol.ERR_UNAVAILABLE))
         except Exception as error:  # a worker thread must not die silently
             self._warn(f"dictation failed: {error!r}")
+            # F08: this arm called dictation_error with NO code at all, so an
+            # unexpected worker failure was indistinguishable from a
+            # well-understood one at the protocol level.
             self._send(turn.receiver, protocol.dictation_error(
                 f"dictation failed unexpectedly: {error}. Try again; the "
-                "daemon's stderr has the details."))
+                "daemon's stderr has the details.", protocol.ERR_INTERNAL))
         finally:
             turn.receiver.close()
             self._clear_dictation(turn)
@@ -889,10 +987,25 @@ class Daemon:
 
     def _dictate(self, turn: _DictationTurn) -> None:
         """Run one whole turn: capture, recognise, deliver."""
-        self._require_capture_consent()
+        # F03: ONE resolved identity for this turn. The consent check and the
+        # recogniser are handed the same frozen object, so the configuration
+        # the user consented to is provably the configuration that opens the
+        # microphone. Previously each resolved its own and nothing compared
+        # them.
+        resolved = stt_lib.resolve_stt(self._cfg)
+        # F02: preparation used to run with no reference to the caller's
+        # budget or to stop-dictation at all, so a stop arriving during
+        # preparation did not prevent the microphone opening.
+        turn.stop.check()
+        self._require_capture_consent(resolved)
+        turn.stop.check()
         capture = audio.MicCapture(self._cfg)
-        engine = stt_lib.make_stt(self._cfg, capture.rate)
+        engine = stt_lib.make_stt(self._cfg, capture.rate, resolved=resolved)
         try:
+            # The last boundary before the device is opened. Everything above
+            # can take real time -- a payload hash and a model load -- and a
+            # stop or an expiry during it must still mean the mic stays shut.
+            turn.stop.check()
             capture.start()
             engine.start_utterance()
             heard = self._record(turn, capture, engine)
@@ -928,7 +1041,8 @@ class Daemon:
             capture.stop()
             engine.close()
 
-    def _require_capture_consent(self) -> None:
+    def _require_capture_consent(
+            self, resolved: stt_lib.ResolvedStt | None = None) -> None:
         """Refuse to open the microphone without a matching consent record.
 
         S02/S03 reach production here. The digest binds the model and engine
@@ -945,16 +1059,21 @@ class Daemon:
         # deliberate deployment choice rather than the absence of one.
         if os.environ.get("KILIX_VOICE_REQUIRE_CONSENT", "1") == "0":
             return
-        # settings.stt_model()/stt_engine(), NOT self._cfg.get("stt_model"):
-        # those keys do not exist in the config mapping, so the digest bound
-        # two empty strings and therefore bound nothing. Caught by running the
-        # CLI end to end and reading the model it printed.
-        model_id = settings.stt_model()
-        engine = settings.stt_engine()
+        # F03: this used to call settings.stt_model()/stt_engine() with no
+        # settings path, while make_stt read stt.engine, stt.model,
+        # stt.model_path and settings_path from the daemon's effective config.
+        # Two independent resolutions meant the identity checked here need not
+        # be the identity opened. The caller now resolves once and passes it.
+        if resolved is None:
+            resolved = stt_lib.resolve_stt(self._cfg)
+        model_id = resolved.model_id
+        engine = resolved.engine
         # The installed bytes, not just the model NAME: S03 is about the same
-        # name over different bytes.
+        # name over different bytes -- and the bytes in the directory the
+        # recogniser will actually open, not the catalogue's guess at it.
         digest = consent.capture_digest(
-            model_id, engine, consent.payload_digest(model_id, engine))
+            model_id, engine,
+            consent.payload_digest_at(resolved.model_dir, engine))
         if not consent.granted("dictation", digest):
             # No silent auto-grant. A grant recorded without the user being
             # asked is not consent, whatever the file says afterwards. The
