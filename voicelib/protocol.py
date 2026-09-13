@@ -24,6 +24,22 @@ OP_STATUS = "status"
 
 OPS = (OP_SPEAK, OP_STOP_SPEECH, OP_DICTATE, OP_STOP_DICTATION, OP_STATUS)
 
+# Protocol identity. A caller MAY declare the wire contract it was written
+# against; omitting it means "whatever the daemon speaks", which is what every
+# existing client does and must keep working.
+#
+# Major is the compatibility boundary: same major = the request shapes this
+# module validates are unchanged, so a newer minor may add optional fields and
+# an older client still parses every reply it understands. A different major
+# means a shape it validates has changed meaning, and guessing is worse than
+# refusing -- the caller learns immediately instead of having a field silently
+# reinterpreted.
+PROTOCOL_SCHEMA = "kilix.voice.protocol/v1"
+PROTOCOL_MAJOR = 1
+PROTOCOL_MINOR = 1
+PROTOCOL_VERSION = f"{PROTOCOL_MAJOR}.{PROTOCOL_MINOR}"
+_VERSION_TOKEN = re.compile(r"^(\d{1,3})(?:\.(\d{1,3}))?$")
+
 MAX_ID_CHARS = 64
 # AF_UNIX/SOCK_SEQPACKET has a platform message ceiling below the daemon's old
 # one-megabyte read guard.  This conservative bound is shared by clients and
@@ -203,6 +219,32 @@ def _validated_socket(raw: object, session_dir: str) -> str:
     return target
 
 
+def _protocol_version(raw: object) -> str:
+    """Return the caller's declared version, or raise on an incompatible major.
+
+    Accepts "1", "1.0", "1.7" and the integer 1. Refuses a different major.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, (str, int)):
+        raise ProtocolError(
+            f"'v' must be a version string such as {PROTOCOL_VERSION!r}, got "
+            f"{type(raw).__name__}. Omit it to accept whatever this daemon "
+            "speaks.")
+    text = str(raw)
+    match = _VERSION_TOKEN.fullmatch(text)
+    if match is None:
+        raise ProtocolError(
+            f"'v' is {text!r}; expected MAJOR or MAJOR.MINOR, for example "
+            f"{PROTOCOL_VERSION!r}.")
+    major = int(match.group(1))
+    if major != PROTOCOL_MAJOR:
+        raise ProtocolError(
+            f"protocol major {major} is not supported; this daemon speaks "
+            f"{PROTOCOL_SCHEMA} (major {PROTOCOL_MAJOR}, current "
+            f"{PROTOCOL_VERSION}). A different major means a request shape "
+            "changed meaning; upgrade the client rather than retrying.")
+    return text
+
+
 def _deadline_ms(raw: object) -> int:
     """Return a positive relative deadline in milliseconds, or raise."""
     if not isinstance(raw, int) or isinstance(raw, bool):
@@ -236,6 +278,8 @@ def validate_request(msg: dict, session_dir: str) -> dict:
         raise ProtocolError(
             f"unknown op {op!r}. Use one of: {', '.join(OPS)}.")
     request: dict = {"op": op, "id": _request_id(msg.get("id"))}
+    if "v" in msg:
+        request["v"] = _protocol_version(msg.get("v"))
     if "deadline_ms" in msg:
         request["deadline_ms"] = _deadline_ms(msg.get("deadline_ms"))
     if op == OP_SPEAK:

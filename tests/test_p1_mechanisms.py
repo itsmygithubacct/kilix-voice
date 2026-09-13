@@ -115,3 +115,45 @@ class ErrorCodeTestCase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProtocolVersionTestCase(unittest.TestCase):
+    """V08 -- compatible framing accepts, an incompatible major refuses."""
+
+    def setUp(self) -> None:
+        self.session = tempfile.mkdtemp(prefix="f104-version-")
+        os.chmod(self.session, 0o700)
+
+    def _speak(self, **extra):
+        msg = {"op": "speak", "text": "hi"}
+        msg.update(extra)
+        return protocol.validate_request(msg, self.session)
+
+    def test_identity_constants_agree(self) -> None:
+        self.assertEqual(protocol.PROTOCOL_SCHEMA, "kilix.voice.protocol/v1")
+        self.assertEqual(protocol.PROTOCOL_VERSION,
+                         f"{protocol.PROTOCOL_MAJOR}.{protocol.PROTOCOL_MINOR}")
+        # The schema string must name the same major it claims.
+        self.assertTrue(protocol.PROTOCOL_SCHEMA.endswith(f"/v{protocol.PROTOCOL_MAJOR}"))
+
+    def test_accept_arm_same_major_any_minor(self) -> None:
+        for value in ("1", "1.0", "1.1", "1.999", 1):
+            with self.subTest(value=value):
+                self.assertEqual(self._speak(v=value)["v"], str(value))
+
+    def test_refuse_arm_different_major(self) -> None:
+        for value in ("2", "2.0", "0.9", 2, "17.3"):
+            with self.subTest(value=value):
+                with self.assertRaises(protocol.ProtocolError) as caught:
+                    self._speak(v=value)
+                self.assertIn("is not supported", str(caught.exception))
+
+    def test_omitting_the_version_still_works(self) -> None:
+        # Every existing client omits it; that must keep working.
+        self.assertNotIn("v", self._speak())
+
+    def test_malformed_version_tokens_are_refused(self) -> None:
+        for value in ("", "v1", "1.2.3", "one", "1.", ".1", "-1", 1.0, True, None, ["1"]):
+            with self.subTest(value=value):
+                with self.assertRaises(protocol.ProtocolError):
+                    self._speak(v=value)
