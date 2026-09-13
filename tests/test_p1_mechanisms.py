@@ -6,12 +6,15 @@ the vector it unblocks.
 """
 import json
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
-from voicelib import models, protocol
+from voicelib import consent, models, protocol
 
 
 class FrameLimitTestCase(unittest.TestCase):
@@ -237,3 +240,101 @@ class CatalogReaderTestCase(unittest.TestCase):
                 with self.assertRaises(models.CatalogError) as caught:
                     models.read_catalog(doc)
                 self.assertIn(f"missing required field {key!r}", str(caught.exception))
+
+
+class ConsentTestCase(unittest.TestCase):
+    """V25 S02/S03 -- consent is created, reused, and invalidated by digest."""
+
+    A = "a" * 64
+    B = "b" * 64
+
+    def setUp(self) -> None:
+        self.home = os.path.realpath(tempfile.mkdtemp(prefix="f104-consent-"))
+        self.env = mock.patch.dict(os.environ, {"HOME": self.home}, clear=True)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.addCleanup(shutil.rmtree, self.home, True)
+
+    def test_import_touches_no_filesystem(self) -> None:
+        self.assertFalse(os.path.exists(os.path.join(self.home, ".local")))
+
+    def test_absent_record_is_not_consent(self) -> None:
+        self.assertFalse(consent.granted("dictation", self.A))
+
+    def test_grant_then_reuse(self) -> None:                      # S02
+        consent.grant("dictation", self.A)
+        self.assertTrue(consent.granted("dictation", self.A))
+        self.assertTrue(consent.granted("dictation", self.A))     # reuse, not re-grant
+
+    def test_grant_is_idempotent(self) -> None:                   # S02
+        first = consent.grant("dictation", self.A)
+        second = consent.grant("dictation", self.A)
+        self.assertEqual(first, second)
+
+    def test_a_changed_digest_invalidates(self) -> None:          # S03
+        consent.grant("dictation", self.A)
+        self.assertFalse(consent.granted("dictation", self.B))
+        # and it is not an error -- the caller simply asks again
+        consent.grant("dictation", self.B)
+        self.assertTrue(consent.granted("dictation", self.B))
+        self.assertFalse(consent.granted("dictation", self.A))
+
+    def test_subjects_are_independent(self) -> None:
+        consent.grant("dictation", self.A)
+        self.assertFalse(consent.granted("synthesis", self.A))
+
+    def test_the_record_is_private_and_inside_the_private_layout(self) -> None:
+        consent.grant("dictation", self.A)
+        path = consent.consent_path()
+        self.assertTrue(path.startswith(self.home + "/.local/gpu_terminal/"))
+        self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.dirname(path)).st_mode), 0o700)
+
+    def test_mode_is_not_umask_dependent(self) -> None:
+        # Real property, but note what enforces it: tempfile.mkstemp creates
+        # 0600 whatever the umask. Deleting the explicit fchmod in _write does
+        # NOT turn this red. Recorded so nobody reads a pass here as proof that
+        # the fchmod is load-bearing.
+        old = os.umask(0o000)
+        try:
+            consent.grant("dictation", self.A)
+            self.assertEqual(stat.S_IMODE(os.stat(consent.consent_path()).st_mode), 0o600)
+        finally:
+            os.umask(old)
+
+    def test_revoke(self) -> None:
+        consent.grant("dictation", self.A)
+        self.assertTrue(consent.revoke("dictation"))
+        self.assertFalse(consent.granted("dictation", self.A))
+        self.assertFalse(consent.revoke("dictation"))
+
+    def test_malformed_subjects_and_digests_are_refused(self) -> None:
+        for subject in ("", "a/b", "../x", "-lead", "x" * 65, None, 1, "a b"):
+            with self.subTest(subject=subject):
+                with self.assertRaises(consent.ConsentError):
+                    consent.grant(subject, self.A)
+        for digest in ("", "abc", "A" * 64, "g" * 64, "a" * 63, None, 1):
+            with self.subTest(digest=digest):
+                with self.assertRaises(consent.ConsentError):
+                    consent.grant("dictation", digest)
+
+    def test_a_corrupt_record_is_refused_not_treated_as_absent(self) -> None:
+        consent.grant("dictation", self.A)
+        with open(consent.consent_path(), "w") as handle:
+            handle.write("{not json")
+        with self.assertRaises(consent.ConsentError) as caught:
+            consent.granted("dictation", self.A)
+        self.assertIn("not valid JSON", str(caught.exception))
+
+    def test_a_foreign_schema_is_refused(self) -> None:
+        consent.grant("dictation", self.A)
+        with open(consent.consent_path(), "w") as handle:
+            json.dump({"schema": "other/v1", "grants": {"dictation": self.A}}, handle)
+        with self.assertRaises(consent.ConsentError):
+            consent.granted("dictation", self.A)
+
+    def test_no_temporary_file_is_left_behind(self) -> None:
+        consent.grant("dictation", self.A)
+        leftovers = [n for n in os.listdir(os.path.dirname(consent.consent_path()))
+                     if n.startswith(".consent-")]
+        self.assertEqual(leftovers, [])
