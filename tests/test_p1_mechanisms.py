@@ -4,11 +4,14 @@ These three were declared-but-unenforced or wholly absent, which is why P1
 vectors V10 (response half), V13 and V16 could not be executed. Each test names
 the vector it unblocks.
 """
+import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 
-from voicelib import protocol
+from voicelib import models, protocol
 
 
 class FrameLimitTestCase(unittest.TestCase):
@@ -157,3 +160,80 @@ class ProtocolVersionTestCase(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(protocol.ProtocolError):
                     self._speak(v=value)
+
+
+class CatalogReaderTestCase(unittest.TestCase):
+    """V03 -- a compatible unknown catalog field is ignored, not refused."""
+
+    def _doc(self, **over):
+        doc = {
+            "schema": models.CATALOG_SCHEMA,
+            "default_model": "small-en-us",
+            "models": [
+                {"id": "small-en-us", "engine": "vosk", "installed": True,
+                 "runtime_supported": True, "download_bytes": 41205931},
+                {"id": "lgraph-en-us", "engine": "vosk", "installed": False,
+                 "runtime_supported": True, "download_bytes": 130557655},
+            ],
+        }
+        doc.update(over)
+        return doc
+
+    def test_the_real_producer_document_round_trips(self) -> None:
+        # The strongest control available: parse what the shipped producer emits.
+        out = subprocess.run([sys.executable, "kilix-stt", "--models", "--json"],
+                             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             capture_output=True, text=True)
+        if out.returncode != 0:
+            self.skipTest(f"kilix-stt --models-json unavailable: {out.stderr[:120]}")
+        parsed = models.read_catalog(json.loads(out.stdout))
+        self.assertEqual(parsed["schema"], models.CATALOG_SCHEMA)
+        self.assertTrue(parsed["models"])
+
+    def test_unknown_fields_are_preserved_not_refused(self) -> None:
+        doc = self._doc(future_top_level={"anything": 1})
+        doc["models"][0]["future_record_field"] = ["whatever"]
+        parsed = models.read_catalog(doc)
+        self.assertEqual(parsed["future_top_level"], {"anything": 1})
+        self.assertEqual(parsed["models"][0]["future_record_field"], ["whatever"])
+
+    def test_a_different_schema_is_refused(self) -> None:
+        for schema in ("kilix.speech.models/v2", "other/v1", "", None, 1):
+            with self.subTest(schema=schema):
+                with self.assertRaises(models.CatalogError) as caught:
+                    models.read_catalog(self._doc(schema=schema))
+                self.assertIn("this reader speaks", str(caught.exception))
+
+    def test_a_mistyped_known_field_is_refused(self) -> None:
+        doc = self._doc()
+        doc["models"][0]["installed"] = "yes"
+        with self.assertRaises(models.CatalogError) as caught:
+            models.read_catalog(doc)
+        self.assertIn("must be bool", str(caught.exception))
+
+    def test_a_bool_is_not_accepted_as_an_int(self) -> None:
+        doc = self._doc()
+        doc["models"][0]["download_bytes"] = True
+        with self.assertRaises(models.CatalogError):
+            models.read_catalog(doc)
+
+    def test_duplicate_ids_are_refused(self) -> None:
+        doc = self._doc()
+        doc["models"][1]["id"] = "small-en-us"
+        with self.assertRaises(models.CatalogError) as caught:
+            models.read_catalog(doc)
+        self.assertIn("duplicate model id", str(caught.exception))
+
+    def test_a_default_outside_the_records_is_refused(self) -> None:
+        with self.assertRaises(models.CatalogError) as caught:
+            models.read_catalog(self._doc(default_model="not-present"))
+        self.assertIn("not one of the", str(caught.exception))
+
+    def test_missing_required_fields_are_refused(self) -> None:
+        for key in ("id", "engine"):
+            with self.subTest(key=key):
+                doc = self._doc()
+                del doc["models"][0][key]
+                with self.assertRaises(models.CatalogError) as caught:
+                    models.read_catalog(doc)
+                self.assertIn(f"missing required field {key!r}", str(caught.exception))

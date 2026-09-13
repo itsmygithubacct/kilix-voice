@@ -154,3 +154,82 @@ __all__ = [
     "engine_for_model",
     "tts_engine_for_model",
 ]
+
+
+class CatalogError(ValueError):
+    """A malformed speech-model catalog document."""
+
+
+# The fields a v1 record is REQUIRED to carry. A reader that demanded the exact
+# key set would break the moment a producer added an optional field -- which is
+# precisely what C13 forbids -- so unknown keys are preserved and ignored, and
+# only these are checked.
+_RECORD_REQUIRED = ("id", "engine")
+_RECORD_TYPES = {
+    "id": str, "engine": str, "download_bytes": int, "download_size": str,
+    "installed": bool, "runtime_supported": bool, "selected": bool,
+    "path": str, "summary": str,
+}
+
+
+def read_catalog(document: object) -> dict:
+    """Return a validated speech-model catalog, ignoring unknown fields.
+
+    The producer side has existed since the schema was introduced; nothing
+    consumed it, so no caller could act on a catalog without re-implementing its
+    shape. This is the reader.
+
+    Forward compatibility is the point: an unknown top-level key or record field
+    is carried through untouched, so a newer producer does not break an older
+    reader. What is NOT tolerated is a wrong schema, a mistyped known field, or a
+    duplicate id -- those change the meaning of fields a caller acts on.
+    """
+    if not isinstance(document, dict):
+        raise CatalogError(
+            f"a catalog document must be a JSON object, got "
+            f"{type(document).__name__}.")
+    schema = document.get("schema")
+    if schema != CATALOG_SCHEMA:
+        raise CatalogError(
+            f"catalog schema is {schema!r}; this reader speaks "
+            f"{CATALOG_SCHEMA!r}. A different schema may have changed what a "
+            "field means.")
+    records = document.get("models")
+    if not isinstance(records, list):
+        raise CatalogError(
+            f"'models' must be a list, got {type(records).__name__}.")
+    seen: set[str] = set()
+    parsed = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise CatalogError(
+                f"model record {index} must be an object, got "
+                f"{type(record).__name__}.")
+        for key in _RECORD_REQUIRED:
+            if key not in record:
+                raise CatalogError(
+                    f"model record {index} is missing required field {key!r}.")
+        for key, want in _RECORD_TYPES.items():
+            if key in record and (not isinstance(record[key], want)
+                                  or (want is int and isinstance(record[key], bool))):
+                raise CatalogError(
+                    f"model record {index} field {key!r} must be "
+                    f"{want.__name__}, got {type(record[key]).__name__}.")
+        catalog_id = record["id"]
+        if catalog_id in seen:
+            raise CatalogError(
+                f"duplicate model id {catalog_id!r}; ids must be unique.")
+        seen.add(catalog_id)
+        parsed.append(dict(record))          # unknown fields preserved verbatim
+    default = document.get("default_model")
+    if default is not None and not isinstance(default, str):
+        raise CatalogError(
+            f"'default_model' must be a string or absent, got "
+            f"{type(default).__name__}.")
+    if default is not None and default not in seen:
+        raise CatalogError(
+            f"'default_model' is {default!r}, which is not one of the "
+            f"{len(seen)} records in the document.")
+    result = dict(document)
+    result["models"] = parsed
+    return result
