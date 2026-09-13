@@ -1376,7 +1376,24 @@ class Daemon:
     # -- status -------------------------------------------------------------
 
     def _op_status(self, request: dict) -> dict:
+        # R6 finding 4: validate_request keeps deadline_ms for every op, and
+        # status read it nowhere -- the Piper probe ran to its own 5 s ceiling
+        # and a 150 ms status answered ok after 3 s. The budget is taken
+        # FIRST, before the settings refresh, exactly as speak and dictate do.
+        deadline_ms = request.get("deadline_ms")
+        deadline = (time.monotonic() + deadline_ms / 1000.0
+                    if deadline_ms is not None else None)
         self._refresh_config()
+        try:
+            tts_status = self._tts_status(deadline)
+        except tts_lib.TtsDeadlineExceeded:
+            # Refused, not reported as `available: false`: the caller's own
+            # budget cut the check, and saying the provider is unavailable
+            # would be the misattribution R6 finding 1 was about.
+            return protocol.reply_error(
+                f"the request deadline of {deadline_ms} ms elapsed while "
+                "checking the speech provider; status is incomplete.",
+                protocol.ERR_DEADLINE)
         now = time.monotonic()
         with self._lock:
             idle = now - self._last_activity
@@ -1399,17 +1416,29 @@ class Daemon:
             "speech_error_serial": speech_error_serial,
             "chrome_speak": settings.enabled(settings.KEY_SPEAK),
             "chrome_dictate": settings.enabled(settings.KEY_DICTATE),
-            "tts": self._tts_status(),
+            "tts": tts_status,
             "stt": self._stt_status(),
             "capture": self._tool_status(audio.build_capture_cmd),
             "playback": self._tool_status(
                 lambda cfg: audio.build_play_cmd(
                     cfg, tts_lib.ESPEAK_SAMPLE_RATE)),
         }
+        if deadline is not None and time.monotonic() >= deadline:
+            # The same delivery-boundary rule dictation follows: a status the
+            # caller has already given up on is not answered as a success,
+            # however it came to be late.
+            return protocol.reply_error(
+                f"the request deadline of {deadline_ms} ms elapsed before "
+                "status was complete.", protocol.ERR_DEADLINE)
         return protocol.reply_ok(request["id"], status=payload)
 
-    def _tts_status(self) -> dict:
-        """Report read-aloud without launching anything."""
+    def _tts_status(self, deadline: float | None = None) -> dict:
+        """Report read-aloud without launching anything.
+
+        The Piper probe is the one step here that runs a process, so it gets
+        the caller's remaining budget and raises TtsDeadlineExceeded when that
+        budget -- not the provider -- is what stopped it.
+        """
         engine = settings.tts_engine()
         if engine == "off":
             return {"engine": engine, "model": engine,
@@ -1417,7 +1446,8 @@ class Daemon:
                 "read-aloud is switched off. Set "
                 f"{settings.KEY_TTS_ENGINE}=espeak to enable it.")}
         if engine == models.TTS_ENGINE_PIPER:
-            available, detail = tts_lib.piper_status()
+            budget = None if deadline is None else deadline - time.monotonic()
+            available, detail = tts_lib.piper_probe(budget=budget)
             return {
                 "engine": engine,
                 "model": models.PIPER_KRISTIN_MODEL,

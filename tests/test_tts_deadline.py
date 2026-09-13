@@ -199,5 +199,82 @@ class SynthesisAttributionTestCase(_ProviderFixture):
                          ["read-aloud stopped: the request deadline elapsed."])
 
 
+class StatusDeadlineTestCase(_ProviderFixture):
+    """R6 finding 4: status honours the deadline_ms it accepts."""
+
+    def status(self, deadline_ms=None, *, engine="piper", refresh=lambda: None,
+               provider=None):
+        d = object.__new__(voiced.Daemon)
+        d._session_dir = self.dir
+        d._socket_path = os.path.join(self.dir, "control.sock")
+        d._cfg = {}
+        d._refresh_config = refresh
+        d._touch = lambda: None
+        d._lock = threading.RLock()
+        d._started_at = d._last_activity = time.monotonic()
+        d._idle_seconds = 300
+        d._speech_error, d._speech_error_serial = "", 0
+        d._arbiter = mock.Mock(speaking=False, listening=False)
+        message = {"op": "status"}
+        if deadline_ms is not None:
+            message["deadline_ms"] = deadline_ms
+        env = {tts_lib.PIPER_ENV_COMMAND: provider} if provider else {}
+        with mock.patch.dict(os.environ, env), \
+             mock.patch.object(voiced.settings, "tts_engine",
+                               lambda path=None: engine):
+            started = time.monotonic()
+            reply = voiced.Daemon._dispatch(d, protocol.encode(message))
+            return d, reply, time.monotonic() - started
+
+    def test_a_spent_status_budget_starts_no_provider(self) -> None:
+        provider = _script(self.dir, "piper", f"touch '{self.marker}'; exit 99")
+        _d, reply, _elapsed = self.status(
+            1, provider=provider, refresh=lambda: time.sleep(0.005))
+        self.assertEqual(reply["code"], protocol.ERR_DEADLINE, reply)
+        self.assertFalse(os.path.exists(self.marker))
+
+    def test_a_hung_provider_cannot_hold_status_past_its_budget(self) -> None:
+        provider = _script(self.dir, "piper", "exec sleep 8")
+        _d, reply, elapsed = self.status(150, provider=provider)
+        self.assertEqual(reply["code"], protocol.ERR_DEADLINE, reply)
+        self.assertLess(elapsed, 1.0)
+
+    def test_a_budget_cut_probe_ends_the_status_work_there(self) -> None:
+        # The typed refusal is redundant in OUTCOME with the boundary check
+        # below it -- a budget that cut the probe has necessarily elapsed, so
+        # both say `deadline` -- but not in EFFECT. Reporting the cut as
+        # `available: false` instead went on to inspect dictation, capture
+        # and playback for a caller that had already given up: a mutation
+        # doing exactly that survived every other test here.
+        provider = _script(self.dir, "piper", "exec sleep 8")
+        with mock.patch.object(voiced.Daemon, "_stt_status",
+                               mock.Mock(return_value={})) as stt_status:
+            _d, reply, _elapsed = self.status(150, provider=provider)
+        self.assertEqual(reply["code"], protocol.ERR_DEADLINE, reply)
+        stt_status.assert_not_called()
+
+    def test_a_status_that_finishes_late_is_not_answered_ok(self) -> None:
+        # The delivery boundary: nothing here spawns a process, the report is
+        # simply slow, and the caller has given up by the time it is ready.
+        with mock.patch.object(voiced.Daemon, "_stt_status",
+                               lambda self: time.sleep(0.2) or {}):
+            _d, reply, _elapsed = self.status(50, engine="off")
+        self.assertIs(reply["ok"], False, reply)
+        self.assertEqual(reply["code"], protocol.ERR_DEADLINE, reply)
+
+    def test_a_status_without_a_deadline_is_unchanged(self) -> None:   # control
+        provider = _script(self.dir, "piper", "echo broken >&2; exit 3")
+        _d, reply, _elapsed = self.status(provider=provider)
+        self.assertTrue(reply["ok"], reply)
+        self.assertFalse(reply["status"]["tts"]["available"])
+        self.assertIn("exited 3", reply["status"]["tts"]["detail"])
+
+    def test_a_generous_budget_still_answers_ok(self) -> None:       # control
+        provider = _script(self.dir, "piper", "echo broken >&2; exit 3")
+        _d, reply, _elapsed = self.status(60_000, provider=provider)
+        self.assertTrue(reply["ok"], reply)
+        self.assertFalse(reply["status"]["tts"]["available"])
+
+
 if __name__ == "__main__":
     unittest.main()
