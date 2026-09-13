@@ -901,6 +901,17 @@ class Daemon:
             # not still running while the last words are being turned into
             # text. stop() is idempotent, so the guard below repeats it.
             capture.stop()
+            if capture.overruns:
+                # A transcript assembled from audio the queue threw away is a
+                # partial answer wearing a success reply -- the same thing A06
+                # refuses rather than truncating. Say so instead of delivering
+                # it silently.
+                raise DaemonError(
+                    f"dictation dropped {capture.overruns} frame(s) of audio "
+                    "because the recogniser fell behind, so the transcript "
+                    "would be missing words. Nothing was delivered. Try a "
+                    "shorter turn, or a lighter model "
+                    f"({settings.KEY_STT_MODEL}).")
             text = clean_for_injection(engine.end_utterance())
             if not heard and not text:
                 raise DaemonError(
@@ -980,6 +991,7 @@ class Daemon:
         # said, which is the same wrong-answer-wearing-a-success this contract
         # refuses elsewhere -- so this counts and REFUSES rather than trimming.
         captured_bytes = 0
+        dropped_frames = 0
         while not turn.stop.is_set() and not self._stopping.is_set():
             if time.monotonic() >= deadline:
                 self._debug(f"{turn.id}: hit the {max_seconds:.0f}s ceiling")
@@ -1000,7 +1012,13 @@ class Daemon:
                 continue
             last_audio = time.monotonic()
             heard = True
-            captured_bytes += len(frame)
+            # R3 F04: the counter sat DOWNSTREAM of a bounded queue that drops
+            # the oldest frame when the consumer falls behind, so audio
+            # discarded upstream was never counted at all. Account for it at the
+            # producer by adding what the queue threw away.
+            captured_bytes += len(frame) + (
+                capture.overruns - dropped_frames) * capture.frame_bytes
+            dropped_frames = capture.overruns
             protocol.check_audio_bytes(captured_bytes)
             event = detector.feed(frame)
             text = engine.feed(frame)

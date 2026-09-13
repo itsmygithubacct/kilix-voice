@@ -553,7 +553,11 @@ class CaptureAccountingTestCase(unittest.TestCase):
     class _Capture:
         rate = 16000
         error = ""
-        def __init__(self, frame, count): self._f, self._n = frame, count
+        overruns = 0
+        def __init__(self, frame, count, overruns=0):
+            self._f, self._n = frame, count
+            self.frame_bytes = len(frame)
+            self.overruns = overruns
         def read(self, *a, **k):
             if self._n <= 0:
                 return None
@@ -590,9 +594,85 @@ class CaptureAccountingTestCase(unittest.TestCase):
             heard = voiced.Daemon._record(daemon, turn, capture, self._Engine())
         self.assertTrue(heard)
 
+    def test_frames_the_queue_dropped_are_counted_too(self) -> None:
+        # R3 F04: the counter sat downstream of a queue that discards the
+        # oldest frame under load, so lost audio never reached it. A capture
+        # reporting overruns must push the total past the ceiling even though
+        # the frames it delivered would not.
+        from voicelib import protocol
+        turn = voiced._DictationTurn("d3", mock.Mock())
+        daemon = self._daemon()
+        frame = b"\x00" * (1024 * 1024)
+        lost = protocol.MAX_AUDIO_BYTES // len(frame) + 2
+        capture = self._Capture(frame, 2, overruns=lost)
+        with mock.patch.object(voiced, "Vad", lambda cfg: mock.Mock(
+                feed=lambda f: None)):
+            with self.assertRaises(protocol.MessageTooLarge):
+                voiced.Daemon._record(daemon, turn, capture, self._Engine())
+
     def test_the_counter_is_reached_from_the_capture_loop(self) -> None:
         source = open(os.path.join(ROOT, "kilix-voiced")).read()
         body = source[source.index("def _record(self"):]
         body = body[:body.index("\n    def ", 10)]
         self.assertIn("captured_bytes += len(frame)", body)
         self.assertIn("protocol.check_audio_bytes(captured_bytes)", body)
+
+
+class TruncatedTranscriptTestCase(unittest.TestCase):
+    """R3 F04: a transcript built from audio the queue dropped is not a success."""
+
+    class _Capture:
+        rate = 16000
+        error = ""
+        frame_bytes = 3200
+        def __init__(self, overruns): self.overruns = overruns; self._n = 2
+        def start(self): pass
+        def stop(self): pass
+        def read(self, *a, **k):
+            if self._n <= 0:
+                return None
+            self._n -= 1
+            return b"\x00" * self.frame_bytes
+
+    class _Engine:
+        supports_partials = False
+        def start_utterance(self): pass
+        def feed(self, frame): return None
+        def end_utterance(self): return "some words"
+        def close(self): pass
+
+    def _daemon(self):
+        import threading
+        d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._stopping = threading.Event()
+        d._cfg = {}
+        d._warn = lambda *a, **k: None
+        d._send = lambda *a, **k: True
+        return d
+
+    def _run(self, overruns):
+        # The consent gate is default-ON and is reached BEFORE capture, which
+        # this test incidentally confirms: without disabling it, _dictate
+        # refuses for consent and never gets to the overrun check. That is the
+        # correct order; it just is not what this test is about.
+        turn = voiced._DictationTurn("d9", mock.Mock())
+        capture = self._Capture(overruns)
+        with mock.patch.dict(os.environ,
+                             {"KILIX_VOICE_REQUIRE_CONSENT": "0"}), \
+             mock.patch.object(voiced.audio, "MicCapture", lambda cfg: capture), \
+             mock.patch.object(voiced.stt_lib, "make_stt",
+                               lambda cfg, rate: self._Engine()), \
+             mock.patch.object(voiced, "Vad", lambda cfg: mock.Mock(
+                 feed=lambda f: None)), \
+             mock.patch.object(voiced, "clean_for_injection", lambda t: t):
+            return voiced.Daemon._dictate(self._daemon(), turn)
+
+    def test_a_turn_that_lost_frames_is_refused(self) -> None:
+        with self.assertRaises(voiced.DaemonError) as caught:
+            self._run(overruns=3)
+        self.assertIn("dropped 3 frame(s)", str(caught.exception))
+        self.assertIn("Nothing was delivered", str(caught.exception))
+
+    def test_a_clean_turn_still_delivers(self) -> None:          # positive control
+        self._run(overruns=0)                                     # must not raise
