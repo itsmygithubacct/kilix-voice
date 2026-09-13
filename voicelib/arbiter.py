@@ -31,6 +31,7 @@ import time
 from collections.abc import Callable
 
 from . import paths
+from .protocol import ERR_BUSY, ERR_UNAVAILABLE
 
 LOCK_BASENAME = "voiced.lock"
 
@@ -47,7 +48,23 @@ _MAX_LOCK_BYTES = 4096
 
 
 class ArbiterError(RuntimeError):
-    """The session is owned elsewhere, or a turn broke the half-duplex rule."""
+    """The session is owned elsewhere, or a turn broke the half-duplex rule.
+
+    Every such refusal means "something else holds what you asked for", so it
+    carries ERR_BUSY for the daemon to put on the wire.
+    """
+
+    code = ERR_BUSY
+
+
+class ArbiterUnavailable(ArbiterError):
+    """The barge-in hook failed, so the microphone could not be claimed.
+
+    Not busy: nothing holds the device the caller could wait out. Read-aloud
+    could not be silenced, which leaves dictation unavailable until it is.
+    """
+
+    code = ERR_UNAVAILABLE
 
 
 def _start_ticks(pid: int) -> str:
@@ -317,7 +334,7 @@ class Arbiter:
                     try:
                         self._cancel_speech()
                     except Exception as error:  # the hook is the daemon's
-                        raise ArbiterError(
+                        raise ArbiterUnavailable(
                             f"cannot stop read-aloud before opening the "
                             f"microphone: {error}. Send stop-speech, then "
                             "start dictation again.") from error

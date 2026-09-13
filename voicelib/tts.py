@@ -21,7 +21,7 @@ import threading
 import time
 from typing import NamedTuple
 
-from . import models, settings, util
+from . import models, protocol, settings, util
 
 # espeak-ng writes 22.05 kHz mono at --stdout. The real rate always comes from
 # the WAV header; this is only what an empty clip is labelled with.
@@ -75,7 +75,19 @@ def _bounded(cap: float, budget: float | None) -> float:
 
 
 class TtsError(RuntimeError):
-    """Synthesis failed; the message says what to do about it."""
+    """Synthesis failed; the message says what to do about it.
+
+    A missing synthesiser or provider is the common case, so the family is
+    `unavailable` on the wire unless a subclass knows better.
+    """
+
+    code = protocol.ERR_UNAVAILABLE
+
+
+class TtsUnsupported(TtsError):
+    """The request asked an engine for something it cannot do at all."""
+
+    code = protocol.ERR_UNSUPPORTED
 
 
 class RenderedSpeech(NamedTuple):
@@ -625,13 +637,14 @@ class PiperTts:
                  rate: int | None = None) -> None:
         if voice is not None and str(voice).strip().lower() not in {
                 "kristin", PIPER_VOICE.lower(), self.model.lower()}:
-            raise TtsError(
+            raise TtsUnsupported(
                 f"model {self.model!r} has the fixed voice {PIPER_VOICE!r}; "
                 "omit --voice or use --voice en_US-kristin-medium."
             )
         self.rate = int(settings.tts_rate() if rate is None else rate)
         if self.rate not in (120, 150, 170, 200, 240):
-            raise TtsError("Piper rate must be one of: 120, 150, 170, 200, 240 wpm")
+            raise TtsUnsupported(
+                "Piper rate must be one of: 120, 150, 170, 200, 240 wpm")
         self._lock = threading.Lock()
         self._process: subprocess.Popen[bytes] | None = None
         self._cancelled = False

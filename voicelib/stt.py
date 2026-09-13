@@ -22,7 +22,7 @@ import json
 import os
 import re
 
-from . import models, paths, settings
+from . import models, paths, protocol, settings
 from .util import cfg_get
 
 DEFAULT_RATE = 16000
@@ -74,6 +74,8 @@ _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]")
 
 class SttError(RuntimeError):
     """Recognition is unavailable or failed; the message says what to do."""
+
+    code = protocol.ERR_UNAVAILABLE
 
 
 def _clean_text(raw: str) -> str:

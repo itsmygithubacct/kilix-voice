@@ -118,7 +118,36 @@ _DICTATION_TYPES = (socket.SOCK_SEQPACKET, socket.SOCK_DGRAM,
 
 
 class DaemonError(RuntimeError):
-    """The daemon cannot serve a request; the message says what to do."""
+    """The daemon cannot serve a request; the message says what to do.
+
+    R6 finding 3: every refusal a handler raised reached the caller as
+    ERR_INTERNAL -- "the daemon has a bug" -- because the control path called
+    reply_error with no code, while the dictation worker already coded the
+    same exceptions `unavailable`. The code now travels with the exception, so
+    both paths read it from one place. The base keeps `unavailable`, the code
+    R4 confirmed for this family; a refusal with a more precise cause is a
+    subclass below.
+    """
+
+    code = protocol.ERR_UNAVAILABLE
+
+
+class DaemonBusy(DaemonError):
+    """Refused because a turn already owns the device this request needs."""
+
+    code = protocol.ERR_BUSY
+
+
+class DaemonNotFound(DaemonError):
+    """Refused because a socket the request names is not there to deliver to."""
+
+    code = protocol.ERR_NOT_FOUND
+
+
+class DaemonUnavailable(DaemonError):
+    """Refused because a capability is switched off or cannot be started."""
+
+    code = protocol.ERR_UNAVAILABLE
 
 
 class ConsentDenied(DaemonError):
@@ -132,6 +161,20 @@ class ConsentDenied(DaemonError):
     """
 
     code = protocol.ERR_DENIED
+
+
+def _carried_code(error: BaseException, default: str) -> str:
+    """Return the closed code ``error`` carries, or ``default`` when it has none.
+
+    The one adapter both the control path and the dictation worker use, so an
+    exception family cannot be coded one way on one path and another way on
+    the other -- the R5 finding A shape, where two engines disagreed. The code
+    is validated here (R5 finding B): an attribute that is not in the closed
+    vocabulary would make reply_error or dictation_error raise, and the caller
+    would then get no reply at all.
+    """
+    code = getattr(error, "code", None)
+    return code if code in protocol.ERROR_CODES else default
 
 
 def clean_for_injection(text: str) -> str:
@@ -241,13 +284,13 @@ def _connect_dictation(path: str) -> socket.socket:
     try:
         info = os.lstat(path)
     except OSError as error:
-        raise DaemonError(
+        raise DaemonNotFound(
             f"the dictation socket {path} is not there: {error}. It is created "
             "by the kitty fork as <session>/dictate-<pane>.sock before it asks "
             "for dictation; start dictation from the terminal rather than by "
             "hand.") from error
     if not stat.S_ISSOCK(info.st_mode):
-        raise DaemonError(
+        raise DaemonNotFound(
             f"{path} is not a socket. Dictation is delivered to the socket the "
             "kitty fork creates for the pane; remove whatever is at that path "
             "and start dictation again.")
@@ -261,7 +304,7 @@ def _connect_dictation(path: str) -> socket.socket:
         except OSError as error:
             failures.append(f"{kind.name}: {error}")
             endpoint.close()
-    raise DaemonError(
+    raise DaemonNotFound(
         f"cannot connect to the dictation socket {path} "
         f"({'; '.join(failures)}). The pane that asked for dictation has "
         "probably gone away — start dictation again from a live pane.")
@@ -580,7 +623,7 @@ class Daemon:
             return protocol.reply_error(
                 f"this kilix-voiced serves uid {os.geteuid()} only, and you "
                 f"are uid {uid}. Start your own daemon: voice sessions are per "
-                "user and are never shared.")
+                "user and are never shared.", protocol.ERR_DENIED)
         try:
             raw = conn.recv(MAX_REQUEST_BYTES + 1)
         except socket.timeout:
@@ -595,7 +638,8 @@ class Daemon:
             return protocol.reply_error(
                 f"the request is larger than {MAX_REQUEST_BYTES} bytes. Read a "
                 f"smaller extent by lowering {settings.KEY_TTS_MAX_CHARS}, or "
-                "send the text as several speak requests.")
+                "send the text as several speak requests.",
+                protocol.ERR_TOO_LARGE)
         return self._dispatch(raw)
 
     def _dispatch(self, raw: bytes) -> dict:
@@ -617,7 +661,14 @@ class Daemon:
         except (DaemonError, ArbiterError, audio.AudioError, tts_lib.TtsError,
                 stt_lib.SttError, settings.SettingsError,
                 paths.PathError) as error:
-            return protocol.reply_error(str(error))
+            # These are refusals, not faults: a turn already running, a
+            # capability switched off, a socket that is not there. Each carries
+            # its own code; a family member without one is `unavailable`,
+            # which is what the dictation worker codes the same family.
+            # ERR_INTERNAL is left to the arm below, which is where a genuine
+            # handler bug lands.
+            return protocol.reply_error(
+                str(error), _carried_code(error, protocol.ERR_UNAVAILABLE))
         except Exception as error:  # a handler bug must not take the daemon
             self._warn(f"unhandled failure in {request['op']}: {error!r}")
             return protocol.reply_error(
@@ -931,13 +982,13 @@ class Daemon:
         self._refresh_config()
         engine = str(util.cfg_get(self._cfg, "stt.engine", "")).strip().lower()
         if engine == stt_lib.ENGINE_OFF:
-            raise DaemonError(
+            raise DaemonUnavailable(
                 f"dictation is switched off ({settings.KEY_STT_ENGINE}=off), "
                 "so the microphone is not opened. Set "
                 f"{settings.KEY_STT_ENGINE}={stt_lib.ENGINE_VOSK} in the "
                 "shared settings, or in kilix-stt, to enable it.")
         if self._arbiter.listening:
-            raise DaemonError(
+            raise DaemonBusy(
                 "dictation is already running. Send stop-dictation first; one "
                 "turn owns the microphone at a time.")
         # Connected here rather than in the worker so that an unreachable
@@ -982,7 +1033,7 @@ class Daemon:
             thread.start()
         except RuntimeError as error:
             undo()
-            raise DaemonError(
+            raise DaemonUnavailable(
                 f"cannot start a voice worker thread: {error}. This machine "
                 "is out of threads or memory; close some processes and try "
                 "again.") from error
@@ -1021,9 +1072,15 @@ class Daemon:
             self._send(turn.receiver, protocol.dictation_error(
                 f"dictation stopped: {error}.", protocol.ERR_CANCELLED))
         except (DaemonError, audio.AudioError, stt_lib.SttError,
-                paths.PathError, OSError, ValueError) as error:
+                settings.SettingsError, paths.PathError, OSError,
+                ValueError) as error:
             # A refusal that knows its own code keeps it. Everything else is
             # still `unavailable`, which R4 confirmed is the right default.
+            #
+            # SettingsError joined this tuple with R6 finding 3: the control
+            # path codes an unreadable settings file `unavailable`, and _record
+            # reads settings on every turn, so leaving it out here coded the
+            # same condition `internal` on this path.
             #
             # R5 finding B: the carried code MUST be validated here. This arm
             # catches OSError and ValueError -- large families -- and
@@ -1031,12 +1088,10 @@ class Daemon:
             # raising ProtocolError. Raised inside this except arm, that is not
             # caught by the sibling `except Exception`, so the caller would
             # receive NO datagram at all: strictly worse than the flattening
-            # this replaced.
-            carried = getattr(error, "code", None)
-            if carried not in protocol.ERROR_CODES:
-                carried = protocol.ERR_UNAVAILABLE
-            self._send(turn.receiver,
-                       protocol.dictation_error(str(error), carried))
+            # this replaced. _carried_code is that validation, shared with the
+            # control path so the two cannot code one family differently.
+            self._send(turn.receiver, protocol.dictation_error(
+                str(error), _carried_code(error, protocol.ERR_UNAVAILABLE)))
         except Exception as error:  # a worker thread must not die silently
             self._warn(f"dictation failed: {error!r}")
             # F08: this arm called dictation_error with NO code at all, so an
