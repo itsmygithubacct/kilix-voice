@@ -590,6 +590,14 @@ class Daemon:
     # -- speak --------------------------------------------------------------
 
     def _op_speak(self, request: dict) -> dict:
+        # The budget starts HERE, before configuration refresh, engine
+        # construction and text splitting. Computing it after preparation gave
+        # every request a fresh full budget no matter how long preparation
+        # took -- an independent review measured a 1 s preparation still
+        # handing out a full 20 ms budget.
+        deadline_ms = request.get("deadline_ms")
+        deadline = (time.monotonic() + deadline_ms / 1000.0
+                    if deadline_ms is not None else None)
         self._refresh_config()
         engine = tts_lib.make_tts(
             self._cfg, model=request.get("model"), voice=request.get("voice"),
@@ -612,9 +620,6 @@ class Daemon:
             return protocol.reply_ok(
                 request["id"], chunks=0, model=engine.model,
                 voice=engine.voice, rate=engine.rate)
-        deadline_ms = request.get("deadline_ms")
-        deadline = (time.monotonic() + deadline_ms / 1000.0
-                    if deadline_ms is not None else None)
         turn = _SpeechTurn(self._next_turn_id("speak"), chunks, engine, deadline)
         if turn.expired():
             # Refuse before any work starts. A budget that has already run out
@@ -735,7 +740,12 @@ class Daemon:
         while player.playing:
             if turn.cancel.wait(SPEECH_POLL_S):
                 return False
-        return not turn.cancel.is_set()
+            if turn.expired():
+                # Without this an expired turn drains its already-playing clip
+                # and returns success from the wait, so the budget bounds
+                # generation but not the audio the listener actually hears.
+                return False
+        return not turn.cancel.is_set() and not turn.expired()
 
     # -- dictate ------------------------------------------------------------
 

@@ -331,3 +331,55 @@ class R2ConsentDurabilityTestCase(unittest.TestCase):
         leftovers = [n for n in os.listdir(os.path.dirname(consent.consent_path()))
                      if n.startswith(".consent-")]
         self.assertEqual(leftovers, [])
+
+
+class R2Finding1TestCase(unittest.TestCase):
+    """R2 finding 1: preparation must be INSIDE the budget, and expiry must
+    stop the audio the listener hears, not only generation."""
+
+    def test_the_budget_starts_before_preparation(self) -> None:
+        source = open(os.path.join(ROOT, "kilix-voiced")).read()
+        body = source[source.index("def _op_speak(self, request: dict)"):]
+        body = body[:body.index("def ", 10)]
+        start = body.index("deadline_ms = request.get")
+        # preparation must come AFTER the clock starts, not before it
+        for later in ("self._refresh_config()", "tts_lib.make_tts",
+                      "self._speech_chunks("):
+            with self.subTest(step=later):
+                self.assertGreater(body.index(later), start,
+                                   f"{later} runs before the budget starts")
+
+    def test_await_clip_stops_on_expiry_not_only_cancellation(self) -> None:
+        clock = lambda: clock.t
+        clock.t = 100.0
+        turn = voiced._SpeechTurn("t", ["a"], mock.Mock(), 100.5, clock)
+        player = mock.Mock()
+        player.playing = True
+        daemon = object.__new__(voiced.Daemon)
+        clock.t = 100.6                       # budget spent while the clip plays
+        # A mutant that removes the in-loop expiry check makes this spin
+        # forever, and a HANGING test is not a failing test -- it stalls the
+        # whole suite instead of reporting. Bound it so the mutant fails fast.
+        import threading
+        result = {}
+
+        def call():
+            result["v"] = voiced.Daemon._await_clip(daemon, turn, player)
+
+        with mock.patch.object(voiced, "SPEECH_POLL_S", 0.001):
+            worker = threading.Thread(target=call, daemon=True)
+            worker.start()
+            worker.join(timeout=3)
+        self.assertFalse(worker.is_alive(),
+                         "_await_clip never returned: expiry is not checked "
+                         "inside the wait loop")
+        self.assertFalse(result["v"])
+
+    def test_await_clip_returns_true_for_a_live_budget(self) -> None:   # control
+        clock = lambda: clock.t
+        clock.t = 100.0
+        turn = voiced._SpeechTurn("t", ["a"], mock.Mock(), 100.5, clock)
+        player = mock.Mock()
+        player.playing = False
+        daemon = object.__new__(voiced.Daemon)
+        self.assertTrue(voiced.Daemon._await_clip(daemon, turn, player))
