@@ -418,3 +418,91 @@ class R2Finding1TestCase(unittest.TestCase):
         player.playing = False
         daemon = object.__new__(voiced.Daemon)
         self.assertTrue(voiced.Daemon._await_clip(daemon, turn, player))
+
+
+class StreamedSynthesisTestCase(unittest.TestCase):
+    """A12-A15 at the runtime: chunk descriptors published as clips are queued."""
+
+    def _turn(self, chunks=("one", "two", "three")):
+        engine = mock.Mock()
+        engine.voice, engine.model, engine.rate, engine.seed = "en-us", "m1", 170, 7
+        turn = voiced._SpeechTurn("speak-9", list(chunks), engine)
+        turn.receiver = mock.Mock()
+        return turn
+
+    def _daemon(self):
+        import threading
+        d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._warn = lambda *a, **k: None
+        d._send = lambda receiver, msg: sent.append(msg) or True
+        return d
+
+    def test_a_chunk_is_published_when_the_clip_is_queued(self) -> None:
+        global sent; sent = []
+        turn = self._turn(); daemon = self._daemon(); daemon._speech = turn
+        player = mock.Mock()
+        self.assertTrue(voiced.Daemon._play_if_current(
+            daemon, turn, player, b"\x00\x00" * 100, 24000))
+        player.play.assert_called_once()          # queued...
+        self.assertEqual(len(sent), 1)            # ...and published at that moment
+        chunk = sent[0]
+        self.assertEqual(chunk["sequence"], 0)            # A12
+        self.assertEqual(chunk["voice"], "en-us")         # A13
+        self.assertEqual(chunk["model"], "m1")            # A13
+        self.assertEqual(chunk["seed"], 7)                # A14
+        self.assertEqual(chunk["settings"]["rate_wpm"], 170)
+        self.assertEqual(chunk["pcm_bytes"], 200)
+        self.assertIs(chunk["final"], False)              # A15: more to come
+
+    def test_sequence_advances_and_the_last_chunk_is_final(self) -> None:
+        global sent; sent = []
+        turn = self._turn(("a", "b")); daemon = self._daemon(); daemon._speech = turn
+        for _ in range(2):
+            voiced.Daemon._play_if_current(daemon, turn, mock.Mock(), b"\x00\x00", 24000)
+        self.assertEqual([c["sequence"] for c in sent], [0, 1])
+        self.assertEqual([c["final"] for c in sent], [False, True])
+
+    def test_samples_never_ride_in_the_descriptor(self) -> None:
+        global sent; sent = []
+        turn = self._turn(); daemon = self._daemon(); daemon._speech = turn
+        voiced.Daemon._play_if_current(daemon, turn, mock.Mock(), b"\xff" * 64, 24000)
+        blob = repr(sent[0])
+        self.assertNotIn("\\xff", blob)
+        self.assertEqual(sent[0]["pcm_bytes"], 64)
+
+    def test_a_caller_that_did_not_ask_gets_nothing(self) -> None:   # control
+        global sent; sent = []
+        turn = self._turn(); turn.receiver = None
+        daemon = self._daemon(); daemon._speech = turn
+        voiced.Daemon._play_if_current(daemon, turn, mock.Mock(), b"\x00\x00", 24000)
+        self.assertEqual(sent, [])
+
+    def test_a_malformed_descriptor_does_not_take_the_audio_down(self) -> None:
+        global sent; sent = []
+        turn = self._turn(); turn.engine.voice = "not a valid voice token"
+        daemon = self._daemon(); daemon._speech = turn
+        player = mock.Mock()
+        self.assertTrue(voiced.Daemon._play_if_current(
+            daemon, turn, player, b"\x00\x00", 24000))
+        player.play.assert_called_once()      # audio still queued
+        self.assertEqual(sent, [])            # descriptor dropped, not raised
+
+    def test_speak_validates_the_chunk_socket_inside_the_session(self) -> None:
+        from voicelib import protocol
+        import tempfile
+        session = tempfile.mkdtemp(prefix="f104-chunk-")
+        os.chmod(session, 0o700)
+        with self.assertRaises(protocol.ProtocolError):
+            protocol.validate_request(
+                {"op": "speak", "text": "hi", "chunk_sock": "/etc/evil.sock"},
+                session)
+
+    def test_the_pinned_drop_of_sock_on_speak_is_unchanged(self) -> None:
+        from voicelib import protocol
+        import tempfile
+        session = tempfile.mkdtemp(prefix="f104-chunk2-")
+        os.chmod(session, 0o700)
+        out = protocol.validate_request(
+            {"op": "speak", "text": "hi", "sock": "/etc/evil.sock"}, session)
+        self.assertNotIn("sock", out)

@@ -144,6 +144,11 @@ class _SpeechTurn:
         # an NTP step. None means the caller set no bound.
         self.deadline = deadline
         self._clock = clock
+        # A12-A15: where streamed chunk descriptors go, and the sequence they
+        # carry. None means the caller did not ask for the stream, which stays
+        # the default so an ordinary speak is unchanged.
+        self.receiver: socket.socket | None = None
+        self.sequence = 0
 
     def expired(self) -> bool:
         """True once the caller's budget has run out."""
@@ -621,6 +626,8 @@ class Daemon:
                 request["id"], chunks=0, model=engine.model,
                 voice=engine.voice, rate=engine.rate)
         turn = _SpeechTurn(self._next_turn_id("speak"), chunks, engine, deadline)
+        if request.get("chunk_sock"):
+            turn.receiver = _connect_dictation(request["chunk_sock"])
         if turn.expired():
             # Refuse before any work starts. A budget that has already run out
             # by the time we get here must not produce audio nobody is waiting
@@ -707,6 +714,11 @@ class Daemon:
             with self._lock:
                 if self._speech is turn:
                     self._speech = None
+            if turn.receiver is not None:
+                try:
+                    turn.receiver.close()
+                finally:
+                    turn.receiver = None
             self._arbiter.end_speech(turn.id)
             self._touch()
 
@@ -733,7 +745,38 @@ class Daemon:
                 # just before the budget ran out must not still be played.
                 return False
             player.play(pcm, rate)
+            self._publish_chunk(turn, pcm, rate)
             return True
+
+    def _publish_chunk(self, turn: _SpeechTurn, pcm: bytes, rate: int) -> None:
+        """Emit one A12-A15 chunk descriptor as the clip is queued.
+
+        Queued, not finished: A15 asks for bounded playable audio to arrive
+        BEFORE the whole utterance completes, so the descriptor is published at
+        the moment the clip enters the player rather than after it drains.
+
+        The samples never ride in the JSON -- only their length, which goes
+        through the A06 check. A caller that did not name a socket gets nothing
+        and pays nothing.
+        """
+        if turn.receiver is None:
+            return
+        engine = turn.engine
+        final = turn.sequence == len(turn.chunks) - 1
+        try:
+            chunk = protocol.synthesis_chunk(
+                turn.sequence, pcm_bytes=len(pcm), sample_rate=rate,
+                voice=getattr(engine, "voice", "") or "unset",
+                model=getattr(engine, "model", "") or "unset",
+                seed=getattr(engine, "seed", None),
+                final=final, turn=turn.id,
+                rate_wpm=getattr(engine, "rate", None))
+        except protocol.ProtocolError as error:
+            # A malformed descriptor must not take the audio down with it.
+            self._warn(f"synthesis chunk {turn.sequence} not published: {error}")
+            return
+        turn.sequence += 1
+        self._send(turn.receiver, chunk)
 
     def _await_clip(self, turn: _SpeechTurn, player: audio.Player) -> bool:
         """Wait out the queued clip; False when the turn was cancelled."""

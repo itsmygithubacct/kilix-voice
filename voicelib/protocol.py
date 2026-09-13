@@ -328,6 +328,20 @@ def validate_request(msg: dict, session_dir: str) -> dict:
                     f"'rate' must be one of: "
                     f"{', '.join(map(str, TTS_RATE_CHOICES))} words per minute.")
             request["rate"] = rate
+        if "chunk_sock" in msg:
+            # A15: streamed synthesis needs somewhere to stream TO. It reuses
+            # _validated_socket, so the path containment already reviewed for
+            # dictation applies unchanged rather than a second, weaker set
+            # being invented.
+            #
+            # Deliberately NOT called "sock". The pinned regression test
+            # tests/test_protocol.py:374 asserts that a speak request DROPS an
+            # unused "sock" field, and speak claiming that name would change a
+            # shipped behaviour -- a contract change belonging to the successor
+            # seam freeze. A new capability gets a new name; the old field goes
+            # on being dropped exactly as before.
+            request["chunk_sock"] = _validated_socket(
+                msg.get("chunk_sock"), session_dir)
     elif op == OP_DICTATE:
         request["sock"] = _validated_socket(msg.get("sock"), session_dir)
     return request
