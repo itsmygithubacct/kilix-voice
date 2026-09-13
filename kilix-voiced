@@ -1208,18 +1208,16 @@ class Daemon:
             # turn. Without this the caller gets a `final` transcript, or the
             # misleading "no audio arrived from the microphone", for a request
             # it had already given up on.
-            #
-            # The question here is "has the caller given up?", which is
-            # expired(), not reason(): a stop pressed in time does not make a
-            # budget that has since run out any less spent.
-            if turn.stop.expired():
-                raise DeadlineExceeded(
-                    "the request deadline elapsed while recording")
+            self._raise_if_budget_spent(turn, "while recording")
             # The microphone closes the moment the turn ends, before anything
             # is recognised or delivered: click-to-talk means the recorder is
             # not still running while the last words are being turned into
             # text. stop() is idempotent, so the guard below repeats it.
             capture.stop()
+            # R6 finding 2: stopping the recorder is terminate plus join and
+            # can take seconds. Checked BEFORE the overruns refusal, so a turn
+            # whose budget ran out here says deadline rather than unavailable.
+            self._raise_if_budget_spent(turn, "while the recorder shut down")
             if capture.overruns:
                 # A transcript assembled from audio the queue threw away is a
                 # partial answer wearing a success reply -- the same thing A06
@@ -1232,6 +1230,12 @@ class Daemon:
                     "shorter turn, or a lighter model "
                     f"({settings.KEY_STT_MODEL}).")
             text = clean_for_injection(engine.end_utterance())
+            # The delivery boundary: final decoding can outlast the budget
+            # too. Checked BEFORE the no-audio refusal, so an expired turn that
+            # heard nothing says deadline rather than "no audio arrived". What
+            # remains between here and the send is in-process work measured
+            # in microseconds, which is the accepted tolerance.
+            self._raise_if_budget_spent(turn, "before the transcript was ready")
             if not heard and not text:
                 raise DaemonError(
                     "no audio arrived from the microphone. Check that one is "
@@ -1242,18 +1246,25 @@ class Daemon:
             # dictation never presses Enter (DESIGN.md safety rule 2).
             # Same segment id as this turn's partials, marked stable: the
             # consumer replaces the running text rather than appending to it.
-            #
-            # The delivery boundary. Final decoding and the recorder shutting
-            # down can both outlast the budget after recording ended, and no
-            # `final` is delivered once it has.
-            if turn.stop.expired():
-                raise DeadlineExceeded(
-                    "the request deadline elapsed before the transcript was "
-                    "ready")
             self._send(turn.receiver, protocol.dictation_final(text, turn.id))
         finally:
             capture.stop()
             engine.close()
+
+    @staticmethod
+    def _raise_if_budget_spent(turn: _DictationTurn, where: str) -> None:
+        """Refuse delivery once the caller's budget has run out, wherever.
+
+        The question at every step after recording is "has the caller given
+        up?", which is expired() -- not reason(): a stop pressed in time does
+        not make a budget that has since run out any less spent, and nobody is
+        waiting for the transcript any more.
+
+        A staticmethod that reads only the turn, so a daemon built without
+        __init__ can still run it.
+        """
+        if turn.stop.expired():
+            raise DeadlineExceeded(f"the request deadline elapsed {where}")
 
     def _require_capture_consent(
             self, resolved: stt_lib.ResolvedStt | None = None) -> None:
