@@ -205,3 +205,67 @@ class CaptureConsentGateTestCase(unittest.TestCase):
         # Deployment default: upgrading must not silently break existing callers.
         with mock.patch.dict(os.environ, {"HOME": self.home}, clear=True):
             voiced.Daemon._require_capture_consent(self.daemon)  # must not raise
+
+
+class DispatchBindingTestCase(unittest.TestCase):
+    """R2 survivors: the DISPATCH wiring, not just the mechanism.
+
+    R1's lesson was 'helpers with no callers'. R2 found I had repeated it one
+    level up: the turn honoured a deadline it was given, and nothing tested that
+    dispatch actually gave it one. Same for the consent CLI.
+    """
+
+    def test_dispatch_binds_the_validated_deadline_onto_the_turn(self) -> None:
+        source = open(os.path.join(ROOT, "kilix-voiced")).read()
+        body = source[source.index("deadline_ms = request.get"):]
+        head = body[:body.index("turn.thread")]
+        # the computed instant must actually be handed to the turn
+        self.assertIn("time.monotonic() + deadline_ms / 1000.0", head)
+        self.assertIn("chunks, engine, deadline)", head)
+
+    def test_a_turn_built_without_a_deadline_never_expires(self) -> None:
+        # The behavioural half: if dispatch stopped passing it, turns would
+        # silently never expire. This is what the source check above protects.
+        turn = voiced._SpeechTurn("t", ["a"], mock.Mock())
+        self.assertIsNone(turn.deadline)
+        self.assertFalse(turn.expired())
+
+    def test_dispatch_refuses_an_already_spent_budget(self) -> None:
+        source = open(os.path.join(ROOT, "kilix-voiced")).read()
+        self.assertIn("protocol.ERR_DEADLINE", source)
+        block = source[source.index("if turn.expired():"):]
+        self.assertIn("elapsed before", block[:600])
+
+    def test_the_consent_cli_is_dispatched(self) -> None:
+        # R2 survivor: removing the dispatch left the flags parsed and inert.
+        source = open(os.path.join(ROOT, "kilix-stt")).read()
+        self.assertIn("if args.grant_consent or args.revoke_consent:", source)
+        self.assertIn("_consent_command(args)", source)
+        # and it must count as an action, or the interactive fallback swallows it
+        self.assertIn("or args.grant_consent or args.revoke_consent", source)
+
+    def test_the_consent_cli_actually_records(self) -> None:
+        import json as _json, shutil, subprocess as _sp, tempfile
+        home = tempfile.mkdtemp(prefix="f104-cli-")
+        self.addCleanup(shutil.rmtree, home, True)
+        env = dict(os.environ, HOME=home)
+        out = _sp.run([sys.executable, "kilix-stt", "--grant-consent"],
+                      cwd=ROOT, capture_output=True, text=True, env=env)
+        self.assertEqual(out.returncode, 0, out.stderr[:300])
+        self.assertIn("consent recorded", out.stdout)
+        probe = _sp.run(
+            [sys.executable, "-c",
+             "import sys;sys.path.insert(0,'.');"
+             "from voicelib import consent, settings;"
+             "print(consent.granted('dictation', consent.capture_digest("
+             "settings.stt_model(), settings.stt_engine())))"],
+            cwd=ROOT, capture_output=True, text=True, env=env)
+        self.assertEqual(probe.stdout.strip(), "True", probe.stderr[:300])
+
+    def test_engine_identity_is_part_of_the_capture_digest(self) -> None:
+        # R2 survivor: dropping engine from the digest left the suite green.
+        from voicelib import consent
+        self.assertNotEqual(consent.capture_digest("m", "vosk"),
+                            consent.capture_digest("m", "vibevoice"))
+        self.assertNotEqual(consent.capture_digest("m", "vosk"),
+                            consent.capture_digest("other", "vosk"))
