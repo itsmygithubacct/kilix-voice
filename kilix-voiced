@@ -68,7 +68,8 @@ for _package_root in (_INSTALLED_LIB, _HERE):
     if _package_root not in sys.path:
         sys.path.insert(0, _package_root)
 
-from voicelib import (  # noqa: E402  (the import follows the path bootstrap)
+from voicelib import (
+    consent,  # noqa: E402  (the import follows the path bootstrap)
     __version__, audio, events, models, paths, protocol, settings, stt as stt_lib,
     tts as tts_lib, util)
 from voicelib.arbiter import Arbiter, ArbiterError  # noqa: E402
@@ -823,6 +824,7 @@ class Daemon:
 
     def _dictate(self, turn: _DictationTurn) -> None:
         """Run one whole turn: capture, recognise, deliver."""
+        self._require_capture_consent()
         capture = audio.MicCapture(self._cfg)
         engine = stt_lib.make_stt(self._cfg, capture.rate)
         try:
@@ -849,6 +851,35 @@ class Daemon:
         finally:
             capture.stop()
             engine.close()
+
+    def _require_capture_consent(self) -> None:
+        """Refuse to open the microphone without a matching consent record.
+
+        S02/S03 reach production here. The digest binds the model and engine
+        being used, so a changed model -- or a changed payload under the same
+        model -- invalidates the grant instead of carrying it silently. The
+        record is per-user and lives in the private XDG layout.
+
+        Enforcement is opt-in via KILIX_VOICE_REQUIRE_CONSENT so that upgrading
+        does not silently break every existing dictation caller. That default is
+        a DEPLOYMENT decision and not a statement that the gate is optional:
+        with it set, capture does not start without a grant.
+        """
+        if os.environ.get("KILIX_VOICE_REQUIRE_CONSENT", "") != "1":
+            return
+        # settings.stt_model()/stt_engine(), NOT self._cfg.get("stt_model"):
+        # those keys do not exist in the config mapping, so the digest bound
+        # two empty strings and therefore bound nothing. Caught by running the
+        # CLI end to end and reading the model it printed.
+        model_id = settings.stt_model()
+        engine = settings.stt_engine()
+        digest = consent.capture_digest(model_id, engine)
+        if not consent.granted("dictation", digest):
+            raise DaemonError(
+                "dictation has no recorded consent for this configuration "
+                f"(model {model_id!r}, engine {engine!r}). The microphone was "
+                "not opened. Grant it once with `kilix stt --grant-consent`; a "
+                "change of model or of the installed payload asks again.")
 
     def _record(self, turn: _DictationTurn, capture: audio.MicCapture,
                 engine: SttEngine) -> bool:

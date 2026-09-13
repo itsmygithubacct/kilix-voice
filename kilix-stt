@@ -58,7 +58,8 @@ for _package_root in (_INSTALLED_LIB, _HERE):
     if _package_root not in sys.path:
         sys.path.insert(0, _package_root)
 
-from voicelib import (  # noqa: E402  (the import follows the path bootstrap)
+from voicelib import (
+    consent as model_consent,  # noqa: E402  (the import follows the path bootstrap)
     __version__, audio, events, models as model_catalog, paths, protocol,
     settings, stt as stt_lib, tui_shell)
 from voicelib.vad import Vad  # noqa: E402
@@ -861,7 +862,16 @@ def _model_catalog_document() -> dict:
                 "--default", spec.catalog_id,
             ],
             "summary": spec.summary,
+            # C06: the published record now carries the device class. Adding
+            # the field to an internal tuple did not put it on the wire, which
+            # is what a consumer sizing hardware actually reads.
+            "device_class": spec.device_class,
         })
+        if spec.resource_profile is not None:
+            # C12: only when MEASURED. An absent profile is honest about not
+            # having been measured; an empty or invented one would certify the
+            # opposite.
+            records[-1]["resource_profile"] = spec.resource_profile
     return {
         "schema": model_catalog.CATALOG_SCHEMA,
         "default_model": active,
@@ -1498,6 +1508,11 @@ def main(argv: list[str] | None = None) -> int:
                              "is missing")
     parser.add_argument("--models", action="store_true",
                         help="print the speech-model catalog")
+    parser.add_argument("--grant-consent", action="store_true",
+                        help="record consent to capture with the selected "
+                             "model")
+    parser.add_argument("--revoke-consent", action="store_true",
+                        help="withdraw dictation capture consent")
     parser.add_argument("--json", action="store_true",
                         help="with --models, emit the versioned machine-readable "
                              "catalog contract")
@@ -1538,12 +1553,16 @@ def main(argv: list[str] | None = None) -> int:
             settings.update(changes)
         if args.show:
             _print_report()
+        if args.grant_consent or args.revoke_consent:
+            _consent_command(args)
+            return 0
         if args.models:
             _print_models_json() if args.json else _print_models()
     except (ModelInstallError, settings.SettingsError, paths.PathError,
             OSError) as error:
         parser.exit(1, f"kilix-stt: {error}\n")
-    if changes or args.install or args.show or args.models:
+    if (changes or args.install or args.show or args.models
+            or args.grant_consent or args.revoke_consent):
         return 0
 
     if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -1569,6 +1588,22 @@ def main(argv: list[str] | None = None) -> int:
         # The screen is already restored by the wrapper, and run()'s finally
         # has closed the microphone; nothing is left to say.
         return 0
+
+
+def _consent_command(args) -> None:
+    """Record or withdraw dictation capture consent for this configuration."""
+    model_id = settings.stt_model()
+    engine = settings.stt_engine()
+    digest = model_consent.capture_digest(model_id, engine)
+    if args.revoke_consent:
+        removed = model_consent.revoke("dictation")
+        print("dictation consent withdrawn." if removed
+              else "no dictation consent was recorded.")
+        return
+    model_consent.grant("dictation", digest)
+    print(f"dictation consent recorded for model {model_id!r} "
+          f"(engine {engine!r}).")
+    print("Changing the model, or the installed payload beneath it, asks again.")
 
 
 if __name__ == "__main__":

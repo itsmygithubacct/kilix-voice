@@ -141,3 +141,67 @@ class RuntimeAudioAndTranscriptTestCase(unittest.TestCase):
         self.assertEqual(p["segment"], f["segment"])
         self.assertIs(p["stable"], False)
         self.assertIs(f["stable"], True)
+
+
+class CaptureConsentGateTestCase(unittest.TestCase):
+    """Finding 2: consent must have a PRODUCTION caller on the capture path."""
+
+    def setUp(self) -> None:
+        import shutil, tempfile
+        self.home = os.path.realpath(tempfile.mkdtemp(prefix="f104-gate-"))
+        self.env = mock.patch.dict(
+            os.environ, {"HOME": self.home, "KILIX_VOICE_REQUIRE_CONSENT": "1"},
+            clear=True)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.daemon = object.__new__(voiced.Daemon)
+        self.daemon._cfg = {}
+
+    def _digest(self):
+        from voicelib import consent, settings
+        return consent.capture_digest(settings.stt_model(), settings.stt_engine())
+
+    def test_without_a_grant_the_microphone_is_not_opened(self) -> None:
+        with self.assertRaises(voiced.DaemonError) as caught:
+            voiced.Daemon._require_capture_consent(self.daemon)
+        self.assertIn("no recorded consent", str(caught.exception))
+
+    def test_with_a_grant_capture_proceeds(self) -> None:        # positive control
+        from voicelib import consent
+        consent.grant("dictation", self._digest())
+        voiced.Daemon._require_capture_consent(self.daemon)      # must not raise
+
+    def test_a_grant_for_another_configuration_does_not_authorise_this_one(self) -> None:
+        # S03 at the gate. Written as "grant a DIFFERENT digest" rather than
+        # "patch the model": patching settings depends on module-attribute
+        # visibility that other tests in the process can perturb, and a test
+        # that silently becomes a no-op is worse than none. The assertion below
+        # proves the two digests really differ before anything is concluded.
+        from voicelib import consent
+        other = consent.capture_digest("some-other-model", "vosk")
+        self.assertNotEqual(other, self._digest())
+        consent.grant("dictation", other)
+        with self.assertRaises(voiced.DaemonError) as caught:
+            voiced.Daemon._require_capture_consent(self.daemon)
+        self.assertIn("no recorded consent", str(caught.exception))
+
+    def test_a_changed_payload_digest_invalidates(self) -> None:
+        # S03 again, at the level the digest is built: the same model with a
+        # changed installed payload is not what was agreed to.
+        from voicelib import consent
+        before = consent.capture_digest("m", "vosk", "")
+        after = consent.capture_digest("m", "vosk", "a" * 64)
+        self.assertNotEqual(before, after)
+
+    def test_the_gate_is_reached_from_dictate(self) -> None:
+        # The point of the finding: the helper existed and nothing called it.
+        source = open(os.path.join(ROOT, "kilix-voiced")).read()
+        body = source[source.index("def _dictate(self"):]
+        self.assertIn("self._require_capture_consent()",
+                      body[:body.index("def _require_capture_consent")])
+
+    def test_the_gate_is_off_unless_explicitly_required(self) -> None:
+        # Deployment default: upgrading must not silently break existing callers.
+        with mock.patch.dict(os.environ, {"HOME": self.home}, clear=True):
+            voiced.Daemon._require_capture_consent(self.daemon)  # must not raise

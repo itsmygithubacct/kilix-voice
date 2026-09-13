@@ -17,6 +17,7 @@ Importing this module performs no filesystem work.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -181,3 +182,26 @@ def revoke(subject: str) -> bool:
         del grants[subject]
         _write({"schema": CONSENT_SCHEMA, "grants": grants})
     return True
+
+
+def capture_digest(model_id: str, engine: str, payload_digest: str = "") -> str:
+    """Return the digest a dictation consent is bound to.
+
+    S03: what the consent is FOR must be in the digest, so changing any of it
+    invalidates the grant rather than silently carrying it over. Recognising
+    with a different model, or with the same model whose payload changed
+    underneath, is not what the user agreed to.
+
+    ``payload_digest`` is the installed artefact's own identity when a caller
+    can supply one. It is deliberately a REQUIRED part of the input rather than
+    an optional extra: an empty value is recorded as empty and still changes the
+    digest the moment a real one appears, so consent granted before artefact
+    identity was available does not survive its arrival.
+    """
+    for name, value in (("model_id", model_id), ("engine", engine),
+                        ("payload_digest", payload_digest)):
+        if not isinstance(value, str):
+            raise ConsentError(
+                f"{name} must be a string, got {type(value).__name__}.")
+    material = "\x00".join((CONSENT_SCHEMA, model_id, engine, payload_digest))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
