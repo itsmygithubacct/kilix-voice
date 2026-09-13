@@ -510,6 +510,29 @@ class ResourceProfileTestCase(unittest.TestCase):
         self.assertFalse(resources.fits(profile, available_vram_mib=2048,
                                         available_ram_mib=46000))
 
+    def test_a_lone_demand_still_needs_its_own_headroom(self) -> None:
+        # Found by independent review: a profile measuring only model_bytes
+        # returned True with NO headroom supplied at all, contradicting the
+        # documented "absent headroom is unknown".
+        cpu_only_disk = {
+            "schema": resources.RESOURCE_SCHEMA,
+            "device_class": resources.DEVICE_CPU,
+            "measured": {"host": "h", "date": "2026-09-13", "model_bytes": 10},
+        }
+        self.assertFalse(resources.fits(cpu_only_disk))
+        self.assertFalse(resources.fits(cpu_only_disk, available_vram_mib=99))
+        self.assertTrue(resources.fits(cpu_only_disk, available_disk_bytes=10))
+        self.assertFalse(resources.fits(cpu_only_disk, available_disk_bytes=9))
+
+    def test_malformed_headroom_is_refused_not_certified(self) -> None:
+        # NaN in particular makes every comparison false, which reads as "fits".
+        profile = self._p()
+        for bad in (float("nan"), float("inf"), "lots", True, -1, 1.5):
+            with self.subTest(headroom=bad):
+                with self.assertRaises(resources.ResourceError):
+                    resources.fits(profile, available_vram_mib=bad,
+                                   available_ram_mib=46000)
+
     def test_pleon_measurements_fit_its_measured_headroom(self) -> None:
         # The figures actually measured on pleon under the H2 fixture.
         self.assertTrue(resources.fits(self._p(), available_vram_mib=8192,

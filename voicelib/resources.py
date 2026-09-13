@@ -99,23 +99,60 @@ def validate(profile: object) -> dict:
     return dict(profile)
 
 
-def fits(profile: dict, *, available_vram_mib: int | None = None,
-         available_ram_mib: int | None = None) -> bool:
-    """Return whether measured demand fits the stated headroom.
+# Every measured demand maps to the headroom that must cover it. Adding a
+# measured figure without adding its headroom here makes fits() return False
+# rather than silently ignoring the new demand -- unknown, not satisfied.
+_DEMAND_TO_HEADROOM = {
+    "peak_vram_mib": "available_vram_mib",
+    "peak_ram_mib": "available_ram_mib",
+    "model_bytes": "available_disk_bytes",
+}
 
-    Absent headroom is UNKNOWN, not infinite: a caller that cannot measure its
-    own device gets False rather than an optimistic True.
+
+def _headroom(name: str, value: object) -> int | None:
+    """Return a validated headroom figure, or None when not supplied."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        # floats included on purpose: NaN and inf are not headroom, and NaN in
+        # particular makes every comparison false, which reads as "fits".
+        raise ResourceError(
+            f"{name} must be a non-negative integer or None, got {value!r}.")
+    if value < 0:
+        raise ResourceError(f"{name} must not be negative, got {value}.")
+    return value
+
+
+def fits(profile: dict, *, available_vram_mib: int | None = None,
+         available_ram_mib: int | None = None,
+         available_disk_bytes: int | None = None) -> bool:
+    """Return whether EVERY measured demand is covered by supplied headroom.
+
+    Absent headroom is UNKNOWN, not infinite. If the profile measured a demand
+    and the caller did not supply the matching headroom, the answer is False --
+    a caller that cannot measure its own device gets a refusal, not an
+    optimistic yes.
+
+    An earlier revision checked only the demands the profile happened to carry
+    against only the headroom the caller happened to pass, so a profile
+    measuring just model_bytes returned True with nothing supplied at all. That
+    contradicted this docstring; an independent review caught it.
     """
     checked = validate(profile)
+    supplied = {
+        "available_vram_mib": _headroom("available_vram_mib", available_vram_mib),
+        "available_ram_mib": _headroom("available_ram_mib", available_ram_mib),
+        "available_disk_bytes": _headroom("available_disk_bytes", available_disk_bytes),
+    }
     measured = checked["measured"]
-    if checked["device_class"] != DEVICE_CPU:
-        if available_vram_mib is None:
+    demands = {k: v for k, v in measured.items() if k in _DEMAND_TO_HEADROOM}
+    if not demands:                      # validate() forbids this, belt and braces
+        return False
+    for demand, value in demands.items():
+        name = _DEMAND_TO_HEADROOM[demand]
+        headroom = supplied[name]
+        if headroom is None:             # unknown, never infinite
             return False
-        if measured["peak_vram_mib"] > available_vram_mib:
-            return False
-    if "peak_ram_mib" in measured:
-        if available_ram_mib is None:
-            return False
-        if measured["peak_ram_mib"] > available_ram_mib:
+        if value > headroom:
             return False
     return True
