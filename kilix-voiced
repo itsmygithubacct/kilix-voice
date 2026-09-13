@@ -715,7 +715,8 @@ class Daemon:
             # precisely what it is: too-large, or unsupported for an unknown
             # op or an incompatible protocol major.
             return protocol.reply_error(
-                str(error), _carried_code(error, protocol.ERR_MALFORMED))
+                str(error), _carried_code(error, protocol.ERR_MALFORMED),
+                **(getattr(error, "fields", None) or {}))
         except Exception as error:
             # decode and validate_request are meant to raise only
             # ProtocolError for anything a caller sends. Three payloads proved
@@ -1382,7 +1383,10 @@ class Daemon:
             speech_error = self._speech_error
             speech_error_serial = self._speech_error_serial
         payload = {
+            # `version` is the PACKAGE release and stays for the chrome that
+            # shows it; `protocol` is the wire contract a client checks.
             "version": __version__,
+            "protocol": protocol.protocol_identity(),
             "pid": os.getpid(),
             "session": self._session_dir,
             "socket": self._socket_path,

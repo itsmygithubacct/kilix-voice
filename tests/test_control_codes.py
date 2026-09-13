@@ -310,5 +310,54 @@ class ValidationRefusalCodesTestCase(_ControlFixture):
             protocol.ProtocolError("x", code="oops")
 
 
+def _load_tool(name, filename):
+    spec = importlib.util.spec_from_loader(
+        name, importlib.machinery.SourceFileLoader(name, os.path.join(ROOT, filename)))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class FirstPartyClientsDeclareTheirVersionTestCase(unittest.TestCase):
+    """The daemon's own tools say which contract they were written against."""
+
+    def test_kilix_tts_declares_v_on_status_and_stop(self) -> None:
+        tool = _load_tool("kilix_tts_codes", "kilix-tts")
+        sent = []
+
+        def control(request, *args, **kwargs):
+            sent.append(request)
+            if request["op"] == protocol.OP_STATUS:
+                raise RuntimeError("captured")
+            return {"ok": True, "stopped": True}
+
+        with mock.patch.object(tool, "control", control):
+            with self.assertRaises(RuntimeError):
+                tool.probe()
+            tool.stop_speech()
+            tool._compensate_speech()
+        self.assertEqual([r["op"] for r in sent],
+                         [protocol.OP_STATUS, protocol.OP_STOP_SPEECH,
+                          protocol.OP_STOP_SPEECH])
+        for request in sent:
+            self.assertEqual(request["v"], protocol.PROTOCOL_VERSION)
+
+    def test_kilix_stt_declares_v_on_status(self) -> None:
+        tool = _load_tool("kilix_stt_codes", "kilix-stt")
+        sent = []
+
+        class Endpoint:
+            def __init__(self, *a, **k): pass
+            def settimeout(self, timeout): pass
+            def connect(self, path): pass
+            def send(self, data): sent.append(protocol.decode(data)); return len(data)
+            def recv(self, size): return protocol.encode(protocol.reply_ok("", status={}))
+            def close(self): pass
+
+        with mock.patch.object(tool.socket, "socket", Endpoint):
+            self.assertEqual(tool.daemon_status(), {})
+        self.assertEqual([r["v"] for r in sent], [protocol.PROTOCOL_VERSION])
+
+
 if __name__ == "__main__":
     unittest.main()

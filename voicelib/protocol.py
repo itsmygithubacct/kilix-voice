@@ -36,9 +36,24 @@ OPS = (OP_SPEAK, OP_STOP_SPEECH, OP_DICTATE, OP_STOP_DICTATION, OP_STATUS)
 # reinterpreted.
 PROTOCOL_SCHEMA = "kilix.voice.protocol/v1"
 PROTOCOL_MAJOR = 1
-PROTOCOL_MINOR = 1
+# Minor 2 adds only optional fields, which is what a minor may do: status and
+# the unsupported refusal carry `protocol`, and refusal codes other than
+# `internal` are now actually sent. A minor-1 client parses every reply it
+# understood before.
+PROTOCOL_MINOR = 2
 PROTOCOL_VERSION = f"{PROTOCOL_MAJOR}.{PROTOCOL_MINOR}"
 _VERSION_TOKEN = re.compile(r"^(\d{1,3})(?:\.(\d{1,3}))?$")
+
+
+def protocol_identity() -> dict:
+    """Return the wire contract this module speaks, as a caller can read it.
+
+    Without this a client learned the daemon's protocol major only from the
+    prose of a refusal: status reported the PACKAGE version and nothing named
+    the protocol at all.
+    """
+    return {"schema": PROTOCOL_SCHEMA, "version": PROTOCOL_VERSION,
+            "major": PROTOCOL_MAJOR, "minor": PROTOCOL_MINOR}
 
 MAX_ID_CHARS = 64
 # AF_UNIX/SOCK_SEQPACKET has a platform message ceiling below the daemon's old
@@ -128,8 +143,13 @@ class ProtocolError(ValueError):
     """
 
     code: str | None = None
+    # Extra fields for the refusal reply, e.g. the protocol identity on an
+    # incompatible-major refusal. None on the base, for the same reason as
+    # `code`: only a raise site that knows what to add adds it.
+    fields: dict | None = None
 
-    def __init__(self, message: str = "", *, code: str | None = None) -> None:
+    def __init__(self, message: str = "", *, code: str | None = None,
+                 fields: dict | None = None) -> None:
         super().__init__(message)
         if code is not None:
             if code not in ERROR_CODES:
@@ -137,6 +157,8 @@ class ProtocolError(ValueError):
                     f"unknown error code {code!r}. Use one of: "
                     f"{', '.join(ERROR_CODES)}.")
             self.code = code
+        if fields is not None:
+            self.fields = dict(fields)
 
 
 class MessageTooLarge(ProtocolError):
@@ -423,7 +445,10 @@ def _protocol_version(raw: object) -> str:
             f"{PROTOCOL_SCHEMA} (major {PROTOCOL_MAJOR}, current "
             f"{PROTOCOL_VERSION}). A different major means a request shape "
             "changed meaning; upgrade the client rather than retrying.",
-            code=ERR_UNSUPPORTED)
+            code=ERR_UNSUPPORTED,
+            # The refusal names what the daemon DOES speak as data, so a
+            # client can choose without parsing the sentence above.
+            fields={"protocol": protocol_identity()})
     return text
 
 
@@ -530,19 +555,31 @@ def reply_ok(request_id: str = "", **fields: object) -> dict:
     return reply
 
 
-def reply_error(message: str, code: str = ERR_INTERNAL) -> dict:
+def reply_error(message: str, code: str = ERR_INTERNAL,
+                **fields: object) -> dict:
     """Return a failure reply carrying a code from the closed set.
 
     ``message`` is prose for a human and may be reworded freely; ``code`` is the
     contract a caller may branch on.  An unknown code is refused rather than
     forwarded, so the vocabulary cannot drift open one caller at a time.
+
+    ``fields`` add optional data to the refusal. They may not replace the three
+    keys that make it a refusal: an extra ``ok`` could turn it into a success.
+    ``code`` cannot arrive here, because it is the parameter above.
     """
     if code not in ERROR_CODES:
         raise ProtocolError(
             f"unknown error code {code!r}. Use one of: "
             f"{', '.join(ERROR_CODES)}.")
-    return {"ok": False, "error": _cut_prose(message, MAX_ERROR_PROSE_CHARS),
-            "code": code}
+    clash = sorted({"ok", "error", "code"} & set(fields))
+    if clash:
+        raise ProtocolError(
+            f"reply_error fields may not replace {', '.join(clash)}; those keys "
+            "are what make the reply a refusal.")
+    reply = {"ok": False, "error": _cut_prose(message, MAX_ERROR_PROSE_CHARS),
+             "code": code}
+    reply.update(fields)
+    return reply
 
 
 def check_audio_bytes(length: int, *, embedded: bool = False) -> int:

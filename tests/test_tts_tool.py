@@ -60,8 +60,12 @@ class TtsToolTests(unittest.TestCase):
             ])
 
         self.assertEqual(result, 0)
+        # CORRECTED (protocol identity): this pinned the request without `v`.
+        # kilix-tts now declares the wire contract it was written against, so
+        # a daemon of a different major refuses it rather than guessing; the
+        # pin records that the declaration is sent.
         control.assert_called_once_with({
-            "op": "speak", "id": "kilix-tts",
+            "op": "speak", "id": "kilix-tts", "v": protocol.PROTOCOL_VERSION,
             "text": "Kilix can say this exact text.",
             "model": "mbrola", "voice": "us1", "rate": 200,
         })

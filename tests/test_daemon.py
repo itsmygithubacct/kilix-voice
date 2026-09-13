@@ -176,6 +176,20 @@ class DaemonTestCase(unittest.TestCase):
         self.assertEqual(status["speech_error"], "")
         self.assertEqual(status["speech_error_serial"], 0)
 
+    def test_status_advertises_the_protocol_it_speaks(self) -> None:
+        status = self.request({"op": "status"})["status"]
+        self.assertEqual(status["protocol"], {
+            "schema": "kilix.voice.protocol/v1", "version": "1.2",
+            "major": 1, "minor": 2})
+
+    def test_an_incompatible_major_is_refused_naming_the_protocol(self) -> None:
+        reply = self.request({"op": "status", "v": "2"})
+        self.assertIs(reply["ok"], False, reply)
+        self.assertEqual(reply["code"], "unsupported", reply)
+        self.assertEqual(reply["protocol"]["major"], 1, reply)
+        # An older minor of the same major is still served.
+        self.assertTrue(self.request({"op": "status", "v": "1.1"})["ok"])
+
     def test_status_reports_every_missing_dependency(self) -> None:
         status = self.request({"op": "status"})["status"]
         for part in ("tts", "stt", "capture", "playback"):

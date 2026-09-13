@@ -509,6 +509,15 @@ class ReplyTestCase(unittest.TestCase):
         self.assertIn("apt install", reply["error"])
         self.assertEqual(protocol.decode(protocol.encode(reply)), reply)
 
+    def test_error_fields_cannot_replace_what_makes_it_a_refusal(self) -> None:
+        for clash in ({"ok": True}, {"error": "fine"}):
+            with self.subTest(clash=clash):
+                with self.assertRaises(protocol.ProtocolError):
+                    protocol.reply_error("x", "busy", **clash)
+        reply = protocol.reply_error("x", "busy", protocol={"major": 1})
+        self.assertEqual(reply, {"ok": False, "error": "x", "code": "busy",
+                                 "protocol": {"major": 1}})
+
     def test_error_prose_is_capped_at_construction(self) -> None:
         limit = protocol.MAX_ERROR_PROSE_CHARS + len(" …[truncated]")
         self.assertLessEqual(len(protocol.reply_error("x" * 10_000)["error"]), limit)

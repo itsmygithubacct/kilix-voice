@@ -353,7 +353,8 @@ def _local_status(daemon_ok: bool, daemon_detail: str) -> Status:
 def probe(timeout: float = PROBE_TIMEOUT_S) -> Status:
     """Ask the daemon what it can do; fall back to inspecting this machine."""
     try:
-        reply = control({"op": protocol.OP_STATUS, "id": "kilix-tts"}, timeout)
+        reply = control({"op": protocol.OP_STATUS, "id": "kilix-tts",
+                         "v": protocol.PROTOCOL_VERSION}, timeout)
     except VoiceToolError as error:
         return _local_status(False, _one_line(error))
     payload = reply.get("status")
@@ -392,8 +393,10 @@ def _speech_request(text: str, *, model: str | None = None,
     """Validate one bounded arbitrary-text request for playback or export."""
     if not isinstance(text, str) or not text.strip():
         raise VoiceToolError("nothing to read aloud: speech text is empty")
+    # `v` declares the wire contract this tool was written against, so a
+    # daemon of a different major refuses it instead of guessing.
     request: dict = {"op": protocol.OP_SPEAK, "text": text,
-                     "id": "kilix-tts"}
+                     "id": "kilix-tts", "v": protocol.PROTOCOL_VERSION}
     requested = {"model": model, "voice": voice, "rate": rate}
     request.update({key: value for key, value in requested.items()
                     if value is not None})
@@ -599,7 +602,8 @@ def save_text(text: str, output: str, *, model: str | None = None,
 def _compensate_speech() -> bool:
     """Best-effort stop after a speak whose exact acceptance is unknown."""
     try:
-        control({"op": protocol.OP_STOP_SPEECH, "id": "kilix-tts"})
+        control({"op": protocol.OP_STOP_SPEECH, "id": "kilix-tts",
+                     "v": protocol.PROTOCOL_VERSION})
     except VoiceToolError:
         return False
     return True
@@ -607,7 +611,8 @@ def _compensate_speech() -> bool:
 
 def stop_speech() -> str:
     """Ask the daemon to silence the speakers; return what happened."""
-    reply = control({"op": protocol.OP_STOP_SPEECH, "id": "kilix-tts"})
+    reply = control({"op": protocol.OP_STOP_SPEECH, "id": "kilix-tts",
+                     "v": protocol.PROTOCOL_VERSION})
     return "Stopped." if reply.get("stopped") else "Nothing was speaking."
 
 

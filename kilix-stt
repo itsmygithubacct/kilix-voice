@@ -370,7 +370,8 @@ def daemon_status(timeout: float = DAEMON_TIMEOUT_S) -> dict | None:
         endpoint.settimeout(timeout)
         endpoint.connect(paths.control_socket())
         endpoint.send(protocol.encode({"op": protocol.OP_STATUS,
-                                       "id": "kilix-stt"}))
+                                       "id": "kilix-stt",
+                                       "v": protocol.PROTOCOL_VERSION}))
         reply = protocol.decode(endpoint.recv(MAX_STATUS_BYTES))
     except (OSError, protocol.ProtocolError):
         return None
