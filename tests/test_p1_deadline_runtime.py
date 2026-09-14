@@ -680,6 +680,26 @@ class StreamedSynthesisTestCase(unittest.TestCase):
         self.assertEqual([(c["model"], c["voice"]) for c in sent],
                          [("espeak", "v1"), ("espeak", "v2")])
 
+    def test_the_descriptor_carries_the_engines_seed_and_settings(self) -> None:
+        # AUD-05 / V24 A14: a real engine's integer seed and its closed
+        # settings reach the descriptor -- the rate it was given, and whether
+        # the seed was consumed and the output is reproducible.
+        import tempfile
+        global sent; sent = []
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self._fallback_engine(tmp)
+            turn = voiced._SpeechTurn("speak-9", ["one"], engine)
+            turn.receiver = mock.Mock()
+            daemon = self._daemon(); daemon._speech = turn
+            clip = voiced.Daemon._synth(daemon, turn, "one")
+            pcm, rate = clip
+            voiced.Daemon._play_if_current(daemon, turn, mock.Mock(), pcm, rate,
+                                           clip.provenance)
+        self.assertEqual(sent[0]["seed"], 0)
+        self.assertEqual(sent[0]["settings"], {"turn": "speak-9", "rate_wpm": 170,
+                                               "seed_consumed": False,
+                                               "reproducible": True})
+
     def test_speak_validates_the_chunk_socket_inside_the_session(self) -> None:
         from voicelib import protocol
         import tempfile

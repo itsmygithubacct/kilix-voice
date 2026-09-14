@@ -1058,9 +1058,14 @@ class Daemon:
                 ordinal, pcm_bytes=len(pcm), sample_rate=rate,
                 voice=prov.voice,
                 model=prov.model,
-                seed=getattr(engine, "seed", None),
+                # A14: always an integer seed and the settings the engine was
+                # actually given, from its own record. seed_consumed and
+                # reproducible say whether that seed means anything.
+                seed=prov.seed,
                 final=final, turn=turn.id,
-                rate_wpm=getattr(engine, "rate", None))
+                rate_wpm=prov.rate_wpm,
+                seed_consumed=prov.seed_consumed,
+                reproducible=prov.reproducible)
             # Inside the guard: _send refuses a datagram over MAX_REPLY_BYTES,
             # and a descriptor too large to deliver must not take the audio
             # down any more than a malformed one may.

@@ -769,5 +769,50 @@ def synthesis_chunk(sequence: int, *, pcm_bytes: int, sample_rate: int,
     if seed is not None:
         chunk["seed"] = seed
     if settings:
-        chunk["settings"] = dict(settings)
+        chunk["settings"] = _synthesis_settings(settings)
+    size = len(encode(chunk))
+    if size > MAX_SYNTHESIS_DESCRIPTOR_BYTES:
+        raise ProtocolError(
+            f"chunk descriptor is {size} bytes; the limit is "
+            f"{MAX_SYNTHESIS_DESCRIPTOR_BYTES}. A descriptor carries provenance "
+            "and length, never payload.")
     return chunk
+
+
+# A14: the settings a chunk descriptor may carry, as a CLOSED vocabulary with a
+# type and a range for each. Keyword arguments used to pass straight through,
+# so a 150,000-character string or a nested object was accepted and then made
+# the descriptor too large to send. A descriptor is also bounded as a whole,
+# far below any client's receive buffer.
+SYNTHESIS_SETTING_KEYS = ("turn", "rate_wpm", "seed_consumed", "reproducible")
+MAX_SYNTHESIS_DESCRIPTOR_BYTES = 2048
+MAX_SYNTHESIS_RATE_WPM = 1000
+# A job id as the daemon issues them: speak-N, listen-N, ingest-N.
+_JOB_ID = re.compile(r"^(speak|listen|ingest)-[1-9][0-9]{0,11}$")
+
+
+def _synthesis_settings(raw: dict) -> dict:
+    """Return the settings of one descriptor, or raise on any key or value."""
+    settings: dict = {}
+    for key, value in raw.items():
+        if key not in SYNTHESIS_SETTING_KEYS:
+            raise ProtocolError(
+                f"unknown synthesis setting {_echo(key)}. A chunk descriptor "
+                f"carries only: {', '.join(SYNTHESIS_SETTING_KEYS)}.")
+        if key == "turn":
+            if not isinstance(value, str) or not _JOB_ID.fullmatch(value):
+                raise ProtocolError(
+                    f"synthesis setting 'turn' must be a job id such as "
+                    f"'speak-1', got {_echo(value)}.")
+        elif key == "rate_wpm":
+            if (not isinstance(value, int) or isinstance(value, bool)
+                    or not 0 <= value <= MAX_SYNTHESIS_RATE_WPM):
+                raise ProtocolError(
+                    f"synthesis setting 'rate_wpm' must be an integer from 0 "
+                    f"to {MAX_SYNTHESIS_RATE_WPM}, got {_echo(value)}.")
+        elif not isinstance(value, bool):
+            raise ProtocolError(
+                f"synthesis setting {key!r} must be true or false, got "
+                f"{_echo(value)}.")
+        settings[key] = value
+    return settings

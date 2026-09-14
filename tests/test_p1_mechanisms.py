@@ -558,14 +558,54 @@ class SynthesisChunkTestCase(unittest.TestCase):
         return protocol.synthesis_chunk(**kw)
 
     def test_a_chunk_carries_sequence_provenance_and_bounds(self) -> None:
-        chunk = self._chunk(seed=7, temperature=0.0)
+        # Was temperature=0.0. No engine applies a temperature, and AUD-05
+        # closes the settings vocabulary, so an invented key is now refused
+        # (test_unknown_setting_refused). rate_wpm is a setting the engines
+        # really are given.
+        chunk = self._chunk(seed=7, rate_wpm=170)
         self.assertEqual(chunk["sequence"], 0)
         self.assertEqual(chunk["voice"], "en-us")
         self.assertEqual(chunk["model"], "piper-en-us-kristin-medium")
         self.assertEqual(chunk["seed"], 7)
-        self.assertEqual(chunk["settings"], {"temperature": 0.0})
+        self.assertEqual(chunk["settings"], {"rate_wpm": 170})
         self.assertIs(chunk["final"], False)
         self.assertEqual(protocol.decode(protocol.encode(chunk)), chunk)
+
+    def test_every_setting_in_the_vocabulary_is_accepted(self) -> None:   # control
+        chunk = self._chunk(seed=0, turn="speak-12", rate_wpm=0,
+                            seed_consumed=False, reproducible=True)
+        self.assertEqual(chunk["settings"], {"turn": "speak-12", "rate_wpm": 0,
+                                             "seed_consumed": False,
+                                             "reproducible": True})
+        self._chunk(turn="listen-1", rate_wpm=protocol.MAX_SYNTHESIS_RATE_WPM)
+        self._chunk(turn="ingest-999999999999")
+
+    def test_unknown_setting_refused(self) -> None:
+        # A true/false value is what the type check alone would accept, so the
+        # bool-valued keys are the ones only the vocabulary check refuses.
+        for extra in ({"temperature": 0.0}, {"noise_scale": 0.667},
+                      {"model_path": "/models/x"}, {"Turn": "speak-1"},
+                      {"deterministic": True}, {"stable": False}):
+            with self.subTest(extra=extra):
+                with self.assertRaises(protocol.ProtocolError) as caught:
+                    self._chunk(**extra)
+                self.assertIn("unknown synthesis setting", str(caught.exception))
+
+    def test_nested_or_oversized_setting_refused(self) -> None:
+        for bad in ({"turn": "speak-1" * 500}, {"turn": {"id": "speak-1"}},
+                    {"turn": "speak-0"}, {"turn": "shell-1"},
+                    {"rate_wpm": True}, {"rate_wpm": 1001}, {"rate_wpm": -1},
+                    {"rate_wpm": 170.0}, {"reproducible": "yes"},
+                    {"seed_consumed": 0}, {"reproducible": None}):
+            with self.subTest(bad=bad):
+                with self.assertRaises(protocol.ProtocolError):
+                    self._chunk(**bad)
+
+    def test_descriptor_byte_ceiling(self) -> None:
+        self._chunk(model="m" * 1800)                        # still under 2048
+        with self.assertRaises(protocol.ProtocolError) as caught:
+            self._chunk(model="m" * (protocol.MAX_SYNTHESIS_DESCRIPTOR_BYTES + 1))
+        self.assertIn(str(protocol.MAX_SYNTHESIS_DESCRIPTOR_BYTES), str(caught.exception))
 
     def test_samples_never_ride_in_the_json(self) -> None:      # A07
         chunk = self._chunk()

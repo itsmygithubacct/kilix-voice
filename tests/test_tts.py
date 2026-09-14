@@ -567,6 +567,42 @@ class Provenance(unittest.TestCase):
         engine.synth("anything")
         self.assertEqual(self.family_and_voice(engine), ("off", "none"))
 
+    def test_seed_fields_per_engine(self) -> None:
+        # A14: every real engine returns an integer seed and says honestly
+        # whether it means anything. None of these engines takes a seed.
+        # espeak-ng and silence have no stochastic stage; kilix-piper-tts
+        # leaves Piper's noise unseeded, so only Piper is not reproducible.
+        def fields(engine):
+            prov = engine.last_provenance
+            self.assertIsInstance(prov.seed, int)
+            self.assertNotIsInstance(prov.seed, bool)
+            return prov.seed, prov.seed_consumed, prov.reproducible, prov.rate_wpm
+
+        cmd = [sys.executable, "-I", self.script, "{voice}", "{rate}", self.log, "ok"]
+        espeak = tts.EspeakTts({"tts": {"cmd": cmd}}, voice="en-us", rate=200)
+        espeak.synth("hello")
+        self.assertEqual(fields(espeak), (0, False, True, 200))
+        # rate_wpm is the rate the synthesiser was really invoked with.
+        self.assertEqual([int(i["rate"]) for i in self.invocations()], [200])
+
+        mbrola = tts.EspeakTts({"tts": {"cmd": cmd}}, voice="en-us", rate=150,
+                               mbrola=True)
+        mbrola.synth("hello")
+        self.assertEqual(fields(mbrola), (0, False, True, 150))
+
+        null = tts.NullTts()
+        null.synth("anything")
+        self.assertEqual(fields(null), (0, False, True, 0))
+
+        provider = os.path.join(self.dir, "kilix-piper-tts")
+        with open(provider, "w", encoding="utf-8") as handle:
+            handle.write(_FAKE_PIPER)
+        os.chmod(provider, 0o755)
+        with mock.patch.dict(os.environ, {tts.PIPER_ENV_COMMAND: provider}):
+            piper = tts.PiperTts(rate=240)
+            piper.synth("hello")
+        self.assertEqual(fields(piper), (0, False, False, 240))
+
     def test_an_engine_that_records_nothing_is_described_from_its_attributes(self) -> None:
         class ThirdParty:
             model, voice, rate, seed = "m", "v1", 150, 3
@@ -578,6 +614,29 @@ class Provenance(unittest.TestCase):
                          tts.SynthesisProvenance("m", "v1", 3, False, False, 150))
         self.assertEqual(tts.clip_provenance(Odd()),
                          tts.SynthesisProvenance("unset", "unset", 0, False, False, 0))
+
+
+@unittest.skipUnless(os.environ.get("VOICE_TEST_REAL_ENGINES") == "1"
+                     and os.path.exists("/usr/bin/espeak-ng"),
+                     "opt-in: set VOICE_TEST_REAL_ENGINES=1 on a host with "
+                     "/usr/bin/espeak-ng")
+class RealEspeakReproducible(unittest.TestCase):
+    """The evidence behind EspeakTts reporting reproducible=True.
+
+    Not part of the hermetic suite, because it needs espeak-ng installed. Run
+    it on the release host. If it ever fails there, change the flag for
+    espeak rather than weakening this test.
+    """
+
+    def test_the_same_text_synthesises_to_identical_bytes(self) -> None:
+        cfg = {"tts": {"cmd": ["/usr/bin/espeak-ng", "-b", "1", "-v", "{voice}",
+                               "-s", "{rate}", "--stdout"]}}
+        engine = tts.EspeakTts(cfg, voice="en-us", rate=170)
+        first = engine.synth("The same sentence, spoken twice.")
+        second = engine.synth("The same sentence, spoken twice.")
+        self.assertTrue(first[0])
+        self.assertEqual(first, second)
+        self.assertIs(engine.last_provenance.reproducible, True)
 
 
 class EngineSelection(unittest.TestCase):

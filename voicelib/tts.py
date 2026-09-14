@@ -478,7 +478,11 @@ class NullTts:
     def synth(self, text: str, *,
               budget: float | None = None) -> tuple[bytes, int]:
         """Return an empty clip regardless of ``text``."""
-        self.last_provenance = SynthesisProvenance(self.model, "none")
+        # Silence has no stochastic stage: no seed is used, and the same
+        # request always renders the same (empty) clip.
+        self.last_provenance = SynthesisProvenance(
+            self.model, "none", seed=0, seed_consumed=False, reproducible=True,
+            rate_wpm=0)
         return b"", ESPEAK_SAMPLE_RATE
 
     def cancel(self) -> None:
@@ -669,7 +673,11 @@ class EspeakTts:
         # espeak and a failed mb- attempt records nothing.
         self.last_provenance = SynthesisProvenance(
             models.TTS_ENGINE_MBROLA if voice.startswith("mb-")
-            else models.TTS_ENGINE_ESPEAK, voice)
+            else models.TTS_ENGINE_ESPEAK, voice,
+            # A14: espeak-ng and mbrola have no stochastic stage, so no seed
+            # is used and identical input renders identical audio; the opt-in
+            # RealEspeakReproducible test is the evidence on a real engine.
+            seed=0, seed_consumed=False, reproducible=True, rate_wpm=self.rate)
         return clip
 
     def cancel(self) -> None:
@@ -789,6 +797,18 @@ class PiperTts:
         self._process: subprocess.Popen[bytes] | None = None
         self._cancelled = False
 
+    def _provenance(self) -> SynthesisProvenance:
+        """A13/A14 for a Piper clip.
+
+        The model and voice are fixed. kilix-piper-tts sets only the length
+        scale, so no seed reaches the model and its noise is unseeded: the
+        seed is reported, marked unconsumed, and the output is not claimed to
+        be reproducible.
+        """
+        return SynthesisProvenance(self.model, self.voice, seed=0,
+                                   seed_consumed=False, reproducible=False,
+                                   rate_wpm=self.rate)
+
     def check_available(self, *, budget: float | None = None) -> None:
         """Raise TtsError with the provider's own detail unless it is ready.
 
@@ -849,7 +869,7 @@ class PiperTts:
             cancelled = self._cancelled
         if cancelled:
             # The fixed model and voice were what ran; the clip is empty.
-            self.last_provenance = SynthesisProvenance(self.model, self.voice)
+            self.last_provenance = self._provenance()
             return b"", PIPER_SAMPLE_RATE
         if process.returncode != 0:
             raise TtsError(
@@ -858,7 +878,7 @@ class PiperTts:
             )
         if len(out) % 2:
             raise TtsError(f"{binary} returned an odd-length s16le PCM stream")
-        self.last_provenance = SynthesisProvenance(self.model, self.voice)
+        self.last_provenance = self._provenance()
         return out, PIPER_SAMPLE_RATE
 
     def cancel(self) -> None:
