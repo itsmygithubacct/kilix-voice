@@ -629,6 +629,120 @@ class SynthesisChunkTestCase(unittest.TestCase):
         self.assertIs(self._chunk(sequence=9, final=True)["final"], True)
 
 
+class EmbeddedAudioRefusal(unittest.TestCase):
+    """AUD-03 / V22 A07: large audio embedded in JSON is refused on every op.
+
+    It used to be dropped silently, and the op then ran. The measure is the
+    decoded length: V19's 3,244-byte WAV preview is 4,328 characters of
+    base64, and must still be accepted.
+    """
+
+    def setUp(self) -> None:
+        import shutil
+        import tempfile
+        self.session = os.path.realpath(tempfile.mkdtemp(prefix="kv-a07-"))
+        self.addCleanup(shutil.rmtree, self.session, True)
+
+    def validate(self, message: dict) -> dict:
+        return protocol.validate_request(message, self.session)
+
+    @staticmethod
+    def b64(size: int, encode=None) -> str:
+        import base64
+        data = bytes((i * 7 + 3) & 0xFF for i in range(size))
+        return (encode or base64.b64encode)(data).decode("ascii")
+
+    def test_each_key_over_limit_is_too_large_on_every_op(self) -> None:
+        over = self.b64(protocol.MAX_EMBEDDED_AUDIO_BYTES + 1)
+        for key in sorted(protocol.EMBEDDED_AUDIO_KEYS):
+            for op in protocol.OPS:
+                with self.subTest(key=key, op=op):
+                    with self.assertRaises(protocol.MessageTooLarge) as caught:
+                        self.validate({"op": op, key: over})
+                    self.assertEqual(caught.exception.code, protocol.ERR_TOO_LARGE)
+                    self.assertIn(repr(key), str(caught.exception))
+
+    def test_the_size_refusal_precedes_interpretation(self) -> None:
+        over = self.b64(protocol.MAX_EMBEDDED_AUDIO_BYTES + 1)
+        for message in ({"audio": over}, {"op": "nonsense", "pcm": over},
+                        {"op": "dictate", "wav": over}, {"op": 5, "samples": over}):
+            with self.subTest(message=sorted(message)):
+                with self.assertRaises(protocol.MessageTooLarge):
+                    self.validate(message)
+
+    def test_exact_limit_decoded_is_accepted_and_dropped(self) -> None:
+        at = self.b64(protocol.MAX_EMBEDDED_AUDIO_BYTES)
+        self.assertGreater(len(at), protocol.MAX_EMBEDDED_AUDIO_BYTES)  # not characters
+        self.assertEqual(self.validate({"op": "status", "audio": at}),
+                         {"op": "status", "id": ""})
+
+    def test_v19s_preview_wav_is_accepted_on_every_op(self) -> None:
+        import base64
+        from voicelib import util
+        wav = util.write_wav(bytes(3200), 16000)
+        preview = base64.b64encode(wav).decode("ascii")
+        self.assertEqual((len(wav), len(preview)), (3244, 4328))
+        bases = {"speak": {"text": "hi"},
+                 "dictate": {"sock": os.path.join(self.session, "dictate-1.sock")}}
+        for op in protocol.OPS:
+            with self.subTest(op=op):
+                request = self.validate(dict(bases.get(op, {}), op=op, audio=preview,
+                                             wav=preview, pcm=preview))
+                self.assertFalse({"audio", "wav", "pcm"} & set(request))
+
+    def test_url_safe_base64_is_measured_decoded_too(self) -> None:
+        import base64
+        at = self.b64(protocol.MAX_EMBEDDED_AUDIO_BYTES, base64.urlsafe_b64encode)
+        self.assertTrue({"-", "_"} & set(at))           # really the URL alphabet
+        self.assertNotIn("pcm", self.validate({"op": "status", "pcm": at}))
+        over = self.b64(protocol.MAX_EMBEDDED_AUDIO_BYTES + 1, base64.urlsafe_b64encode)
+        with self.assertRaises(protocol.MessageTooLarge):
+            self.validate({"op": "status", "pcm": over})
+
+    def test_non_base64_string_measured_in_utf8_bytes(self) -> None:
+        for text in ("é" * 4097, "é" * 2049):          # 2049 characters, 4098 bytes
+            with self.subTest(chars=len(text)):
+                with self.assertRaises(protocol.MessageTooLarge):
+                    self.validate({"op": "status", "audio": text})
+        self.assertNotIn("audio", self.validate({"op": "status", "audio": "é" * 2048}))
+
+    def test_list_of_samples_counts_two_bytes_each(self) -> None:
+        with self.assertRaises(protocol.MessageTooLarge):
+            self.validate({"op": "status", "samples": [0] * 2049})
+        self.assertNotIn("samples", self.validate({"op": "status", "samples": [0] * 2048}))
+
+    def test_values_that_carry_no_samples_are_not_measured(self) -> None:   # control
+        for value in ({"n": 1}, 5, True, None, 1.5):
+            with self.subTest(value=value):
+                self.assertNotIn("audio", self.validate({"op": "status", "audio": value}))
+
+    def test_dispatch_reply_code_is_too_large_and_no_worker_starts(self) -> None:
+        import importlib.machinery
+        import importlib.util
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        loader = importlib.machinery.SourceFileLoader(
+            "kilix_voiced_a07", os.path.join(root, "kilix-voiced"))
+        spec = importlib.util.spec_from_loader("kilix_voiced_a07", loader)
+        voiced = importlib.util.module_from_spec(spec)
+        loader.exec_module(voiced)
+        d = object.__new__(voiced.Daemon)
+        d._session_dir = self.session
+        d._touch = lambda: None
+        started = []
+        d._start = lambda thread, undo: started.append(thread.name)
+        handler = mock.Mock(side_effect=AssertionError("a handler ran"))
+        d._op_speak = handler
+        over = self.b64(16 * 1024)
+        for key in ("audio", "pcm", "wav", "samples"):
+            with self.subTest(key=key):
+                reply = voiced.Daemon._dispatch(d, protocol.encode(
+                    {"op": "speak", "text": "Hello there.", key: over}))
+                self.assertIs(reply["ok"], False, reply)
+                self.assertEqual(reply["code"], protocol.ERR_TOO_LARGE, reply)
+        handler.assert_not_called()
+        self.assertEqual(started, [])
+
+
 class ResourceProfileTestCase(unittest.TestCase):
     """C06/C12/C18 -- a device class and a MEASURED resource profile."""
 

@@ -481,6 +481,38 @@ def _deadline_ms(raw: object) -> int:
     return raw
 
 
+# A07 on every op: the closed set of keys a caller might put audio samples
+# under. Their size is measured and refused BEFORE the request is otherwise
+# interpreted, as decode refuses an over-size frame before parsing it. A short
+# preview at or under MAX_EMBEDDED_AUDIO_BYTES is still accepted, and dropped
+# like any other field the op does not use.
+EMBEDDED_AUDIO_KEYS = frozenset({
+    "audio", "pcm", "wav", "samples", "audio_data", "pcm_data", "wav_data",
+    "audio_b64", "pcm_b64", "wav_b64"})
+_BASE64 = re.compile(
+    r"^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$")
+_BASE64_URL = re.compile(
+    r"^(?:[A-Za-z0-9_-]{4})*(?:[A-Za-z0-9_-]{2}==|[A-Za-z0-9_-]{3}=)?$")
+
+
+def _embedded_audio_length(value: object) -> int | None:
+    """Return how many bytes of audio ``value`` embeds, or None when it cannot.
+
+    Base64 is measured by its DECODED length, computed without decoding: a
+    3,244-byte WAV is 4,328 characters of base64, so counting characters would
+    refuse a preview well under the limit. Other text is measured in UTF-8
+    bytes, and a list as s16 samples of two bytes each. Any other JSON value
+    carries no samples and is not measured.
+    """
+    if isinstance(value, str):
+        if _BASE64.fullmatch(value) or _BASE64_URL.fullmatch(value):
+            return len(value) * 3 // 4 - value.count("=", -2)
+        return len(value.encode("utf-8", "surrogatepass"))
+    if isinstance(value, list):
+        return 2 * len(value)
+    return None
+
+
 def validate_request(msg: dict, session_dir: str) -> dict:
     """Return a normalised copy of a control request, or raise ProtocolError.
 
@@ -491,6 +523,13 @@ def validate_request(msg: dict, session_dir: str) -> dict:
         raise ProtocolError(
             f"a request must be a JSON object, got {type(msg).__name__}. "
             'Send for example {"op":"status"}.')
+    # V22: this used to drop a 16 KiB base64 'audio' silently and start the
+    # speech anyway. A size refusal precedes every other question about the
+    # request, so it is too-large whatever else is wrong with it.
+    for key in sorted(EMBEDDED_AUDIO_KEYS & msg.keys()):
+        length = _embedded_audio_length(msg[key])
+        if length is not None:
+            check_audio_bytes(length, embedded=True, key=key)
     op = msg.get("op")
     # Two different refusals that used to share one message and, on the wire,
     # the code `internal`. A missing or non-string op is a request that is not
@@ -593,23 +632,31 @@ def reply_error(message: str, code: str = ERR_INTERNAL,
     return reply
 
 
-def check_audio_bytes(length: int, *, embedded: bool = False) -> int:
+def check_audio_bytes(length: int, *, embedded: bool = False,
+                      key: str | None = None) -> int:
     """Return ``length`` if it is a permissible audio size, else refuse.
 
     A06 and A07. ``embedded`` applies the much smaller in-JSON ceiling: audio
     that large belongs behind a descriptor, not inside a control message.
+    ``key`` names the request field that embedded it, for the refusal.
     """
     if not isinstance(length, int) or isinstance(length, bool) or length < 0:
         raise ProtocolError(
             f"audio length must be a non-negative integer, got {length!r}.")
     limit = MAX_EMBEDDED_AUDIO_BYTES if embedded else MAX_AUDIO_BYTES
     if length > limit:
+        if embedded:
+            # Not "or a path": a peer-selected path is exactly what P06 rules
+            # out. A descriptor carries the caller's own access and no name.
+            where = f"{key!r} embeds" if key is not None else "the message embeds"
+            raise MessageTooLarge(
+                f"{where} {length} bytes of audio; the in-JSON limit is "
+                f"{limit}. Send a descriptor instead: large audio is never "
+                "embedded in JSON.", size=length, limit=limit)
         raise MessageTooLarge(
-            f"audio is {length} bytes; the "
-            f"{'embedded-in-JSON' if embedded else 'audio'} limit is {limit}. "
-            + ("Send a descriptor or a path instead of the samples."
-               if embedded else
-               "Split the clip or stream it; it is refused, not truncated."))
+            f"audio is {length} bytes; the audio limit is {limit}. Split the "
+            "clip or stream it; it is refused, not truncated.",
+            size=length, limit=limit)
     return length
 
 
