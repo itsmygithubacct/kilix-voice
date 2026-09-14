@@ -207,6 +207,7 @@ class Outbound(unittest.TestCase):
                 message = {"sequence": 0, "final": False}
                 self.assertTrue(voiced.Daemon._send(
                     d, sender, voiced._Outbound(message, fds=(memfd,))))
+                receiver.settimeout(2)   # a missing message fails; it never hangs
                 data, ancillary, _flags, _ = receiver.recvmsg(
                     1 << 16, socket.CMSG_SPACE(4 * _INT))
                 received = _received(ancillary)

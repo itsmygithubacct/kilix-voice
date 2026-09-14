@@ -854,21 +854,25 @@ def dictation_error(message: str, code: str | None = None,
 
 def synthesis_chunk(sequence: int, *, pcm_bytes: int, sample_rate: int,
                     voice: str, model: str, seed: int | None = None,
-                    final: bool = False, **settings: object) -> dict:
+                    final: bool = False, audio_fd: int | None = None,
+                    media_type: str | None = None, byte_length: int | None = None,
+                    sha256: str | None = None, **settings: object) -> dict:
     """Return one streamed synthesis chunk descriptor.
 
     A12 sequence, A13 voice provenance, A14 seed and deterministic settings.
     The samples never ride in the JSON -- only their length, which
     check_audio_bytes bounds.
 
-    WHAT THIS IS NOT, stated because the earlier docstring overclaimed it and an
-    independent review caught that: this descriptor carries length, rate and
-    provenance and NO path, handle or retrieval token for the PCM. The audio
-    goes to the daemon's local player. So a subscriber learns that a bounded
-    clip is playing and what produced it -- an ANNOUNCEMENT of local playback,
-    arriving before the utterance completes. It is not delivery of playable
-    audio to the subscriber, and A15's positive arm is not satisfied by it. A
-    playable transport, or a narrower A15, is still owed.
+    A15: the playable audio arrives WITH the descriptor, not inside it. The
+    daemon attaches one sealed, read-only canonical WAV by SCM_RIGHTS, and
+    the descriptor names it: ``audio_fd`` is its index in that message's
+    descriptor array (always 0), ``media_type`` is audio/wav, ``byte_length``
+    is the WAV's size (pcm_bytes plus its 44-byte header) and ``sha256`` its
+    digest. A subscriber reading with recvmsg gets the audio, byte-identical
+    to what the local player was given, before the utterance completes. One
+    reading with plain recv still gets this JSON intact; the kernel closes the
+    descriptor it did not take. The four are optional so a descriptor with no
+    audio attached can still be built, but each is checked when given.
     """
     if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
         raise ProtocolError(
@@ -893,6 +897,37 @@ def synthesis_chunk(sequence: int, *, pcm_bytes: int, sample_rate: int,
     }
     if seed is not None:
         chunk["seed"] = seed
+    # A15: the attached audio, each field checked when given.
+    if audio_fd is not None:
+        # An index into this message's SCM_RIGHTS array, which carries exactly
+        # one descriptor.
+        if not isinstance(audio_fd, int) or isinstance(audio_fd, bool) or audio_fd != 0:
+            raise ProtocolError(
+                f"chunk 'audio_fd' must be 0, the index of the one attached "
+                f"descriptor, got {_echo(audio_fd)}.")
+        chunk["audio_fd"] = audio_fd
+    if media_type is not None:
+        if media_type != AUDIO_MEDIA_TYPE:
+            raise ProtocolError(
+                f"chunk 'media_type' must be {AUDIO_MEDIA_TYPE!r}, got "
+                f"{_echo(media_type)}.")
+        chunk["media_type"] = media_type
+    if byte_length is not None:
+        if (not isinstance(byte_length, int) or isinstance(byte_length, bool)
+                or byte_length < 0
+                or (media_type == AUDIO_MEDIA_TYPE
+                    and byte_length != chunk["pcm_bytes"] + WAV_HEADER_BYTES)):
+            raise ProtocolError(
+                f"chunk 'byte_length' must be the attached file's size -- "
+                f"pcm_bytes plus the {WAV_HEADER_BYTES}-byte header for "
+                f"{AUDIO_MEDIA_TYPE} -- got {_echo(byte_length)}.")
+        chunk["byte_length"] = byte_length
+    if sha256 is not None:
+        if not isinstance(sha256, str) or not _SHA256_HEX.fullmatch(sha256):
+            raise ProtocolError(
+                f"chunk 'sha256' must be 64 lowercase hex digits, got "
+                f"{_echo(sha256)}.")
+        chunk["sha256"] = sha256
     if settings:
         chunk["settings"] = _synthesis_settings(settings)
     size = len(encode(chunk))
@@ -912,6 +947,11 @@ def synthesis_chunk(sequence: int, *, pcm_bytes: int, sample_rate: int,
 SYNTHESIS_SETTING_KEYS = ("turn", "rate_wpm", "seed_consumed", "reproducible")
 MAX_SYNTHESIS_DESCRIPTOR_BYTES = 2048
 MAX_SYNTHESIS_RATE_WPM = 1000
+# A15/A08: audio handed to a caller is a canonical WAV: 16-bit mono PCM behind
+# util.write_wav's fixed 44-byte header.
+AUDIO_MEDIA_TYPE = "audio/wav"
+WAV_HEADER_BYTES = 44
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 # A job id as the daemon issues them: speak-N, listen-N, ingest-N.
 _JOB_ID = re.compile(r"^(speak|listen|ingest)-[1-9][0-9]{0,11}$")
 

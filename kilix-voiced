@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -345,6 +346,8 @@ class _JobTurn:
     terminal_events = False
     chunks_published = 0
     subscriber_lost = False
+    # A15: the closed code for why a chunk subscription ended, or None.
+    delivery_error: str | None = None
     # One lock for every turn's settle. It is held only to compare-and-set
     # one attribute and hand the outcome to the ledger, so sharing it costs
     # nothing measurable and needs no per-turn setup.
@@ -1285,51 +1288,82 @@ class Daemon:
         through the A06 check. A caller that did not name a socket gets nothing
         and pays nothing.
         """
-        if turn.receiver is None:
-            turn.sequence += 1        # the clip happened whether or not
-            return                    # anyone subscribed to hear about it
-        engine = turn.engine
         # The ordinal is the CLIP's, taken before anything can fail. Deriving it
         # from descriptor success made a failed build leave the counter behind
         # the real position, so later sequences lagged and the true last clip
         # could go unmarked -- R3 F05.
         ordinal = turn.sequence
         turn.sequence += 1
+        if turn.receiver is None or turn.subscriber_lost:
+            # Nobody asked, or the subscriber has gone or fallen behind: its
+            # stream already has a gap, and resuming would hand it clips out
+            # of order. The clip still plays.
+            return
         final = ordinal == len(turn.chunks) - 1
         # A13: the family and voice that ACTUALLY produced this clip, as the
         # engine recorded them and _synth carried them here. The old read of
         # engine.effective_model was true only of a Mock -- no real engine had
         # that attribute -- so the mbrola fallback was reported as mbrola. A
         # caller with no carried provenance gets the engine's own description.
-        prov = provenance or tts_lib.clip_provenance(engine)
+        prov = provenance or tts_lib.clip_provenance(turn.engine)
+        # A15: the bytes the local player plays -- it drops a trailing half
+        # sample -- so the subscriber's copy is identical to the queued clip.
+        data = pcm[:len(pcm) - len(pcm) % 2]
         try:
+            wav = util.write_wav(data, rate)
             chunk = protocol.synthesis_chunk(
-                ordinal, pcm_bytes=len(pcm), sample_rate=rate,
+                ordinal, pcm_bytes=len(data), sample_rate=rate,
                 voice=prov.voice,
                 model=prov.model,
                 # A14: always an integer seed and the settings the engine was
                 # actually given, from its own record. seed_consumed and
                 # reproducible say whether that seed means anything.
                 seed=prov.seed,
-                final=final, turn=turn.id,
+                final=final, audio_fd=0, media_type=protocol.AUDIO_MEDIA_TYPE,
+                byte_length=len(wav), sha256=hashlib.sha256(wav).hexdigest(),
+                turn=turn.id,
                 rate_wpm=prov.rate_wpm,
                 seed_consumed=prov.seed_consumed,
                 reproducible=prov.reproducible)
-            # Inside the guard: _send refuses a datagram over MAX_REPLY_BYTES,
-            # and a descriptor too large to deliver must not take the audio
-            # down any more than a malformed one may.
-            if self._send(turn.receiver, chunk):
-                turn.chunks_published += 1
-            else:
-                # R3 F05: a subscriber that has gone is recorded in the job's
-                # outcome instead of ignored. The audio plays on.
-                turn.subscriber_lost = True
-        except protocol.ProtocolError as error:
+        except ValueError as error:
             # A malformed descriptor must not take the audio down with it.
             # The ordinal, not turn.sequence: the counter has already moved on
             # to the next clip, so it named the wrong one.
             self._warn(f"synthesis chunk {ordinal} of turn {turn.id} not "
                        f"published: {error}")
+            return
+        try:
+            fd = audiofd.sealed_readonly(wav)
+        except audiofd.DescriptorError as error:
+            # No descriptor is ever sent without its audio. The subscription
+            # ends; the clip plays on.
+            turn.subscriber_lost = True
+            turn.delivery_error = error.code
+            self._warn(f"synthesis chunk {ordinal} of turn {turn.id}: its audio "
+                       f"could not be attached, so the subscription ends: {error}")
+            return
+        try:
+            # Called with self._lock held, so it must not wait: MSG_DONTWAIT
+            # returns at once whether the subscriber is not keeping up (EAGAIN)
+            # or has gone (EPIPE, ECONNREFUSED, ETOOMANYREFS). A stop-speech or
+            # barge-in waiting on this lock is never held up by a subscriber.
+            delivered = self._send(turn.receiver,
+                                   _Outbound(chunk, fds=(fd,), nonblocking=True))
+        except protocol.ProtocolError as error:
+            # _send refuses a datagram over MAX_REPLY_BYTES; a descriptor too
+            # large to deliver is skipped like a malformed one.
+            self._warn(f"synthesis chunk {ordinal} of turn {turn.id} not "
+                       f"published: {error}")
+            return
+        finally:
+            os.close(fd)
+        if delivered:
+            turn.chunks_published += 1
+        else:
+            # R3 F05: a subscriber that cannot take the descriptor is recorded
+            # in the job's outcome instead of ignored, and is not sent to again.
+            turn.subscriber_lost = True
+            turn.delivery_error = protocol.ERR_UNAVAILABLE
 
     def _await_clip(self, turn: _SpeechTurn, player: audio.Player) -> bool:
         """Wait out the queued clip; False when the turn was cancelled."""

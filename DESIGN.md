@@ -193,6 +193,15 @@ never spoken or recognised text.
   not a success result; the terminal outcome is.
 - Every dictation terminal datagram, `final` or `error`, carries the job id as
   `segment`, and a job sends exactly one of them.
+- Each chunk descriptor arrives with its audio: one sealed, read-only WAV
+  descriptor passed by SCM_RIGHTS, named by `audio_fd` (its index, 0) and
+  described by `media_type`, `byte_length` and `sha256`. Its samples are the
+  ones the local player was given. A subscriber reading with plain `recv` still
+  gets the JSON; the kernel closes the descriptor it did not take. On
+  SOCK_STREAM the descriptor rides with the first byte of its line. A subscriber
+  that stops reading or goes away loses its subscription, never the audio: the
+  daemon never waits on it, and the loss is recorded in the job's outcome as
+  `subscriber_lost`.
 
 `stop-dictation` takes an optional `mode`. `finish`, the default, ends
 recording and delivers the words heard so far as the job's final. `abort` ends

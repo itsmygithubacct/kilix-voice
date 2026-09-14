@@ -700,6 +700,160 @@ class StreamedSynthesisTestCase(unittest.TestCase):
                                                "seed_consumed": False,
                                                "reproducible": True})
 
+    def _socket_daemon(self, turn):
+        import threading
+        d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._warn = lambda *a, **k: None
+        d._speech = turn
+        d._player = None
+        d._arbiter = mock.Mock()
+        return d
+
+    @staticmethod
+    def _received_fds(ancillary):
+        import socket
+        import struct
+        size = struct.calcsize("i")
+        return [fd for level, kind, blob in ancillary
+                if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS
+                for fd in struct.unpack(f"{len(blob) // size}i", blob)]
+
+    def test_descriptor_carries_a_sealed_wav_identical_to_the_queued_clip(self) -> None:
+        # AUD-06 / V24 A15: the subscriber can play what the daemon plays.
+        import fcntl
+        import hashlib
+        import socket
+        import struct
+        from voicelib import audiofd, util
+        sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.addCleanup(sender.close)
+        self.addCleanup(receiver.close)
+        turn = self._turn(("one", "two"))
+        turn.receiver = sender
+        daemon = self._socket_daemon(turn)
+        player = mock.Mock()
+        pcm = bytes(range(256)) * 8 + b"\x07"      # odd: the half sample is dropped
+        self.assertTrue(voiced.Daemon._play_if_current(daemon, turn, player, pcm, 22050))
+        queued = player.play.call_args.args[0]
+        queued = queued[:len(queued) - len(queued) % 2]   # as Player.play trims it
+        receiver.settimeout(2)          # a missing descriptor fails; it never hangs
+        data, ancillary, _flags, _ = receiver.recvmsg(
+            1 << 16, socket.CMSG_SPACE(4 * struct.calcsize("i")))
+        fds = self._received_fds(ancillary)
+        for fd in fds:
+            self.addCleanup(os.close, fd)
+        self.assertEqual(len(fds), 1)
+        descriptor = voiced.protocol.decode(data)
+        wav = os.pread(fds[0], 1 << 20, 0)
+        self.assertEqual(util.parse_wav_bytes(wav), (queued, 22050))
+        self.assertEqual(descriptor["pcm_bytes"], len(queued))
+        self.assertEqual(descriptor["byte_length"], len(wav))
+        self.assertEqual(len(wav), len(queued) + 44)
+        self.assertEqual(descriptor["sha256"], hashlib.sha256(wav).hexdigest())
+        self.assertEqual((descriptor["audio_fd"], descriptor["media_type"]), (0, "audio/wav"))
+        with self.assertRaises(OSError):
+            os.write(fds[0], b"x")
+        self.assertEqual(fcntl.fcntl(fds[0], audiofd.F_GET_SEALS) & audiofd.ALL_SEALS,
+                         audiofd.ALL_SEALS)
+        self.assertEqual(turn.chunks_published, 1)
+
+    def test_subscriber_that_stops_reading_never_blocks_the_lock(self) -> None:
+        import socket
+        import time
+        sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.addCleanup(sender.close)
+        self.addCleanup(receiver.close)
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1)
+        sender.settimeout(1.0)                     # as _connect_dictation sets it
+        turn = self._turn(tuple(f"clip {n}" for n in range(21)))
+        turn.receiver = sender
+        daemon = self._socket_daemon(turn)
+        player = mock.Mock()
+        open_before = len(os.listdir("/proc/self/fd"))
+        for index in range(20):
+            started = time.monotonic()
+            self.assertTrue(voiced.Daemon._play_if_current(
+                daemon, turn, player, b"\x01\x00" * 8000, 22050))
+            elapsed = time.monotonic() - started
+            if elapsed > 0.05:
+                self.fail(f"clip {index} held the daemon lock for {elapsed:.3f} s")
+        # Every sealed descriptor made for a clip was closed on the daemon's side.
+        self.assertEqual(len(os.listdir("/proc/self/fd")), open_before)
+        self.assertEqual(player.play.call_count, 20)          # the audio went on
+        self.assertIs(turn.subscriber_lost, True)
+        self.assertEqual(turn.delivery_error, voiced.protocol.ERR_UNAVAILABLE)
+        receiver.setblocking(False)
+        delivered = 0
+        try:
+            while receiver.recv(1 << 20):
+                delivered += 1
+        except BlockingIOError:
+            pass
+        self.assertLess(delivered, 20, "the subscriber kept being sent to after it stalled")
+        self.assertEqual(delivered, turn.chunks_published)
+        # Drained now, the lost subscriber is still not sent to: its stream has
+        # a gap in it, and resuming would hand it clips out of sequence.
+        voiced.Daemon._play_if_current(daemon, turn, player, b"\x01\x00" * 8000, 22050)
+        with self.assertRaises(BlockingIOError):
+            receiver.recv(1 << 20)
+
+    def test_a_stalled_subscriber_does_not_hold_up_stop_speech(self) -> None:
+        import socket
+        import threading
+        import time
+        sender, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.addCleanup(sender.close)
+        self.addCleanup(receiver.close)
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1)
+        # The subscriber has already stopped reading: its queue is full before
+        # the first clip, so the publisher's first send is the one that would
+        # wait, holding the daemon lock, while stop-speech asks for it.
+        sender.setblocking(False)
+        try:
+            while True:
+                sender.send(b"x" * 4096)
+        except BlockingIOError:
+            pass
+        sender.settimeout(1.0)                     # as _connect_dictation sets it
+        turn = self._turn(tuple(f"clip {n}" for n in range(200)))
+        turn.receiver = sender
+        daemon = self._socket_daemon(turn)
+        publishing = threading.Event()
+
+        def publish():
+            for _ in range(200):
+                publishing.set()
+                if not voiced.Daemon._play_if_current(
+                        daemon, turn, mock.Mock(), b"\x01\x00" * 8000, 22050):
+                    return
+
+        worker = threading.Thread(target=publish, daemon=True)
+        worker.start()
+        self.assertTrue(publishing.wait(5))
+        time.sleep(0.05)                           # inside its first send by now
+        started = time.monotonic()
+        reply = voiced.Daemon._op_stop_speech(daemon, {"id": "s"})
+        elapsed = time.monotonic() - started
+        worker.join(10)
+        self.assertIs(reply["stopped"], True)
+        self.assertLess(elapsed, 0.1, f"stop-speech waited {elapsed:.3f} s behind a stalled subscriber")
+        self.assertFalse(worker.is_alive())
+
+    def test_descriptor_allocation_failure_ends_subscription_not_audio(self) -> None:
+        global sent; sent = []
+        turn = self._turn(("a", "b")); daemon = self._daemon(); daemon._speech = turn
+        player = mock.Mock()
+        with mock.patch.object(voiced.audiofd, "sealed_readonly",
+                               side_effect=voiced.audiofd.DescriptorError("no memory")):
+            for _ in range(2):
+                self.assertTrue(voiced.Daemon._play_if_current(
+                    daemon, turn, player, b"\x00\x00", 24000))
+        self.assertEqual(player.play.call_count, 2)          # the audio still plays
+        self.assertEqual(sent, [])                            # no descriptor without audio
+        self.assertIs(turn.subscriber_lost, True)
+        self.assertEqual(turn.delivery_error, voiced.protocol.ERR_UNAVAILABLE)
+
     def test_speak_validates_the_chunk_socket_inside_the_session(self) -> None:
         from voicelib import protocol
         import tempfile
