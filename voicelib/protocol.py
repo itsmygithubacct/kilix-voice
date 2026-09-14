@@ -351,6 +351,17 @@ def _request_id(raw: object) -> str:
         raise ProtocolError(
             f"'id' is {len(text)} characters; the limit is {MAX_ID_CHARS}. "
             "Use a short correlation token such as a counter.")
+    # The id is the one caller string every reply echoes verbatim. A lone
+    # surrogate (JSON "\ud800") passed the checks above, rode out on the reply,
+    # and made that reply unencodable, so encode_reply answered `internal`,
+    # "this is a bug", for the caller's own input. Checked after the length,
+    # so the encode is never longer than MAX_ID_CHARS characters.
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ProtocolError(
+            "'id' is not valid UTF-8 text: it contains a lone surrogate. Use "
+            "a short correlation token such as a counter.") from error
     return text
 
 
