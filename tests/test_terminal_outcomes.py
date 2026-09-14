@@ -726,6 +726,152 @@ class Abort(_LiveTurnsFixture):
                 self.assertEqual(reply.get("code"), protocol.ERR_MALFORMED, reply)
 
 
+class Quiesce(unittest.TestCase):
+    """TERM-04: once stop-dictation replies quiesced, no feed begins and no
+    partial is sent; a slow feed bounds the reply; a stalled receiver costs
+    partials, not the turn."""
+
+    FRAME = b"\x00" * 640
+
+    def daemon(self, sent: list | None, max_seconds: float = 30):
+        d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._cfg = {"stt": {"max_seconds": max_seconds}, "vad": {"silence_ms": 900}}
+        d._stopping = threading.Event()
+        d._warn = d._debug = lambda *a, **k: None
+        if sent is not None:
+            d._send = lambda receiver, msg: sent.append((time.monotonic(), msg)) or True
+        return d
+
+    def capture(self, delay: float = 0.0):
+        from types import SimpleNamespace
+
+        def read(timeout=None):
+            if delay:
+                time.sleep(delay)
+            return self.FRAME
+
+        return SimpleNamespace(rate=16000, frame_bytes=len(self.FRAME), overruns=0,
+                               error="", read=read)
+
+    def no_speech_end(self):
+        from types import SimpleNamespace
+        return mock.patch.object(voiced, "Vad", lambda cfg: SimpleNamespace(
+            feed=lambda frame: ""))
+
+    def test_no_feed_or_partial_after_stop_reply(self) -> None:
+        import random
+        from types import SimpleNamespace
+        rng = random.Random(20260914)
+        violations = []
+        with self.no_speech_end():
+            for iteration in range(500):
+                feeds, sent = [], []
+                d = self.daemon(sent)
+                turn = voiced._DictationTurn(f"listen-{iteration + 1}", mock.Mock())
+                d._dictation = turn
+
+                def feed(frame, feeds=feeds):
+                    feeds.append(time.monotonic())
+                    time.sleep(rng.random() * 0.0003)
+                    return "word"
+
+                engine = SimpleNamespace(supports_partials=True, feed=feed)
+                worker = threading.Thread(target=voiced.Daemon._record,
+                                          args=(d, turn, self.capture(), engine),
+                                          daemon=True)
+                worker.start()
+                time.sleep(rng.random() * 0.003)
+                reply = voiced.Daemon._op_stop_dictation(d, {"id": "s"})
+                replied = time.monotonic()
+                worker.join(5)
+                self.assertFalse(worker.is_alive())
+                # A daemon that does not say is taken at its word that it
+                # stopped: the claim under test is "nothing after the reply".
+                if reply.get("quiesced", True):
+                    late = (sum(1 for t in feeds if t > replied),
+                            sum(1 for t, _m in sent if t > replied))
+                    if any(late):
+                        violations.append((iteration, *late))
+        self.assertEqual(violations, [], "feeds or partials began after the stop reply")
+
+    def test_slow_feed_bounds_the_stop_reply(self) -> None:
+        from types import SimpleNamespace
+        feeding, release, sent = threading.Event(), threading.Event(), []
+        d = self.daemon(sent)
+        turn = voiced._DictationTurn("listen-1", mock.Mock())
+        d._dictation = turn
+
+        def feed(frame):
+            feeding.set()
+            release.wait(5)
+            return "word"
+
+        engine = SimpleNamespace(supports_partials=True, feed=feed)
+        with self.no_speech_end(), \
+             mock.patch.object(voiced, "STOP_QUIESCE_TIMEOUT_S", 0.2):
+            worker = threading.Thread(target=voiced.Daemon._record,
+                                      args=(d, turn, self.capture(), engine), daemon=True)
+            worker.start()
+            self.assertTrue(feeding.wait(5))
+            started = time.monotonic()
+            reply = voiced.Daemon._op_stop_dictation(d, {"id": "s"})
+            elapsed = time.monotonic() - started
+            release.set()
+            worker.join(5)
+        self.assertLess(elapsed, 0.35)
+        self.assertEqual((reply["stopped"], reply["quiesced"]), (True, False))
+        self.assertTrue(turn.stop.is_set())
+        self.assertEqual(sent, [], "the in-flight feed's partial was delivered after the stop")
+
+    def test_full_receiver_drops_partials_but_recording_continues(self) -> None:
+        from types import SimpleNamespace
+        sender, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.addCleanup(sender.close)
+        self.addCleanup(peer.close)
+        sender.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1)
+        sender.settimeout(1.0)                # as _connect_dictation sets it
+        d = self.daemon(None, max_seconds=1)
+        turn = voiced._DictationTurn("listen-1", sender)
+        feeds = []
+        engine = SimpleNamespace(supports_partials=True,
+                                 feed=lambda frame: feeds.append(1) or "word " * 30)
+        with self.no_speech_end():
+            started = time.monotonic()
+            heard = voiced.Daemon._record(d, turn, self.capture(delay=0.005), engine)
+            elapsed = time.monotonic() - started
+        self.assertTrue(heard)
+        self.assertGreaterEqual(elapsed, 0.9, "recording ended before its ceiling")
+        self.assertGreater(len(feeds), 50)
+        peer.setblocking(False)
+        delivered = 0
+        try:
+            while peer.recv(1 << 16):
+                delivered += 1
+        except BlockingIOError:
+            pass
+        self.assertLess(delivered, len(feeds), "no partial was dropped, so nothing was tested")
+        # Drained, the receiver still gets the job's one final.
+        self.assertTrue(voiced.Daemon._deliver_terminal(
+            d, turn, protocol.dictation_final("all the words", turn.id)))
+        peer.setblocking(True)
+        peer.settimeout(2)
+        self.assertEqual(protocol.decode(peer.recv(1 << 16))["final"], "all the words")
+
+    def test_gone_receiver_ends_recording(self) -> None:
+        from types import SimpleNamespace
+        sender, peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.addCleanup(sender.close)
+        peer.close()
+        d = self.daemon(None, max_seconds=30)
+        turn = voiced._DictationTurn("listen-1", sender)
+        engine = SimpleNamespace(supports_partials=True, feed=lambda frame: "word")
+        with self.no_speech_end():
+            started = time.monotonic()
+            voiced.Daemon._record(d, turn, self.capture(delay=0.001), engine)
+        self.assertLess(time.monotonic() - started, 2.0)
+
+
 class SettleOnce(unittest.TestCase):
 
     def test_settle_attempted_from_many_threads_records_one_outcome(self) -> None:

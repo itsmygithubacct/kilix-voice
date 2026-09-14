@@ -17,10 +17,10 @@ accepted connection is checked with ``SO_PEERCRED``.
     {"op":"stop-speech"}             -> {"ok":true,"id":"","stopped":true}
     {"op":"dictate","sock":"…"}      -> {"ok":true,"id":"","turn":"listen-1"}
     {"op":"stop-dictation"}          -> {"ok":true,"id":"","stopped":true,
-                                         "mode":"finish"}
+                                         "quiesced":true,"mode":"finish"}
     {"op":"stop-dictation","mode":"abort"}
                                      -> {"ok":true,"id":"","stopped":true,
-                                         "mode":"abort"}
+                                         "quiesced":true,"mode":"abort"}
     {"op":"status"}                  -> {"ok":true,"id":"","status":{…}}
 
 Dictation results go to the caller's socket as datagrams — ``{"partial":…}``
@@ -99,6 +99,10 @@ DATAGRAM_TIMEOUT_S = 1.0     # a dictation receiver that stopped reading
 SPEECH_POLL_S = 0.05         # how often a speech turn notices a cancellation
 CAPTURE_POLL_S = 0.2
 JOIN_TIMEOUT_S = 5.0
+# How long stop-dictation waits for a recogniser feed already in progress
+# before it replies anyway. The same order as REQUEST_TIMEOUT_S: the accept
+# loop can already be held that long by a peer that sends nothing.
+STOP_QUIESCE_TIMEOUT_S = 1.0
 
 # One control request is one datagram. The shared ceiling both bounds the
 # allocation and stays below the platform's AF_UNIX/SOCK_SEQPACKET send limit.
@@ -407,6 +411,10 @@ class _DictationTurn(_JobTurn):
         # preparation, recogniser construction and recording alike.
         self.stop = Cancellation(deadline, clock)
         self.thread: threading.Thread | None = None
+        # TERM-04: held while a frame is fed and its partial sent, and taken
+        # by stop-dictation before it replies, so a stop that has replied is
+        # never followed by either.
+        self.progress_lock = threading.Lock()
 
     @property
     def deadline(self) -> float | None:
@@ -1426,12 +1434,24 @@ class Daemon:
         mode = request.get("mode", protocol.STOP_MODE_FINISH)
         with self._lock:
             turn = self._dictation
-        if turn is not None:
+        if turn is None:
+            return protocol.reply_ok(request["id"], stopped=False, mode=mode)
+        # TERM-04: wait -- bounded, and NOT holding self._lock -- for a feed
+        # already in progress, so that once this replies quiesced no feed
+        # begins and no partial is sent for the turn. quiesced false means a
+        # feed was still running; _record suppresses its partial because the
+        # stop is set before that feed's result is looked at.
+        acquired = turn.progress_lock.acquire(timeout=STOP_QUIESCE_TIMEOUT_S)
+        try:
             if mode == protocol.STOP_MODE_ABORT:
                 # Before the stop: whatever sees the stop sees the abort too.
                 turn.abort = True
             turn.stop.set()
-        return protocol.reply_ok(request["id"], stopped=turn is not None, mode=mode)
+        finally:
+            if acquired:
+                turn.progress_lock.release()
+        return protocol.reply_ok(request["id"], stopped=True,
+                                 quiesced=acquired, mode=mode)
 
     def _run_dictation(self, turn: _DictationTurn) -> None:
         """Record one turn, stream partials, and deliver the final text."""
@@ -1769,12 +1789,27 @@ class Daemon:
                 capture.overruns - dropped_frames) * capture.frame_bytes
             dropped_frames = capture.overruns
             protocol.check_audio_bytes(captured_bytes)
-            event = detector.feed(frame)
-            text = engine.feed(frame)
-            if partials and text is not None:
-                if not self._send(turn.receiver, protocol.dictation_partial(
-                        clean_for_injection(text), turn.id)):
+            # TERM-04: the stop check, the feed and the partial are one step
+            # under the turn's progress lock, which stop-dictation takes before
+            # it replies. A loop iteration already past its check used to feed
+            # one more frame and deliver one more partial after the stop had
+            # been answered. The read above stays outside the lock, so a stop
+            # never waits on a quiet microphone.
+            with turn.progress_lock:
+                if turn.stop.done() or self._stopping.is_set():
                     break
+                event = detector.feed(frame)
+                text = engine.feed(frame)
+                if turn.stop.done():
+                    # A stop that gave up waiting landed during this feed: its
+                    # partial is not delivered, and nothing more is fed.
+                    break
+                if partials and text is not None:
+                    # Droppable: a receiver that is not reading loses progress,
+                    # not the turn. One that has gone still ends it.
+                    if not self._send(turn.receiver, _Outbound(protocol.dictation_partial(
+                            clean_for_injection(text), turn.id), droppable=True)):
+                        break
             if event == events.VAD_SPEECH_START:
                 speaking = True
             elif event == events.VAD_SPEECH_END and speaking:

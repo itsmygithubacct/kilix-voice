@@ -203,6 +203,14 @@ changes nothing and replies `stopped: false`. The reply echoes the `mode`, so a
 client can tell an older daemon, which ignores the field and finishes, from
 one that honoured it.
 
+A stop reply for a running turn also says `quiesced`. With `quiesced: true`, no
+further audio is fed to the recogniser and no further partial is sent for
+that job once the reply is sent. The daemon waits at most one second for a feed
+already in progress; `quiesced: false` means one was still running, and its
+partial is suppressed. Partials are progress: a receiver that is not reading
+loses partials rather than ending the turn, while a receiver that has gone
+ends it.
+
 ### voicelib/audio.py
 
 ```python
