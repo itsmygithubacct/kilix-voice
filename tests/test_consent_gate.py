@@ -28,13 +28,37 @@ _spec.loader.exec_module(voiced)
 from voicelib import consent, protocol  # noqa: E402
 
 
+def _private_environment(root: str, **store: str) -> dict[str, str]:
+    """Return this process's environment with every store root inside ``root``.
+
+    The store resolvers honour KILIX_DATA_HOME, KILIX_STORAGE_HOME,
+    KILIX_SESSION_HOME and GPU_TERMINAL_HOME ahead of HOME, and a desktop
+    session exports them. These tests once set HOME and KILIX_STORAGE_HOME only,
+    so KILIX_DATA_HOME still named the user's real store, and the grants and
+    fixture model files they record were written into it. Every stack variable
+    is dropped and each root named explicitly, so this module stays safe even
+    when it runs without the tests package's guard, as a script or under
+    discover without -t.
+    """
+    env = {name: value for name, value in os.environ.items()
+           if not name.startswith(("KILIX", "GPU_TERMINAL_", "PLEB_", "XDG_"))}
+    env.update(HOME=root,
+               GPU_TERMINAL_HOME=os.path.join(root, "gpu_terminal"),
+               KILIX_STORAGE_HOME=os.path.join(root, "storage"),
+               KILIX_DATA_HOME=os.path.join(root, "storage", "data"),
+               KILIX_SESSION_HOME=os.path.join(root, "storage", "session"))
+    env.update(store)
+    return env
+
+
 class BrokenConsentRecordTestCase(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        env = mock.patch.dict(os.environ, {"KILIX_DATA_HOME": self.tmp.name,
-                                           "KILIX_VOICE_REQUIRE_CONSENT": "1"})
+        env = mock.patch.dict(os.environ, _private_environment(
+            self.tmp.name, KILIX_DATA_HOME=self.tmp.name,
+            KILIX_VOICE_REQUIRE_CONSENT="1"), clear=True)
         env.start()
         self.addCleanup(env.stop)
         os.makedirs(os.path.dirname(consent.consent_path()), exist_ok=True)
@@ -122,10 +146,9 @@ class GrantMatchesTheGateTestCase(unittest.TestCase):
         settings_file = os.path.join(root, "settings")
         with open(settings_file, "w") as handle:
             handle.write(f"{settings.KEY_STT_ENGINE}=vosk\n")
-        env = {"HOME": root, "GPU_TERMINAL_SETTINGS_FILE": settings_file,
-               "KILIX_STORAGE_HOME": os.path.join(root, "storage"),
-               "KILIX_VOICE_REQUIRE_CONSENT": "1"}
-        patcher = mock.patch.dict(os.environ, env)
+        env = _private_environment(root, GPU_TERMINAL_SETTINGS_FILE=settings_file,
+                                   KILIX_VOICE_REQUIRE_CONSENT="1")
+        patcher = mock.patch.dict(os.environ, env, clear=True)
         patcher.start()
         self.addCleanup(patcher.stop)
         for name in (stt_lib.ENV_MODEL, daemon_config.ENV_CONFIG):
