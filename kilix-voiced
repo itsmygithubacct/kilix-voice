@@ -73,7 +73,7 @@ for _package_root in (_INSTALLED_LIB, _HERE):
 
 from voicelib import (
     consent,  # noqa: E402  (the import follows the path bootstrap)
-    __version__, audio, audiofd, daemon_config, events, models, paths,
+    __version__, audio, audiofd, daemon_config, events, jobs, models, paths,
     protocol, settings, stt as stt_lib, tts as tts_lib, util)
 from voicelib.arbiter import Arbiter, ArbiterError  # noqa: E402
 from voicelib.cancel import (  # noqa: E402
@@ -317,7 +317,43 @@ class _Clip(tuple):
         return clip
 
 
-class _SpeechTurn:
+class _JobTurn:
+    """What every job's turn shares: its one terminal outcome.
+
+    settle() is first-writer-wins. The first outcome sticks; every later
+    attempt changes nothing and returns False. Exactly-once is enforced HERE,
+    on the turn, so a daemon built without __init__ -- with no ledger at all --
+    still cannot end a job twice. on_settle is the ledger's record, when the
+    daemon has a ledger.
+
+    Everything is a class-level default, so a turn built and adjusted by hand,
+    as the tests build them, has all of it.
+    """
+
+    outcome: jobs.JobOutcome | None = None
+    on_settle: Callable[[jobs.JobOutcome], object] | None = None
+    # Set for a caller that declared protocol minor 2 or later: its chunk
+    # stream ends with one terminal message after the last descriptor.
+    terminal_events = False
+    chunks_published = 0
+    subscriber_lost = False
+    # One lock for every turn's settle. It is held only to compare-and-set
+    # one attribute and hand the outcome to the ledger, so sharing it costs
+    # nothing measurable and needs no per-turn setup.
+    _settle_lock = threading.Lock()
+
+    def settle(self, outcome: jobs.JobOutcome) -> bool:
+        with self._settle_lock:
+            if self.outcome is not None:
+                return False
+            self.outcome = outcome
+            hook = self.on_settle
+            if hook is not None:
+                hook(outcome)
+            return True
+
+
+class _SpeechTurn(_JobTurn):
     """One read-aloud turn: its clips, its thread, and its cancel flag."""
 
     def __init__(self, turn_id: str, chunks: list[str],
@@ -416,6 +452,11 @@ class Daemon:
     # has no control socket for a receiver to collide with.
     _socket_dev: int | None = None
     _socket_ino: int | None = None
+    # P07/P11: settled job outcomes, and the turn the latest speech_error
+    # belongs to. Class-level defaults: a daemon built without __init__ has no
+    # ledger, and its turns still settle exactly once on their own.
+    _jobs: jobs.JobLedger | None = None
+    _speech_error_turn = ""
 
     def __init__(self, *, config_path: str | None = None,
                  idle_seconds: float | None = None,
@@ -463,6 +504,9 @@ class Daemon:
         # polling client show each failure exactly once.
         self._speech_error = ""
         self._speech_error_serial = 0
+        # P07/P11: every accepted job's single terminal outcome, by job id.
+        self._jobs = jobs.JobLedger()
+        self._speech_error_turn = ""
 
     # -- logging ------------------------------------------------------------
 
@@ -484,6 +528,8 @@ class Daemon:
                 return
             self._speech_error = message
             self._speech_error_serial += 1
+            # P11: the failure is joinable to its job; the prose alone was not.
+            self._speech_error_turn = turn.id
         self._warn(message)
 
     # -- configuration ------------------------------------------------------
@@ -982,15 +1028,31 @@ class Daemon:
             turn.thread = threading.Thread(
                 target=self._run_speech, args=(turn,),
                 name=f"kilix-voice-{turn.id}", daemon=True)
+            # P11: a subscriber that declared minor 2 or later opted in to
+            # the terminal message after its last descriptor.
+            minor = protocol.declared_minor(request)
+            turn.terminal_events = minor is not None and minor >= 2
+            ledger = self._jobs
+            if ledger is not None:
+                # Hooked BEFORE the worker starts: a worker can settle the job
+                # before _start even returns, and that outcome must still be
+                # recorded.
+                turn.on_settle = ledger.record
             with self._lock:
                 self._cancel_speech()      # a new read replaces the old one
                 self._speech_error = ""
+                self._speech_error_turn = ""
                 self._arbiter.begin_speech(turn.id)
                 self._speech = turn
                 self._start(turn.thread, self._cancel_speech)
                 # Set INSIDE the lock and only after _start returned: the
                 # worker is running and its `finally` is now guaranteed to run.
                 handed_off = True
+                if ledger is not None:
+                    # After _start, so a worker the OS refused never becomes a
+                    # job. A no-op when the worker has already settled, so a
+                    # finished job is never put back to running.
+                    ledger.begin(turn.id, jobs.KIND_SPEECH)
             return protocol.reply_ok(
                 request["id"], turn=turn.id, chunks=len(chunks),
                 model=engine.model, voice=engine.voice, rate=engine.rate)
@@ -1062,17 +1124,30 @@ class Daemon:
                     turn, "read-aloud stopped: the request deadline elapsed.")
             elif player.error:
                 self._report_speech_failure(turn, player.error)
+        # Each arm also records WHY the job failed, for the one outcome the
+        # finally below settles. The status prose is exactly what it was.
         except tts_lib.TtsDeadlineExceeded:
             # The same words the expiry check above uses: a synthesis the
             # budget cut is the deadline, however the engine phrased it.
-            self._report_speech_failure(
-                turn, "read-aloud stopped: the request deadline elapsed.")
+            message = "read-aloud stopped: the request deadline elapsed."
+            turn.failure = (jobs.OUTCOME_DEADLINE, protocol.ERR_DEADLINE, message)
+            self._report_speech_failure(turn, message)
         except tts_lib.TtsError as error:
-            self._report_speech_failure(
-                turn, f"read-aloud stopped: {error}")
+            message = f"read-aloud stopped: {error}"
+            turn.failure = (jobs.OUTCOME_FAILED,
+                            _carried_code(error, protocol.ERR_UNAVAILABLE), message)
+            self._report_speech_failure(turn, message)
         except Exception as error:  # a worker thread must not die silently
-            self._report_speech_failure(
-                turn, f"read-aloud failed: {error!r}")
+            message = f"read-aloud failed: {error!r}"
+            # A device, settings or path failure is `unavailable`, as the
+            # control path codes it; an over-size clip carries too-large on
+            # its class; anything else is a bug.
+            refusal = isinstance(error, (audio.AudioError, settings.SettingsError,
+                                         paths.PathError, OSError))
+            turn.failure = (jobs.OUTCOME_FAILED, _carried_code(
+                error, protocol.ERR_UNAVAILABLE if refusal else protocol.ERR_INTERNAL),
+                message)
+            self._report_speech_failure(turn, message)
         finally:
             with self._lock:
                 mine = self._speech is turn
@@ -1093,6 +1168,44 @@ class Daemon:
                 except Exception as error:      # never mask the real failure
                     self._warn(
                         f"could not stop playback for turn {turn.id}: {error!r}")
+            # P11: this job's one terminal outcome, decided HERE and nowhere
+            # else, the first cause first, and settled before the receiver
+            # closes so a 1.2 subscriber's stream can end with it. Cancel and
+            # deadline come from the token's reason(): whichever came first.
+            try:
+                failure = getattr(turn, "failure", None)
+                why = turn.cancel.reason()
+                if failure is not None:
+                    outcome, code, message = failure
+                elif why == "cancelled":
+                    outcome, code, message = (jobs.OUTCOME_CANCELLED,
+                                              protocol.ERR_CANCELLED,
+                                              "read-aloud was stopped.")
+                elif why == "deadline":
+                    outcome, code, message = (
+                        jobs.OUTCOME_DEADLINE, protocol.ERR_DEADLINE,
+                        "read-aloud stopped: the request deadline elapsed.")
+                elif player is not None and player.error:
+                    outcome, code, message = (jobs.OUTCOME_FAILED,
+                                              protocol.ERR_UNAVAILABLE,
+                                              str(player.error))
+                else:
+                    outcome, code, message = jobs.OUTCOME_COMPLETED, None, ""
+                if outcome == jobs.OUTCOME_FAILED and code in (
+                        protocol.ERR_CANCELLED, protocol.ERR_DEADLINE):
+                    code = protocol.ERR_INTERNAL      # never a failure in disguise
+                settled = jobs.JobOutcome(
+                    job=turn.id, kind=jobs.KIND_SPEECH, outcome=outcome,
+                    code=code, message=message,
+                    chunks_published=turn.chunks_published,
+                    subscriber_lost=turn.subscriber_lost)
+                if (turn.settle(settled) and turn.terminal_events
+                        and turn.receiver is not None and not turn.subscriber_lost):
+                    self._send(turn.receiver, protocol.job_terminal(settled))
+            except Exception as error:
+                # The device is still released below, whatever went wrong.
+                self._warn(f"could not settle turn {turn.id} "
+                           f"({type(error).__name__})")
             if turn.receiver is not None:
                 try:
                     turn.receiver.close()
@@ -1189,7 +1302,12 @@ class Daemon:
             # Inside the guard: _send refuses a datagram over MAX_REPLY_BYTES,
             # and a descriptor too large to deliver must not take the audio
             # down any more than a malformed one may.
-            self._send(turn.receiver, chunk)
+            if self._send(turn.receiver, chunk):
+                turn.chunks_published += 1
+            else:
+                # R3 F05: a subscriber that has gone is recorded in the job's
+                # outcome instead of ignored. The audio plays on.
+                turn.subscriber_lost = True
         except protocol.ProtocolError as error:
             # A malformed descriptor must not take the audio down with it.
             # The ordinal, not turn.sequence: the counter has already moved on
@@ -1626,6 +1744,14 @@ class Daemon:
         deadline_ms = request.get("deadline_ms")
         deadline = (time.monotonic() + deadline_ms / 1000.0
                     if deadline_ms is not None else None)
+        # P07/P11: a question about one job the daemon does not hold is
+        # refused before any provider is probed on its behalf.
+        job = request.get("job")
+        if job is not None and (self._jobs is None or self._jobs.get(job) is None):
+            return protocol.reply_error(
+                f"no job {job} is known to this kilix-voiced. It keeps the "
+                f"most recent {jobs.MAX_ENTRIES} jobs; ask with the 'turn' "
+                "the job's own reply carried.", protocol.ERR_NOT_FOUND)
         self._refresh_config()
         try:
             tts_status = self._tts_status(deadline)
@@ -1642,6 +1768,7 @@ class Daemon:
             idle = now - self._last_activity
             speech_error = self._speech_error
             speech_error_serial = self._speech_error_serial
+            speech_error_turn = self._speech_error_turn
         payload = {
             # `version` is the PACKAGE release and stays for the chrome that
             # shows it; `protocol` is the wire contract a client checks.
@@ -1657,6 +1784,13 @@ class Daemon:
             "listening": self._arbiter.listening,
             "speech_error": speech_error,
             "speech_error_serial": speech_error_serial,
+            # P11: the job behind that error, so the failure can be joined to
+            # the request that caused it.
+            "speech_error_turn": speech_error_turn,
+            # The ledger's view: the most recent jobs, and the one asked for,
+            # read now so a job that settled during the probes says so.
+            **({"jobs": self._jobs.recent()} if self._jobs is not None else {}),
+            **({"job": self._jobs.get(job)} if job is not None else {}),
             "chrome_speak": settings.enabled(settings.KEY_SPEAK),
             "chrome_dictate": settings.enabled(settings.KEY_DICTATE),
             "tts": tts_status,

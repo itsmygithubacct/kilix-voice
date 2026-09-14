@@ -36,13 +36,18 @@ OPS = (OP_SPEAK, OP_STOP_SPEECH, OP_DICTATE, OP_STOP_DICTATION, OP_STATUS)
 # reinterpreted.
 PROTOCOL_SCHEMA = "kilix.voice.protocol/v1"
 PROTOCOL_MAJOR = 1
-# Minor 2 adds only optional fields, which is what a minor may do: status and
-# the unsupported refusal carry `protocol`, and refusal codes other than
-# `internal` are now actually sent. A minor-1 client parses every reply it
-# understood before.
+# Minor 2 adds only optional fields and opt-in messages, which is what a minor
+# may do. Status and the unsupported refusal carry `protocol`, and refusal
+# codes other than `internal` are actually sent. Status reports job outcomes.
+# A chunk subscriber that declares minor 2 or later receives one terminal
+# message after its last descriptor. A client that declares nothing, or minor
+# 1, parses every reply and datagram it understood before.
 PROTOCOL_MINOR = 2
 PROTOCOL_VERSION = f"{PROTOCOL_MAJOR}.{PROTOCOL_MINOR}"
 _VERSION_TOKEN = re.compile(r"^(\d{1,3})(?:\.(\d{1,3}))?$")
+
+# P11: how a job ended. One vocabulary for the wire and the ledger alike.
+JOB_OUTCOMES = ("completed", "cancelled", "deadline", "failed")
 
 
 def protocol_identity() -> dict:
@@ -54,6 +59,45 @@ def protocol_identity() -> dict:
     """
     return {"schema": PROTOCOL_SCHEMA, "version": PROTOCOL_VERSION,
             "major": PROTOCOL_MAJOR, "minor": PROTOCOL_MINOR}
+
+
+def declared_minor(request: dict) -> int | None:
+    """Return the protocol minor a normalised request declared, if any.
+
+    None when the caller declared no version; 0 when it named only a major. A
+    message a newer minor adds is sent only to a caller that asked for it by
+    declaring that minor, so a legacy stream stays exactly what it was.
+    """
+    raw = request.get("v")
+    if raw is None:
+        return None
+    match = _VERSION_TOKEN.fullmatch(str(raw))
+    if match is None:
+        return None
+    return int(match.group(2)) if match.group(2) is not None else 0
+
+
+def job_terminal(outcome) -> dict:
+    """Return the one terminal message a protocol-1.2 chunk subscriber receives.
+
+    Built from the job's settled outcome, the same record status reports, so
+    the stream and status cannot disagree about how a job ended. It carries
+    no spoken or recognised text.
+    """
+    if outcome.outcome not in JOB_OUTCOMES:
+        raise ProtocolError(f"unknown job outcome {outcome.outcome!r}.")
+    message: dict = {"terminal": True, "job": outcome.job, "kind": outcome.kind,
+                     "outcome": outcome.outcome, "chunks": outcome.chunks_published}
+    if outcome.code is not None:
+        if outcome.code not in ERROR_CODES:
+            raise ProtocolError(f"unknown error code {outcome.code!r}.")
+        message["code"] = outcome.code
+        message["error"] = _cut_prose(
+            outcome.message or f"the job ended: {outcome.outcome}",
+            MAX_ERROR_PROSE_CHARS)
+    if outcome.subscriber_lost:
+        message["subscriber_lost"] = True
+    return message
 
 MAX_ID_CHARS = 64
 # AF_UNIX/SOCK_SEQPACKET has a platform message ceiling below the daemon's old
@@ -595,6 +639,16 @@ def validate_request(msg: dict, session_dir: str) -> dict:
                 msg.get("chunk_sock"), session_dir)
     elif op == OP_DICTATE:
         request["sock"] = _validated_socket(msg.get("sock"), session_dir)
+    elif op == OP_STATUS and "job" in msg:
+        # P07/P11: ask for one job's terminal outcome by the id its request
+        # was answered with. Optional, and absent from the normalised request
+        # unless sent, so every status caller that sends none is unchanged.
+        job = msg.get("job")
+        if not isinstance(job, str) or not _JOB_ID.fullmatch(job):
+            raise ProtocolError(
+                f"'job' must be a job id such as 'speak-1', got {_echo(job)}. "
+                "Use the 'turn' a speak or dictate reply carried.")
+        request["job"] = job
     return request
 
 

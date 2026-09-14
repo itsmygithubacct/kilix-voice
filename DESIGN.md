@@ -170,6 +170,28 @@ Status carries `speech_error` plus a monotonically increasing
 request's connection has closed. A client polls those fields while speaking
 and can therefore show each detached worker failure exactly once.
 
+Every accepted job ends in exactly one terminal outcome: `completed`,
+`cancelled`, `deadline` or `failed`, with a closed `code` that agrees with it
+(none, `cancelled`, `deadline`, or another failure code). The outcome is
+recorded once, first writer wins, and is the single source for every channel
+that reports it, so no two channels can disagree. A refused request is not a
+job; its reply is its only outcome. The job ledger keeps failure prose only,
+never spoken or recognised text.
+
+- `status` lists the most recent jobs as `jobs` and names the turn behind the
+  latest `speech_error` as `speech_error_turn`. `{"op":"status","job":ID}`,
+  with the `turn` a reply carried, adds that job's record as `job`, either
+  `{"state":"running"}` or its outcome, and is refused `not-found` for an id
+  the daemon does not hold.
+- A speak subscriber (`chunk_sock`) that declared `v` of `1.2` or later
+  receives one `{"terminal": true, "job", "kind", "outcome", "chunks", ...}`
+  message after the last descriptor, then end of stream. A subscriber that
+  declared nothing, or an older minor, receives none, so the stream is exactly
+  what it was.
+- On a chunk stream, `final: true` means only "no further chunk descriptor
+  will be published". It is sent while the last clip is still playing and is
+  not a success result; the terminal outcome is.
+
 ### voicelib/audio.py
 
 ```python
