@@ -16,7 +16,11 @@ accepted connection is checked with ``SO_PEERCRED``.
     {"op":"speak","text":"…"}        -> {"ok":true,"id":"","chunks":3}
     {"op":"stop-speech"}             -> {"ok":true,"id":"","stopped":true}
     {"op":"dictate","sock":"…"}      -> {"ok":true,"id":"","turn":"listen-1"}
-    {"op":"stop-dictation"}          -> {"ok":true,"id":"","stopped":true}
+    {"op":"stop-dictation"}          -> {"ok":true,"id":"","stopped":true,
+                                         "mode":"finish"}
+    {"op":"stop-dictation","mode":"abort"}
+                                     -> {"ok":true,"id":"","stopped":true,
+                                         "mode":"abort"}
     {"op":"status"}                  -> {"ok":true,"id":"","status":{…}}
 
 Dictation results go to the caller's socket as datagrams — ``{"partial":…}``
@@ -388,6 +392,10 @@ class _SpeechTurn(_JobTurn):
 
 class _DictationTurn(_JobTurn):
     """One dictation turn: the socket it delivers to, and its stop token."""
+
+    # P09: set by stop-dictation mode=abort, always BEFORE the stop token, so
+    # anything that sees the stop has already seen the abort.
+    abort = False
 
     def __init__(self, turn_id: str, receiver: socket.socket,
                  deadline: float | None = None,
@@ -1412,11 +1420,18 @@ class Daemon:
         self._arbiter.end_listen(turn.id)
 
     def _op_stop_dictation(self, request: dict) -> dict:
+        # P09: `finish` (the default) ends recording and delivers the words so
+        # far; `abort` ends it and discards them. The mode is echoed, so a
+        # client can tell a daemon that honoured it from one that ignored it.
+        mode = request.get("mode", protocol.STOP_MODE_FINISH)
         with self._lock:
             turn = self._dictation
         if turn is not None:
+            if mode == protocol.STOP_MODE_ABORT:
+                # Before the stop: whatever sees the stop sees the abort too.
+                turn.abort = True
             turn.stop.set()
-        return protocol.reply_ok(request["id"], stopped=turn is not None)
+        return protocol.reply_ok(request["id"], stopped=turn is not None, mode=mode)
 
     def _run_dictation(self, turn: _DictationTurn) -> None:
         """Record one turn, stream partials, and deliver the final text."""
@@ -1549,7 +1564,7 @@ class Daemon:
             # turn. Without this the caller gets a `final` transcript, or the
             # misleading "no audio arrived from the microphone", for a request
             # it had already given up on.
-            self._raise_if_budget_spent(turn, "while recording")
+            self._check_delivery(turn, "while recording")
             # The microphone closes the moment the turn ends, before anything
             # is recognised or delivered: click-to-talk means the recorder is
             # not still running while the last words are being turned into
@@ -1558,7 +1573,7 @@ class Daemon:
             # R6 finding 2: stopping the recorder is terminate plus join and
             # can take seconds. Checked BEFORE the overruns refusal, so a turn
             # whose budget ran out here says deadline rather than unavailable.
-            self._raise_if_budget_spent(turn, "while the recorder shut down")
+            self._check_delivery(turn, "while the recorder shut down")
             if capture.overruns:
                 # A transcript assembled from audio the queue threw away is a
                 # partial answer wearing a success reply -- the same thing A06
@@ -1576,7 +1591,7 @@ class Daemon:
             # heard nothing says deadline rather than "no audio arrived". What
             # remains between here and the send is in-process work measured
             # in microseconds, which is the accepted tolerance.
-            self._raise_if_budget_spent(turn, "before the transcript was ready")
+            self._check_delivery(turn, "before the transcript was ready")
             if not heard and not text:
                 raise DaemonError(
                     "no audio arrived from the microphone. Check that one is "
@@ -1591,6 +1606,25 @@ class Daemon:
         finally:
             capture.stop()
             engine.close()
+
+    @staticmethod
+    def _check_delivery(turn: _DictationTurn, where: str) -> None:
+        """Refuse delivery once the turn was aborted, or its budget ran out.
+
+        P09: an abort discards the words, so no final may follow it. This runs
+        at every step after recording, including straight after final
+        decoding, so an abort that lands while the recorder shuts down or
+        while the words are being decoded still delivers nothing.
+
+        An abort counts only when its stop came before the deadline, which is
+        what reason() == "cancelled" says. An abort pressed after the budget
+        had already run out is still the deadline: the first-cause rule the
+        stop token applies everywhere else. A staticmethod, as the budget
+        check is, so a daemon built without __init__ can run it.
+        """
+        if turn.abort and turn.stop.reason() == "cancelled":
+            raise Cancelled("the turn was aborted; nothing was transcribed")
+        Daemon._raise_if_budget_spent(turn, where)
 
     @staticmethod
     def _raise_if_budget_spent(turn: _DictationTurn, where: str) -> None:

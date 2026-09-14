@@ -557,6 +557,13 @@ def _embedded_audio_length(value: object) -> int | None:
     return None
 
 
+# P09: how stop-dictation ends a turn. `finish` delivers the words heard so
+# far, as every existing caller expects; `abort` discards them.
+STOP_MODE_FINISH = "finish"
+STOP_MODE_ABORT = "abort"
+STOP_MODES = (STOP_MODE_FINISH, STOP_MODE_ABORT)
+
+
 def validate_request(msg: dict, session_dir: str) -> dict:
     """Return a normalised copy of a control request, or raise ProtocolError.
 
@@ -639,6 +646,15 @@ def validate_request(msg: dict, session_dir: str) -> dict:
                 msg.get("chunk_sock"), session_dir)
     elif op == OP_DICTATE:
         request["sock"] = _validated_socket(msg.get("sock"), session_dir)
+    elif op == OP_STOP_DICTATION and "mode" in msg:
+        # P09. Inserted only when sent, so a stop that names no mode is the
+        # same normalised request it always was.
+        mode = msg.get("mode")
+        if not isinstance(mode, str) or mode not in STOP_MODES:
+            raise ProtocolError(
+                f"'mode' must be one of: {', '.join(STOP_MODES)}, got "
+                f"{_echo(mode)}. Omit it to finish and deliver the words so far.")
+        request["mode"] = mode
     elif op == OP_STATUS and "job" in msg:
         # P07/P11: ask for one job's terminal outcome by the id its request
         # was answered with. Optional, and absent from the normalised request

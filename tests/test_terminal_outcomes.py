@@ -59,7 +59,8 @@ log.write(b"eof\n")
 '''
 
 RECORDER = r'''
-import sys, time
+import os, sys, time
+open(os.path.join(sys.argv[1], "rec-%d.pid" % os.getpid()), "w").close()
 out = sys.stdout.buffer
 while True:
     out.write(b"\x00" * 640)
@@ -190,9 +191,32 @@ class _LiveTurnsFixture(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.tts_sizes = [SMALL]
+        # Every recogniser the daemon builds, each counting its end_utterance
+        # calls. Set end_hold to an Event and final decoding blocks on it,
+        # with end_entered set once it has started.
+        self.stt_engines: list[ScriptedStt] = []
+        self.end_hold: threading.Event | None = None
+        self.end_entered = threading.Event()
+
+        def make_stt(*args, **kwargs) -> ScriptedStt:
+            engine = ScriptedStt()
+            engine.end_calls = 0
+            decode = engine.end_utterance
+
+            def end_utterance() -> str:
+                engine.end_calls += 1
+                if self.end_hold is not None:
+                    self.end_entered.set()
+                    self.end_hold.wait(10)
+                return decode()
+
+            engine.end_utterance = end_utterance
+            self.stt_engines.append(engine)
+            return engine
+
         for target, factory in ((voiced.tts_lib, "make_tts"), (voiced.stt_lib, "make_stt")):
             fake = ((lambda *a, **k: ScriptedTts(self.tts_sizes)) if factory == "make_tts"
-                    else (lambda *a, **k: ScriptedStt()))
+                    else make_stt)
             patch = mock.patch.object(target, factory, fake)
             patch.start()
             self.addCleanup(patch.stop)
@@ -202,7 +226,8 @@ class _LiveTurnsFixture(unittest.TestCase):
                                               os.path.join(self.root, "sink.py"),
                                               self.root, "{rate}"],
                                  "capture_cmd": [sys.executable, "-B",
-                                                 os.path.join(self.root, "rec.py")]},
+                                                 os.path.join(self.root, "rec.py"),
+                                                 self.root]},
                        "stt": {"engine": "null", "max_seconds": self.MAX_SECONDS},
                        "daemon": {"idle_seconds": 0}}, handle)
         self.daemon = voiced.Daemon(config_path=config, idle_seconds=0)
@@ -541,6 +566,164 @@ class DictationOutcomes(_LiveTurnsFixture):
         self.assertEqual((record["kind"], record["outcome"], record["delivered"]),
                          ("dictation", "completed", True))
         self.assertNotIn("hello world", json.dumps(self.status()["status"]))
+
+
+def _alive(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as handle:
+            return handle.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+class AbortWorker(unittest.TestCase):
+    """TERM-03 at the worker: an abort discards the words, first cause first."""
+
+    def run_decoding(self, during_decoding, deadline_s=None):
+        from types import SimpleNamespace
+
+        class Clock:
+            t = 1000.0
+
+            def __call__(self):
+                return self.t
+
+        clock = Clock()
+        sent, ledger = [], jobs.JobLedger()
+        d = _worker_daemon(sent, ledger)
+        d._cfg = {"stt": {"engine": "vosk", "model_path": "/nonexistent",
+                          "max_seconds": 120}, "vad": {"silence_ms": 900}}
+        d._stopping = threading.Event()
+        d._require_capture_consent = lambda resolved=None: None
+        turn = voiced._DictationTurn(
+            "listen-4", mock.Mock(),
+            deadline=None if deadline_s is None else clock() + deadline_s, clock=clock)
+        turn.on_settle = ledger.record
+        frames = [b"\x00" * 320, b"\x00" * 320]
+        capture = mock.Mock(rate=16000, frame_bytes=320, overruns=0, error="")
+        capture.read.side_effect = lambda *a, **k: frames.pop(0) if frames else None
+        engine = mock.Mock(supports_partials=False)
+        engine.feed.return_value = None
+
+        def end_utterance():
+            during_decoding(turn, clock)
+            return "words the user took back"
+
+        engine.end_utterance.side_effect = end_utterance
+        events = iter([voiced.events.VAD_SPEECH_START, voiced.events.VAD_SPEECH_END])
+        with mock.patch.object(voiced.audio, "MicCapture", lambda cfg: capture), \
+             mock.patch.object(voiced.stt_lib, "make_stt", lambda *a, **k: engine), \
+             mock.patch.object(voiced, "Vad", lambda cfg: SimpleNamespace(
+                 feed=lambda frame: next(events, ""))):
+            voiced.Daemon._run_dictation(d, turn)
+        return sent, ledger
+
+    @staticmethod
+    def abort(turn, clock) -> None:
+        turn.abort = True
+        turn.stop.set()
+
+    def test_an_abort_during_final_decoding_delivers_no_final(self) -> None:
+        sent, ledger = self.run_decoding(self.abort)
+        self.assertEqual(len(sent), 1, sent)
+        self.assertNotIn("final", sent[0])
+        self.assertEqual((sent[0]["code"], sent[0]["segment"]),
+                         (protocol.ERR_CANCELLED, "listen-4"))
+        self.assertEqual(ledger.get("listen-4")["outcome"], "cancelled")
+
+    def test_an_abort_after_the_budget_ran_out_is_the_deadline(self) -> None:
+        def late_abort(turn, clock):
+            clock.t += 10.0                 # the budget runs out first...
+            self.abort(turn, clock)         # ...and only then the abort arrives
+
+        sent, _ledger = self.run_decoding(late_abort, deadline_s=5.0)
+        self.assertEqual([m.get("code") for m in sent], [protocol.ERR_DEADLINE])
+
+    def test_the_mode_is_kept_when_named_and_never_inserted(self) -> None:
+        with tempfile.TemporaryDirectory() as session:
+            for mode in protocol.STOP_MODES:
+                self.assertEqual(protocol.validate_request(
+                    {"op": "stop-dictation", "mode": mode}, session)["mode"], mode)
+            self.assertEqual(protocol.validate_request({"op": "stop-dictation"}, session),
+                             {"op": "stop-dictation", "id": ""})
+
+
+class Abort(_LiveTurnsFixture):
+    """TERM-03 end to end: stop-dictation mode=abort on a real daemon."""
+
+    MAX_SECONDS = 15
+
+    def start_dictation(self):
+        self.grant_consent()
+        receiver = self.receiver()
+        reply = self.call(op="dictate", sock=receiver.path)
+        self.assertTrue(reply["ok"], reply)
+        self.assertTrue(wait_until(
+            lambda: sum("partial" in m for m in receiver.msgs) >= 3, 15), receiver.msgs)
+        return receiver, reply["turn"]
+
+    def terminals(self, receiver: Receiver) -> list[dict]:
+        return [m for m in receiver.msgs if "final" in m or "error" in m]
+
+    def recorders_dead(self) -> bool:
+        pids = [int(name[4:-4]) for name in os.listdir(self.root)
+                if name.startswith("rec-") and name.endswith(".pid")]
+        return bool(pids) and not any(_alive(pid) for pid in pids)
+
+    def test_abort_during_recording_sends_one_cancelled_error_and_no_final(self) -> None:
+        receiver, job = self.start_dictation()
+        reply = self.call(op="stop-dictation", mode="abort")
+        self.assertEqual((reply["stopped"], reply["mode"]), (True, "abort"))
+        self.assertTrue(wait_until(lambda: receiver.eof, 5))
+        self.assertTrue(wait_until(self.recorders_dead, 3), "the recorder kept running")
+        terminals = self.terminals(receiver)
+        self.assertEqual(len(terminals), 1, receiver.msgs)
+        self.assertEqual((terminals[0].get("code"), terminals[0].get("segment")),
+                         (protocol.ERR_CANCELLED, job))
+        self.assertIs(receiver.msgs[-1], terminals[0])          # nothing after it
+        self.assertEqual(self.stt_engines[-1].end_calls, 0)     # never decoded
+        record = self.settled(job)
+        self.assertEqual((record["outcome"], record["code"]), ("cancelled", "cancelled"))
+
+    def test_abort_during_end_utterance_suppresses_the_final(self) -> None:
+        self.end_hold = threading.Event()
+        receiver, job = self.start_dictation()
+        self.call(op="stop-dictation")                      # finish: decoding starts
+        self.assertTrue(self.end_entered.wait(5))
+        reply = self.call(op="stop-dictation", mode="abort")
+        self.assertIs(reply["stopped"], True)
+        self.end_hold.set()
+        self.assertTrue(wait_until(lambda: receiver.eof, 5))
+        self.assertEqual([t.get("code") for t in self.terminals(receiver)],
+                         [protocol.ERR_CANCELLED], receiver.msgs)
+        self.assertEqual(self.settled(job)["outcome"], "cancelled")
+
+    def test_abort_after_final_is_noop(self) -> None:
+        receiver, job = self.start_dictation()
+        self.call(op="stop-dictation")
+        self.assertTrue(wait_until(lambda: receiver.eof, 10))
+        self.assertTrue(wait_until(lambda: self.daemon._dictation is None, 5))
+        reply = self.call(op="stop-dictation", mode="abort")
+        self.assertEqual((reply["ok"], reply["stopped"], reply["mode"]), (True, False, "abort"))
+        terminals = self.terminals(receiver)
+        self.assertEqual(len(terminals), 1, receiver.msgs)
+        self.assertIn("final", terminals[0])
+        self.assertEqual(self.settled(job)["outcome"], "completed")
+
+    def test_a_finish_stop_still_delivers_the_words_so_far(self) -> None:   # control
+        receiver, job = self.start_dictation()
+        self.assertEqual(self.call(op="stop-dictation")["mode"], "finish")
+        self.assertTrue(wait_until(lambda: receiver.eof, 10))
+        terminals = self.terminals(receiver)
+        self.assertEqual([(t.get("final"), t.get("segment")) for t in terminals],
+                         [("hello world", job)])
+        self.assertEqual(self.stt_engines[-1].end_calls, 1)
+
+    def test_invalid_mode_refused(self) -> None:
+        for mode in ("now", "", "ABORT", 5, None, ["abort"]):
+            with self.subTest(mode=mode):
+                reply = self.call(op="stop-dictation", mode=mode)
+                self.assertEqual(reply.get("code"), protocol.ERR_MALFORMED, reply)
 
 
 class SettleOnce(unittest.TestCase):

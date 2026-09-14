@@ -191,6 +191,17 @@ never spoken or recognised text.
 - On a chunk stream, `final: true` means only "no further chunk descriptor
   will be published". It is sent while the last clip is still playing and is
   not a success result; the terminal outcome is.
+- Every dictation terminal datagram, `final` or `error`, carries the job id as
+  `segment`, and a job sends exactly one of them.
+
+`stop-dictation` takes an optional `mode`. `finish`, the default, ends
+recording and delivers the words heard so far as the job's final. `abort` ends
+recording and discards what was heard: final decoding never runs, no final is
+sent, and the job's one terminal is an error datagram coded `cancelled`, with
+outcome `cancelled`. An abort that arrives after the final was delivered
+changes nothing and replies `stopped: false`. The reply echoes the `mode`, so a
+client can tell an older daemon, which ignores the field and finishes, from
+one that honoured it.
 
 ### voicelib/audio.py
 
