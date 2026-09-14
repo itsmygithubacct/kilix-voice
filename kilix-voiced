@@ -148,6 +148,19 @@ class DaemonNotFound(DaemonError):
     code = protocol.ERR_NOT_FOUND
 
 
+class DaemonRefusedReceiver(DaemonError):
+    """Refused because the named receiver is the daemon's own control socket.
+
+    Containment admits any path inside the session directory, and control.sock
+    is inside it. A dictate or speak naming it connected the worker to this
+    daemon's own listener, which then read transcripts and chunk descriptors
+    as requests. Like a path outside the session, that is a value no caller
+    should send: malformed.
+    """
+
+    code = protocol.ERR_MALFORMED
+
+
 class DaemonUnavailable(DaemonError):
     """Refused because a capability is switched off or cannot be started."""
 
@@ -284,6 +297,12 @@ def _connect_dictation(path: str) -> socket.socket:
 class Daemon:
     """The control socket, the request dispatch, and the two kinds of turn."""
 
+    # File identity (st_dev, st_ino) of the bound control socket, recorded by
+    # _bind. Class-level None: a daemon built without __init__ or never bound
+    # has no control socket for a receiver to collide with.
+    _socket_dev: int | None = None
+    _socket_ino: int | None = None
+
     def __init__(self, *, config_path: str | None = None,
                  idle_seconds: float | None = None,
                  verbose: bool = False) -> None:
@@ -409,7 +428,9 @@ class Daemon:
             os.umask(previous)
         try:
             os.chmod(self._socket_path, paths.SOCKET_MODE)
-            self._socket_ino = os.stat(self._socket_path).st_ino
+            bound = os.stat(self._socket_path)
+            self._socket_ino = bound.st_ino
+            self._socket_dev = bound.st_dev
             endpoint.listen(LISTEN_BACKLOG)
             endpoint.setblocking(False)
         except OSError as error:
@@ -712,6 +733,27 @@ class Daemon:
                 "This is a bug — the daemon is still running, and its stderr "
                 "has the details.")
 
+    def _refuse_own_control_socket(self, path: str, field: str) -> None:
+        """Refuse a receiver that is this daemon's own control socket.
+
+        Compared by file identity, not by name: a hard link to control.sock, or
+        a symlink inside the session resolved to it, reaches the same listener
+        under another path. A path that cannot be stat'ed is left to
+        _connect_dictation, which says what is missing.
+        """
+        if self._socket_ino is None or self._socket_dev is None:
+            return
+        try:
+            info = os.stat(path)
+        except OSError:
+            return
+        if (info.st_dev, info.st_ino) == (self._socket_dev, self._socket_ino):
+            raise DaemonRefusedReceiver(
+                f"'{field}' names {path}, which is kilix-voiced's own control "
+                "socket, not a receiver. Name a socket your client bound to "
+                "receive datagrams, such as the kitty fork's "
+                "<session>/dictate-<pane>.sock.")
+
     def _next_turn_id(self, kind: str) -> str:
         with self._lock:
             self._turns += 1
@@ -779,6 +821,7 @@ class Daemon:
                 voice=engine.voice, rate=engine.rate)
         turn = _SpeechTurn(self._next_turn_id("speak"), chunks, engine, deadline)
         if request.get("chunk_sock"):
+            self._refuse_own_control_socket(request["chunk_sock"], "chunk_sock")
             turn.receiver = _connect_dictation(request["chunk_sock"])
         # F07: the chunk receiver is connected before the expiry check, the
         # arbiter claim and the worker start, but only _run_speech ever closed
@@ -1027,6 +1070,7 @@ class Daemon:
         # only channel it has, and a caller told "ok" would wait for a
         # datagram that can never arrive. Nothing has been claimed yet, so a
         # failure leaves read-aloud playing.
+        self._refuse_own_control_socket(request["sock"], "sock")
         receiver = _connect_dictation(request["sock"])
         turn = _DictationTurn(self._next_turn_id("listen"), receiver, deadline)
         if turn.expired():
