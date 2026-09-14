@@ -592,14 +592,17 @@ class Provenance(unittest.TestCase):
         self.assertEqual(self.family_and_voice(engine), ("off", "none"))
 
     def test_seed_fields_per_engine(self) -> None:
-        # A14: every real engine returns an integer seed and says honestly
-        # whether it means anything. None of these engines takes a seed.
-        # espeak-ng and silence have no stochastic stage; kilix-piper-tts
-        # leaves Piper's noise unseeded, so only Piper is not reproducible.
+        # A14: each engine says honestly whether a seed means anything. None
+        # of these engines takes a seed. espeak-ng and silence have no
+        # stochastic stage, so seed 0 reproduces their output. kilix-piper-tts
+        # leaves Piper's noise unseeded, so Piper is not reproducible.
+        # CORRECTED (PIP-01): this required an integer seed from Piper too, a
+        # seed that never produced its clip. Piper now reports none.
         def fields(engine):
             prov = engine.last_provenance
-            self.assertIsInstance(prov.seed, int)
-            self.assertNotIsInstance(prov.seed, bool)
+            if prov.seed is not None:
+                self.assertIsInstance(prov.seed, int)
+                self.assertNotIsInstance(prov.seed, bool)
             return prov.seed, prov.seed_consumed, prov.reproducible, prov.rate_wpm
 
         cmd = [sys.executable, "-I", self.script, "{voice}", "{rate}", self.log, "ok"]
@@ -625,7 +628,7 @@ class Provenance(unittest.TestCase):
         with mock.patch.dict(os.environ, {tts.PIPER_ENV_COMMAND: provider}):
             piper = tts.PiperTts(rate=240)
             piper.synth("hello")
-        self.assertEqual(fields(piper), (0, False, False, 240))
+        self.assertEqual(fields(piper), (None, False, False, 240))
 
     def test_an_engine_that_records_nothing_is_described_from_its_attributes(self) -> None:
         class ThirdParty:
@@ -636,8 +639,10 @@ class Provenance(unittest.TestCase):
 
         self.assertEqual(tts.clip_provenance(ThirdParty()),
                          tts.SynthesisProvenance("m", "v1", 3, False, False, 150))
+        # CORRECTED (PIP-01): an engine reporting no integer seed was given
+        # seed 0, a seed it never used. It now gets none.
         self.assertEqual(tts.clip_provenance(Odd()),
-                         tts.SynthesisProvenance("unset", "unset", 0, False, False, 0))
+                         tts.SynthesisProvenance("unset", "unset", None, False, False, 0))
 
 
 @unittest.skipUnless(os.environ.get("VOICE_TEST_REAL_ENGINES") == "1"

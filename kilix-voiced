@@ -1399,9 +1399,10 @@ class Daemon:
                 ordinal, pcm_bytes=len(data), sample_rate=rate,
                 voice=prov.voice,
                 model=prov.model,
-                # A14: always an integer seed and the settings the engine was
-                # actually given, from its own record. seed_consumed and
-                # reproducible say whether that seed means anything.
+                # A14: the seed and settings the engine was actually given, from
+                # its own record. A clip with no seed to report -- Piper's, whose
+                # noise is unseeded -- carries none; seed_consumed and
+                # reproducible say whether a seed that is there means anything.
                 seed=prov.seed,
                 final=final, audio_fd=0, media_type=protocol.AUDIO_MEDIA_TYPE,
                 byte_length=len(wav), sha256=hashlib.sha256(wav).hexdigest(),

@@ -920,7 +920,10 @@ def synthesis_chunk(sequence: int, *, pcm_bytes: int, sample_rate: int,
                     sha256: str | None = None, **settings: object) -> dict:
     """Return one streamed synthesis chunk descriptor.
 
-    A12 sequence, A13 voice provenance, A14 seed and deterministic settings.
+    A12 sequence, A13 voice provenance, A14 seed and settings. ``seed`` is
+    included only when one is given: a clip that no seed produced carries none.
+    Its settings say, as `seed_consumed` and `reproducible`, whether a seed
+    reached the engine and whether identical input renders identical audio.
     The samples never ride in the JSON -- only their length, which
     check_audio_bytes bounds.
 

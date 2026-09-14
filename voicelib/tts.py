@@ -274,7 +274,10 @@ class SynthesisProvenance(NamedTuple):
 
     model: str
     voice: str
-    seed: int = 0
+    # The seed that produced the clip, or None when there is none to report.
+    # kilix-voice never makes one up: a descriptor carries a seed only when the
+    # engine reports one, or when its output is reproducible without one.
+    seed: int | None = None
     seed_consumed: bool = False
     reproducible: bool = False
     rate_wpm: int = 0
@@ -286,7 +289,9 @@ def clip_provenance(engine: object) -> SynthesisProvenance:
     A real engine records it. One that does not -- a third-party engine or a
     test double -- is described from its attributes, each type-checked, with
     its seed marked not consumed and its output not reproducible, which claims
-    nothing the engine did not say. A voice string is passed through as given:
+    nothing the engine did not say. An engine that reports no integer seed gets
+    none: inventing 0 would present a seed that never produced the clip. A
+    voice string is passed through as given:
     an unusable voice is refused where the descriptor is built, not papered
     over here.
     """
@@ -307,7 +312,7 @@ def clip_provenance(engine: object) -> SynthesisProvenance:
     return SynthesisProvenance(
         model=family,
         voice=voice if isinstance(voice, str) and voice else "unset",
-        seed=seed if isinstance(seed, int) and not isinstance(seed, bool) else 0,
+        seed=seed if isinstance(seed, int) and not isinstance(seed, bool) else None,
         seed_consumed=False,
         reproducible=False,
         rate_wpm=rate if isinstance(rate, int) and not isinstance(rate, bool) else 0)
@@ -956,11 +961,13 @@ class PiperTts:
         """A13/A14 for a Piper clip.
 
         The model and voice are fixed. kilix-piper-tts sets only the length
-        scale, so no seed reaches the model and its noise is unseeded: the
-        seed is reported, marked unconsumed, and the output is not claimed to
-        be reproducible.
+        scale: no seed reaches the model, and its noise is drawn fresh on every
+        synthesis, so identical text and settings give different audio. There
+        is no seed to report. This used to report seed 0, so every descriptor
+        presented a seed and settings that could not reproduce the clip. The
+        clip carries no seed and says it is not reproducible.
         """
-        return SynthesisProvenance(self.model, self.voice, seed=0,
+        return SynthesisProvenance(self.model, self.voice, seed=None,
                                    seed_consumed=False, reproducible=False,
                                    rate_wpm=self.rate)
 
