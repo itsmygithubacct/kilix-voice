@@ -318,8 +318,7 @@ def _local_engine() -> tuple[bool, str]:
         return False, _one_line(error)
     detail = f"{engine} · {voice} · {command[0]}"
     if engine == "mbrola":
-        detail += (f" (mb-{voice} is tried first and falls back to plain "
-                   "espeak when it is not installed)")
+        detail += f" ({tts_lib.mbrola_selection_detail(voice)})"
     return True, detail
 
 

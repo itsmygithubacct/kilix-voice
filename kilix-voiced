@@ -205,6 +205,18 @@ def _carried_code(error: BaseException, default: str) -> str:
     return code if code in protocol.ERROR_CODES else default
 
 
+def _reply_voice(engine: object) -> str:
+    """The voice a speak reply names: for the mbrola tier, the voice it runs.
+
+    The request's en-us is a language, not an MBROLA voice, so naming it
+    would not say what speaks. Only a real eSpeak engine is asked; any other
+    engine names its own voice.
+    """
+    if isinstance(engine, tts_lib.EspeakTts):
+        return engine.selected_voice
+    return engine.voice
+
+
 def clean_for_injection(text: str) -> str:
     """Return recognised text that is safe to type into a terminal."""
     return " ".join(_UNSAFE_FOR_PTY.sub(" ", str(text)).split())
@@ -1094,7 +1106,7 @@ class Daemon:
             # silence is the right rendering of that, not a failure.
             return protocol.reply_ok(
                 request["id"], chunks=0, model=engine.model,
-                voice=engine.voice, rate=engine.rate)
+                voice=_reply_voice(engine), rate=engine.rate)
         turn = _SpeechTurn(self._next_turn_id("speak"), chunks, engine, deadline)
         if request.get("chunk_sock"):
             self._refuse_own_control_socket(request["chunk_sock"], "chunk_sock")
@@ -1146,7 +1158,7 @@ class Daemon:
                     ledger.begin(turn.id, jobs.KIND_SPEECH)
             return protocol.reply_ok(
                 request["id"], turn=turn.id, chunks=len(chunks),
-                model=engine.model, voice=engine.voice, rate=engine.rate)
+                model=engine.model, voice=_reply_voice(engine), rate=engine.rate)
         finally:
             if not handed_off and turn.receiver is not None:
                 try:
@@ -2091,8 +2103,9 @@ class Daemon:
                     "detail": str(error)}
         detail = command[0]
         if engine == "mbrola":
-            detail += (f"; the mb-{voice} voice is tried first and falls back "
-                       "to plain espeak when it is not installed")
+            # The voice the tier really runs: en-us is a language, and there
+            # is no mb-en-us.
+            detail += f"; {tts_lib.mbrola_selection_detail(voice)}"
         return {"engine": engine, "model": engine, "available": True,
                 "voice": voice, "detail": detail}
 

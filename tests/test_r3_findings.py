@@ -464,6 +464,8 @@ class R4SurvivorCoverageTestCase(unittest.TestCase):
         engine._mbrola_ok = True
         engine._mbrola_fallback = True
         engine.mbrola_error = ""
+        # Resolved at construction, which __new__ skips (MB-01).
+        engine._mbrola_voice = "mb-us1"
 
         def _fake_run(text, voice, *, budget=None):
             seen.append(budget)
@@ -626,6 +628,8 @@ class R4SurvivorCoverageTestCase(unittest.TestCase):
         engine._mbrola_ok = True
         engine._mbrola_fallback = True
         engine.mbrola_error = ""
+        # Resolved at construction, which __new__ skips (MB-01).
+        engine._mbrola_voice = "mb-us1"
 
         def _fake_run(text, voice, *, budget=None):
             seen.append(budget)

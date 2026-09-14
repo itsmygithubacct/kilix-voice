@@ -593,9 +593,15 @@ class StreamedSynthesisTestCase(unittest.TestCase):
                 "        + struct.pack('<I', len(pcm)) + pcm)\n"
                 "sys.stdout.buffer.write(b'RIFF' + struct.pack('<I', 4 + len(body))"
                 " + b'WAVE' + body)\n")
-        return tts_lib.EspeakTts(
-            {"tts": {"cmd": [sys.executable, "-I", script, "{voice}"]}},
-            voice="en-us", rate=170, mbrola=True)
+        # An installed MBROLA voice for en-us, so the tier really tries mb-us1
+        # and the fake refuses it: the fallback runs on any host (MB-01).
+        share = os.path.join(tmp, "share")
+        os.makedirs(os.path.join(share, "mbrola", "us1"))
+        open(os.path.join(share, "mbrola", "us1", "us1"), "wb").close()
+        with mock.patch.dict(os.environ, {"XDG_DATA_DIRS": share}):
+            return tts_lib.EspeakTts(
+                {"tts": {"cmd": [sys.executable, "-I", script, "{voice}"]}},
+                voice="en-us", rate=170, mbrola=True)
 
     def test_real_espeak_fallback_reaches_the_descriptor(self) -> None:
         # AUD-04 / V24 A13: the provenance test above passes only because a

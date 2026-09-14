@@ -118,6 +118,138 @@ class TtsDeadlineExceeded(TtsError):
     code = protocol.ERR_DEADLINE
 
 
+# --------------------------------------------------------------------------
+# MBROLA voices
+# --------------------------------------------------------------------------
+
+# The MBROLA voices espeak-ng knows, by the language each speaks, most preferred
+# first. Generated from espeak-ng 1.52's voices/mb data: its `language <tag>
+# <priority>` lines, lower priority first, then the voice id. A voice id names
+# its diphone database by its first part, so de4-en speaks English with de4.
+MBROLA_VOICES_BY_LANGUAGE: dict[str, tuple[str, ...]] = {
+    'af': ('af1',),
+    'ar': ('ar1', 'ar2'),
+    'cs': ('cz1', 'cz2'),
+    'de': ('de1', 'de2', 'de3', 'de4', 'de6', 'de5', 'de7', 'de8'),
+    'el': ('gr2', 'gr1'),
+    'en': ('en1', 'us2', 'us1', 'us3', 'de1-en', 'de2-en', 'de3-en', 'de4-en',
+           'de5-en', 'de6-en', 'gr2-en', 'ro1-en', 'fr1-en', 'fr4-en', 'hu1-en',
+           'nl2-en', 'sw2-en', 'af1-en', 'pl1-en', 'sw1-en'),
+    'en-gb': ('en1',),
+    'en-uk': ('en1',),
+    'en-us': ('us1', 'us2', 'us3'),
+    'es': ('es3', 'es4', 'es1', 'es2', 'mx1', 'mx2', 'vz1'),
+    'es-es': ('es3', 'es4', 'es1', 'es2'),
+    'es-mx': ('mx1', 'mx2'),
+    'es-vz': ('vz1',),
+    'et': ('ee1',),
+    'fa': ('ir1',),
+    'fr': ('fr1', 'fr4', 'fr2', 'fr3', 'fr6', 'fr7', 'fr5', 'ca1', 'ca2'),
+    'fr-be': ('fr5',),
+    'fr-ca': ('ca1', 'ca2'),
+    'fr-fr': ('fr1', 'fr4', 'fr2', 'fr3', 'fr6'),
+    'grc': ('de6-grc',),
+    'he': ('hb1', 'hb2'),
+    'hi': ('in1', 'in2'),
+    'hr': ('cr1',),
+    'hu': ('hu1',),
+    'id': ('id1',),
+    'is': ('ic1',),
+    'it': ('it3', 'it4', 'it1', 'it2'),
+    'ja': ('jp1', 'jp2', 'jp3'),
+    'la': ('la1',),
+    'lt': ('lt1', 'lt2'),
+    'mi': ('nz1',),
+    'ms': ('ma1',),
+    'nl': ('nl2', 'nl1', 'nl3'),
+    'pl': ('pl1',),
+    'pt': ('pt1', 'br1', 'br2', 'br3', 'br4'),
+    'pt-br': ('br1', 'br2', 'br3', 'br4'),
+    'pt-pt': ('pt1',),
+    'ro': ('ro1',),
+    'sv': ('sw1', 'sw2'),
+    'te': ('tl1',),
+    'tr': ('tr1', 'tr2'),
+    'xex': ('br1-xex', 'br4-xex', 'br2-xex', 'br3-xex'),
+    'zh': ('cn1',),
+}
+
+# An explicit MBROLA voice id such as us1 or de4-en, as opposed to a language.
+_MBROLA_VOICE_ID = re.compile(r"^[a-z]{2}[0-9]{1,2}(-[a-z]{2,3})?$")
+# espeak-ng's own default when XDG_DATA_DIRS is unset.
+_MBROLA_DEFAULT_DATA_DIRS = "/usr/local/share:/usr/share"
+
+
+def mbrola_database_installed(database: str) -> bool:
+    """True when espeak-ng would find the MBROLA diphone database ``database``.
+
+    The search espeak-ng's mbrola wrapper makes, and nothing is launched: a
+    regular file at <dir>/mbrola/<db>, <dir>/mbrola/<db>/<db> or
+    <dir>/mbrola/voices/<db>, for each <dir> in XDG_DATA_DIRS.
+    """
+    raw = os.environ.get("XDG_DATA_DIRS") or _MBROLA_DEFAULT_DATA_DIRS
+    for root in (part for part in raw.split(":") if part):
+        base = os.path.join(root, "mbrola")
+        for path in (os.path.join(base, database),
+                     os.path.join(base, database, database),
+                     os.path.join(base, "voices", database)):
+            if os.path.isfile(path):
+                return True
+    return False
+
+
+def installed_mbrola_voices() -> tuple[str, ...]:
+    """Every MBROLA voice espeak-ng knows whose database is installed, sorted."""
+    known = sorted({voice for voices in MBROLA_VOICES_BY_LANGUAGE.values()
+                    for voice in voices})
+    return tuple(voice for voice in known
+                 if mbrola_database_installed(voice.split("-")[0]))
+
+
+def resolve_mbrola_voice(voice: str) -> str:
+    """Return the espeak-ng voice name, mb-<id>, that speaks ``voice`` with MBROLA.
+
+    ``voice`` is an MBROLA voice id (us1, de4-en), used as named, or a language
+    tag such as en-us, the shared default. A language resolves to the most
+    preferred of its voices whose database is installed. The tier used to run
+    mb-<voice> verbatim, and espeak-ng has no voice called mb-en-us, so
+    model=mbrola failed as shipped even where a US English MBROLA voice was
+    installed.
+
+    Raises TtsUnsupported when no MBROLA voice speaks the language, and
+    TtsError (unavailable) when none of the voices that do is installed. Both
+    name the MBROLA voices that are installed.
+    """
+    token = str(voice).strip().lower()
+    if _MBROLA_VOICE_ID.match(token):
+        return f"mb-{token}"
+    candidates = MBROLA_VOICES_BY_LANGUAGE.get(token, ())
+    for candidate in candidates:
+        if mbrola_database_installed(candidate.split("-")[0]):
+            return f"mb-{candidate}"
+    installed = ", ".join(installed_mbrola_voices()) or "none"
+    if not candidates:
+        raise TtsUnsupported(
+            f"no MBROLA voice speaks {voice!r}. Name an installed MBROLA voice "
+            f"({installed}) or a language one of them speaks, such as en-us.")
+    packages = " ".join(f"mbrola-{database}" for database in list(dict.fromkeys(
+        candidate.split("-")[0] for candidate in candidates))[:3])
+    raise TtsError(
+        f"no MBROLA voice for {voice!r} is installed: it is spoken by "
+        f"{', '.join(candidates)}, and the installed MBROLA voices are: "
+        f"{installed}. Install one (Debian/Ubuntu: sudo apt install mbrola "
+        f"{packages}), or choose an installed voice.")
+
+
+def mbrola_selection_detail(voice: str) -> str:
+    """One status line: the MBROLA voice ``voice`` runs, or why plain espeak does."""
+    try:
+        return (f"MBROLA voice {resolve_mbrola_voice(voice)} speaks {voice}, with "
+                "plain espeak if it fails")
+    except TtsError as error:
+        return f"plain espeak speaks {voice}: {error}"
+
+
 class RenderedSpeech(NamedTuple):
     """One complete in-memory rendering, ready for a file container."""
 
@@ -554,6 +686,9 @@ class EspeakTts:
     """
 
     name = "espeak"
+    # The espeak-ng voice the mbrola tier runs (mb-us1), resolved at
+    # construction; None when the tier is off or has nothing to run.
+    _mbrola_voice: str | None = None
 
     def __init__(self, cfg: dict | None = None, *, voice: str | None = None,
                  rate: int | None = None, mbrola: bool = False,
@@ -570,6 +705,18 @@ class EspeakTts:
         # explain why the voice sounds like plain espeak.
         self.mbrola_error = ""
         self._mbrola_ok = self.mbrola
+        if self.mbrola:
+            try:
+                self._mbrola_voice = resolve_mbrola_voice(self.voice)
+            except TtsError as error:
+                # An exact model=mbrola request is refused here, before anything
+                # is accepted or launched, naming what is installed. The
+                # settings tier speaks plain espeak instead of starting a
+                # process that cannot succeed.
+                if not self._mbrola_fallback:
+                    raise
+                self._mbrola_ok = False
+                self.mbrola_error = str(error)
         # A13: what produced the last clip. Set only when a synthesis
         # succeeds, so the failed mbrola attempt never leaves it behind.
         self.last_provenance: SynthesisProvenance | None = None
@@ -583,6 +730,14 @@ class EspeakTts:
         """
         recorded = self.last_provenance
         return None if recorded is None else recorded.model
+
+    @property
+    def selected_voice(self) -> str:
+        """The voice a reply names: the MBROLA voice id while that tier is in use
+        (us1 for en-us), otherwise the eSpeak voice."""
+        if self._mbrola_ok and self._mbrola_voice:
+            return self._mbrola_voice[len("mb-"):]
+        return self.voice
 
     @staticmethod
     def _checked_voice(voice: str) -> str:
@@ -603,9 +758,9 @@ class EspeakTts:
             # A screen of nothing but decoration conditions down to nothing;
             # that is an empty clip, not a failure to synthesise.
             return b"", ESPEAK_SAMPLE_RATE
-        if self._mbrola_ok:
+        if self._mbrola_ok and self._mbrola_voice:
             try:
-                return self._run(clean, f"mb-{self.voice}", budget=budget)
+                return self._run(clean, self._mbrola_voice, budget=budget)
             except TtsDeadlineExceeded:
                 # A budget that ran out says nothing about whether the mbrola
                 # voice is installed. Treating it as a failure marked mbrola
@@ -955,10 +1110,20 @@ def render_text(text: str, *, model: str | None = None,
                     f"{chunk_rate} Hz between clips. Save shorter text with one "
                     "voice, or fix the engine so every clip uses one rate.")
             rendered.append(pcm)
+        # The file is labelled with what produced it: the mbrola tier that fell
+        # back to plain espeak rendered espeak, not mbrola.
+        model, voice = engine.model, engine.voice
+        recorded = getattr(engine, "last_provenance", None)
+        if isinstance(engine, EspeakTts):
+            voice = engine.selected_voice
+            if isinstance(recorded, SynthesisProvenance):
+                model, voice = recorded.model, recorded.voice
+                if model == models.TTS_ENGINE_MBROLA and voice.startswith("mb-"):
+                    voice = voice[len("mb-"):]
         return RenderedSpeech(
             b"".join(rendered),
             ESPEAK_SAMPLE_RATE if sample_rate is None else sample_rate,
-            len(chunks), engine.model, engine.voice, engine.rate)
+            len(chunks), model, voice, engine.rate)
     finally:
         closer = getattr(engine, "close", None)
         if closer is not None:

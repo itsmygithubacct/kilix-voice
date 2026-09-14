@@ -352,6 +352,23 @@ class SynthCommand(unittest.TestCase):
         self.assertIn("neither espeak-ng nor espeak", str(caught.exception))
 
 
+def _mbrola_databases(test: unittest.TestCase, *names: str) -> str:
+    """Point espeak-ng's MBROLA database search at a private tree holding ``names``.
+
+    Which MBROLA voices are installed decides what the mbrola tier runs, so a
+    test that depends on it says so rather than reading the host's.
+    """
+    directory = tempfile.TemporaryDirectory()
+    test.addCleanup(directory.cleanup)
+    for name in names:
+        os.makedirs(os.path.join(directory.name, "mbrola", name))
+        open(os.path.join(directory.name, "mbrola", name, name), "wb").close()
+    patcher = mock.patch.dict(os.environ, {"XDG_DATA_DIRS": directory.name})
+    patcher.start()
+    test.addCleanup(patcher.stop)
+    return directory.name
+
+
 class _FakeProcess:
     """A Popen stand-in: nothing is executed, no device is written to."""
 
@@ -418,15 +435,19 @@ class Synthesis(unittest.TestCase):
         self.assertEqual(fake.calls, [])
 
     def test_mbrola_falls_back_to_plain_espeak_and_remembers(self) -> None:
-        fake = self.engine(fail=("mb-en-us",))
+        # CORRECTED (MB-01): this expected the tier to run mb-en-us, a voice
+        # espeak-ng does not have. en-us now resolves to an installed MBROLA
+        # voice, here us1, and that voice is the one that fails.
+        _mbrola_databases(self, "us1")
+        fake = self.engine(fail=("mb-us1",))
         engine = tts.EspeakTts(self.CFG, voice="en-us", rate=170, mbrola=True)
         pcm, _rate = engine.synth("first")
         self.assertEqual(pcm, self.PCM)
-        self.assertEqual(fake.voices, ["mb-en-us", "en-us"])
+        self.assertEqual(fake.voices, ["mb-us1", "en-us"])
         self.assertIn("mbrola", engine.mbrola_error)
         # The rest of the page must not pay for the doomed process again.
         engine.synth("second")
-        self.assertEqual(fake.voices, ["mb-en-us", "en-us", "en-us"])
+        self.assertEqual(fake.voices, ["mb-us1", "en-us", "en-us"])
 
     def test_explicit_mbrola_model_does_not_fall_back_to_espeak(self) -> None:
         fake = self.engine(fail=("mb-us1",))
@@ -501,6 +522,8 @@ class Provenance(unittest.TestCase):
         with open(self.script, "w", encoding="utf-8") as handle:
             handle.write(_FAKE_SYNTHESISER)
         self.log = os.path.join(self.dir, "invocations.log")
+        # en-us speaks MBROLA through us1 here, whatever the host has installed.
+        _mbrola_databases(self, "us1")
 
     def espeak(self, mode: str = "ok", **kwargs: object) -> tts.EspeakTts:
         cfg = {"tts": {"cmd": [sys.executable, "-I", self.script, "{voice}",
@@ -526,16 +549,17 @@ class Provenance(unittest.TestCase):
         self.assertEqual([i["voice"] for i in self.invocations()], ["en-us"])
 
     def test_mbrola_success_reports_mbrola_and_mb_voice(self) -> None:
+        # CORRECTED (MB-01): mb-en-us, pinned here, is not an espeak-ng voice.
         engine = self.espeak(mbrola=True)
         engine.synth("hello")
-        self.assertEqual(self.family_and_voice(engine), ("mbrola", "mb-en-us"))
-        self.assertEqual([i["voice"] for i in self.invocations()], ["mb-en-us"])
+        self.assertEqual(self.family_and_voice(engine), ("mbrola", "mb-us1"))
+        self.assertEqual([i["voice"] for i in self.invocations()], ["mb-us1"])
 
     def test_mbrola_fallback_reports_espeak(self) -> None:
         engine = self.espeak("mb-fails", mbrola=True)
         engine.synth("hello")
         self.assertEqual([i["voice"] for i in self.invocations()],
-                         ["mb-en-us", "en-us"])
+                         ["mb-us1", "en-us"])                # CORRECTED (MB-01)
         self.assertEqual(self.family_and_voice(engine), ("espeak", "en-us"))
         self.assertEqual(engine.model, "mbrola")            # the request, unchanged
         self.assertEqual(engine.effective_model, "espeak")  # what was used
