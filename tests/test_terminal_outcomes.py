@@ -197,6 +197,8 @@ class _LiveTurnsFixture(unittest.TestCase):
         self.stt_engines: list[ScriptedStt] = []
         self.end_hold: threading.Event | None = None
         self.end_entered = threading.Event()
+        # Seconds the recogniser takes to close: the teardown after a final.
+        self.close_delay = 0.0
 
         def make_stt(*args, **kwargs) -> ScriptedStt:
             engine = ScriptedStt()
@@ -211,6 +213,12 @@ class _LiveTurnsFixture(unittest.TestCase):
                 return decode()
 
             engine.end_utterance = end_utterance
+
+            def close() -> None:
+                if self.close_delay:
+                    time.sleep(self.close_delay)
+
+            engine.close = close
             self.stt_engines.append(engine)
             return engine
 
@@ -576,10 +584,29 @@ def _alive(pid: int) -> bool:
         return False
 
 
+class _ObservedToken:
+    """A stop token that reports what the turn looked like the instant it was set.
+
+    The token's own class has __slots__, so its set() cannot be replaced; the
+    turn's token is swapped for this instead. Everything else is the real one.
+    """
+
+    def __init__(self, token, on_set) -> None:
+        self._token = token
+        self._on_set = on_set
+
+    def set(self) -> None:
+        self._on_set()
+        self._token.set()
+
+    def __getattr__(self, name):
+        return getattr(self._token, name)
+
+
 class AbortWorker(unittest.TestCase):
     """TERM-03 at the worker: an abort discards the words, first cause first."""
 
-    def run_decoding(self, during_decoding, deadline_s=None):
+    def run_decoding(self, during_decoding, deadline_s=None, during_stop=None):
         from types import SimpleNamespace
 
         class Clock:
@@ -602,8 +629,21 @@ class AbortWorker(unittest.TestCase):
         frames = [b"\x00" * 320, b"\x00" * 320]
         capture = mock.Mock(rate=16000, frame_bytes=320, overruns=0, error="")
         capture.read.side_effect = lambda *a, **k: frames.pop(0) if frames else None
+        # The real stop-dictation handler can run inside the recorder's
+        # shutdown, as a request arriving while it is terminated would.
+        d._lock = threading.RLock()
+        d._dictation = turn
+        stops = []
+
+        def stop_capture():
+            stops.append(1)
+            if len(stops) == 1 and during_stop is not None:
+                during_stop(d, turn)
+
+        capture.stop.side_effect = stop_capture
         engine = mock.Mock(supports_partials=False)
         engine.feed.return_value = None
+        self.engine = engine
 
         def end_utterance():
             during_decoding(turn, clock)
@@ -646,6 +686,75 @@ class AbortWorker(unittest.TestCase):
                     {"op": "stop-dictation", "mode": mode}, session)["mode"], mode)
             self.assertEqual(protocol.validate_request({"op": "stop-dictation"}, session),
                              {"op": "stop-dictation", "id": ""})
+
+    def test_an_abort_while_the_recorder_shuts_down_never_decodes(self) -> None:
+        # The boundary straight after capture.stop() must see an abort that
+        # arrived during it. Checking only the budget there ran final decoding
+        # of words the user took back, refused only at a later boundary.
+        replies = []
+
+        def abort_now(d, turn):
+            replies.append(voiced.Daemon._op_stop_dictation(
+                d, {"id": "s", "mode": "abort"}))
+
+        sent, ledger = self.run_decoding(lambda turn, clock: None, during_stop=abort_now)
+        self.assertIs(replies[0]["stopped"], True)
+        self.engine.end_utterance.assert_not_called()
+        self.assertEqual([(m.get("code"), "final" in m) for m in sent],
+                         [(protocol.ERR_CANCELLED, False)])
+        self.assertEqual(ledger.get("listen-4")["outcome"], "cancelled")
+
+    def test_whatever_sees_the_stop_already_sees_the_abort(self) -> None:
+        for mode, expected in ((protocol.STOP_MODE_ABORT, [True]),
+                               (protocol.STOP_MODE_FINISH, [False])):
+            with self.subTest(mode=mode):
+                d = object.__new__(voiced.Daemon)
+                d._lock = threading.RLock()
+                turn = voiced._DictationTurn("listen-2", mock.Mock())
+                d._dictation = turn
+                seen = []
+                turn.stop = _ObservedToken(turn.stop, lambda turn=turn, seen=seen:
+                                           seen.append(turn.abort))
+                reply = voiced.Daemon._op_stop_dictation(d, {"id": "s", "mode": mode})
+                self.assertEqual((reply["stopped"], seen), (True, expected))
+
+    def test_a_stop_after_the_terminal_is_decided_changes_nothing(self) -> None:
+        # The turn has delivered its final and is still tearing down, so it is
+        # still the daemon's current dictation.
+        for mode in protocol.STOP_MODES:
+            with self.subTest(mode=mode):
+                sent, ledger = [], jobs.JobLedger()
+                d = _worker_daemon(sent, ledger)
+                d._lock = threading.RLock()
+                turn = voiced._DictationTurn("listen-5", mock.Mock())
+                turn.on_settle = ledger.record
+                d._dictation = turn
+                self.assertTrue(voiced.Daemon._deliver_terminal(
+                    d, turn, protocol.dictation_final("kept", turn.id)))
+                reply = voiced.Daemon._op_stop_dictation(d, {"id": "s", "mode": mode})
+                self.assertEqual((reply["stopped"], reply["mode"]), (False, mode))
+                self.assertNotIn("quiesced", reply)
+                self.assertEqual((turn.abort, turn.stop.is_set()), (False, False))
+                self.assertEqual([m.get("final") for m in sent], ["kept"])
+                self.assertEqual(ledger.get("listen-5")["outcome"], "completed")
+
+    def test_an_abort_just_before_the_final_settles_refuses_the_final(self) -> None:
+        # The gap between the last boundary check and the settle: an abort
+        # answered stopped:true there must still keep the words from going out.
+        sent, ledger = [], jobs.JobLedger()
+        d = _worker_daemon(sent, ledger)
+        d._lock = threading.RLock()
+        turn = voiced._DictationTurn("listen-6", mock.Mock())
+        turn.on_settle = ledger.record
+        d._dictation = turn
+        reply = voiced.Daemon._op_stop_dictation(d, {"id": "s", "mode": "abort"})
+        self.assertIs(reply["stopped"], True)
+        with self.assertRaises(voiced.Cancelled):
+            voiced.Daemon._deliver_terminal(
+                d, turn, protocol.dictation_final("taken back", turn.id))
+        self.assertEqual(sent, [])
+        self.assertIsNone(turn.outcome)
+        self.assertIsNone(ledger.get("listen-6"))
 
 
 class Abort(_LiveTurnsFixture):
@@ -708,6 +817,21 @@ class Abort(_LiveTurnsFixture):
         terminals = self.terminals(receiver)
         self.assertEqual(len(terminals), 1, receiver.msgs)
         self.assertIn("final", terminals[0])
+        self.assertEqual(self.settled(job)["outcome"], "completed")
+
+    def test_an_abort_during_a_slow_teardown_after_the_final_is_a_noop(self) -> None:
+        # Wave-2 reproduction: the recogniser takes seconds to close after the
+        # final went out, and an abort in that window was answered stopped:true.
+        self.close_delay = 1.5
+        receiver, job = self.start_dictation()
+        self.call(op="stop-dictation")
+        self.assertTrue(wait_until(lambda: any("final" in m for m in receiver.msgs), 10))
+        self.assertIsNotNone(self.daemon._dictation, "precondition: teardown still running")
+        reply = self.call(op="stop-dictation", mode="abort")
+        self.assertEqual((reply["stopped"], reply["mode"]), (False, "abort"), reply)
+        self.assertNotIn("quiesced", reply)
+        self.assertTrue(wait_until(lambda: receiver.eof, 10))
+        self.assertEqual(["final" in t for t in self.terminals(receiver)], [True])
         self.assertEqual(self.settled(job)["outcome"], "completed")
 
     def test_a_finish_stop_still_delivers_the_words_so_far(self) -> None:   # control

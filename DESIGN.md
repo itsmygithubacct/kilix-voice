@@ -207,8 +207,12 @@ never spoken or recognised text.
 recording and delivers the words heard so far as the job's final. `abort` ends
 recording and discards what was heard: final decoding never runs, no final is
 sent, and the job's one terminal is an error datagram coded `cancelled`, with
-outcome `cancelled`. An abort that arrives after the final was delivered
-changes nothing and replies `stopped: false`. The reply echoes the `mode`, so a
+outcome `cancelled`. A stop in either mode that arrives once the job's
+terminal is decided -- its final delivered, say, while the recorder and
+recogniser are still being torn down -- changes nothing and replies `stopped:
+false`. The stop and the final's settlement are decided under one lock. A final
+settles only if no abort has won by then, so an abort answered `stopped: true`
+always keeps the words from being delivered. The reply echoes the `mode`, so a
 client can tell an older daemon, which ignores the field and finishes, from
 one that honoured it.
 

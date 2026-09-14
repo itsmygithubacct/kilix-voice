@@ -355,10 +355,16 @@ class _JobTurn:
     # nothing measurable and needs no per-turn setup.
     _settle_lock = threading.Lock()
 
-    def settle(self, outcome: jobs.JobOutcome) -> bool:
+    def settle(self, outcome: jobs.JobOutcome,
+               precondition: Callable[[], None] | None = None) -> bool:
         with self._settle_lock:
             if self.outcome is not None:
                 return False
+            if precondition is not None:
+                # Refuses by raising, under the lock stop-dictation decides
+                # under, so what it checks cannot change before the outcome
+                # is set.
+                precondition()
             self.outcome = outcome
             hook = self.on_settle
             if hook is not None:
@@ -1543,10 +1549,20 @@ class Daemon:
         # stop is set before that feed's result is looked at.
         acquired = turn.progress_lock.acquire(timeout=STOP_QUIESCE_TIMEOUT_S)
         try:
-            if mode == protocol.STOP_MODE_ABORT:
-                # Before the stop: whatever sees the stop sees the abort too.
-                turn.abort = True
-            turn.stop.set()
+            # Decided once, under the settle lock. Either this job's one
+            # terminal was already decided -- its final delivered, say, while
+            # the turn still tears down its recorder and recogniser -- and the
+            # stop changes nothing, so the reply says it stopped nothing (V15
+            # arm C's late stop, and an abort after the final). Or the stop and
+            # the abort are in place before any final can settle, and that
+            # final then refuses itself.
+            with turn._settle_lock:
+                if turn.outcome is not None:
+                    return protocol.reply_ok(request["id"], stopped=False, mode=mode)
+                if mode == protocol.STOP_MODE_ABORT:
+                    # Before the stop: whatever sees the stop sees the abort too.
+                    turn.abort = True
+                turn.stop.set()
         finally:
             if acquired:
                 turn.progress_lock.release()
@@ -1646,9 +1662,16 @@ class Daemon:
             outcome, prose = jobs.OUTCOME_FAILED, message.get("error", "")
             if code not in protocol.ERROR_CODES:
                 code = protocol.ERR_INTERNAL
+        # A final settles only if, at that instant and under the lock
+        # stop-dictation decides under, no abort has won and the budget is not
+        # spent. The boundary checks before this leave a gap an abort can land
+        # in; this closes it, and the refusal becomes the job's terminal.
+        precondition = ((lambda: self._check_delivery(
+            turn, "before the transcript was delivered"))
+            if "final" in message else None)
         if not turn.settle(jobs.JobOutcome(job=turn.id, kind=jobs.KIND_DICTATION,
                                            outcome=outcome, code=code,
-                                           message=prose)):
+                                           message=prose), precondition):
             self._warn(f"dictation {turn.id}: a second terminal was suppressed")
             return False
         delivered = self._send(turn.receiver, message)
