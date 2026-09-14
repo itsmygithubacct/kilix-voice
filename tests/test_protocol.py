@@ -278,7 +278,8 @@ class ValidateRequestTestCase(SessionTestCase):
     def test_every_documented_op_is_accepted(self) -> None:
         self.assertEqual(
             protocol.OPS,
-            ("speak", "stop-speech", "dictate", "stop-dictation", "status"))
+            ("speak", "stop-speech", "dictate", "stop-dictation", "status",
+             "ingest-audio"))
         for op in ("stop-speech", "stop-dictation", "status"):
             with self.subTest(op=op):
                 self.assertEqual(protocol.validate_request({"op": op},

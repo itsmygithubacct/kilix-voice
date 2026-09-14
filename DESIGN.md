@@ -220,6 +220,25 @@ partial is suppressed. Partials are progress: a receiver that is not reading
 loses partials rather than ending the turn, while a receiver that has gone
 ends it.
 
+`ingest-audio` hands the daemon audio by descriptor, to be checked and
+returned in canonical form. The caller attaches exactly one pre-opened
+descriptor -- a pipe's read end, a regular file or a memfd -- by SCM_RIGHTS, and
+may declare `sample_format` (`s16le`), `channels` (1), `sample_rate`
+(8000-48000 Hz), `container` (`wav` or `raw`), `duration_limit_ms` (up to
+600000) and `byte_limit` (up to 32 MiB). Every declaration is optional. The
+daemon reads the descriptor within the byte limit, and a pipe within one second
+or the request's deadline. It refuses, never truncates, anything that breaks a
+declaration or a ceiling: `malformed`, `unsupported`, `too-large` or
+`deadline`. A regular file over the byte limit is refused unread, and a device,
+socket or directory is refused unread. No path is ever opened on the caller's
+behalf, and nothing is resampled or downmixed. The reply carries a canonical
+s16le mono WAV as a sealed, read-only descriptor (`audio_fd` 0), with
+`sample_rate`, `pcm_bytes`, `byte_length`, `duration_ms`, `sha256` and
+`media_type` that match its bytes, and the `job` it was recorded under. It runs
+on the control connection: no worker, microphone, arbiter claim, consent gate
+or model is involved, so a slow pipe can hold the accept loop for at most one
+second.
+
 ### voicelib/audio.py
 
 ```python

@@ -20,12 +20,22 @@ import ctypes
 import errno
 import fcntl
 import os
+import select
+import stat
+import time
 
 from . import protocol
 
 # At most this many SCM_RIGHTS descriptors are received with one control
 # request. More are closed by the kernel as the message is truncated.
 MAX_INBOUND_FDS = 4
+
+# A pipe must reach end-of-file within this long. Ingestion answers on the
+# control connection, so this bounds how long a slow writer can hold the
+# accept loop -- the same order as a peer that connects and says nothing.
+INGEST_READ_TIMEOUT_S = 1.0
+_READ_BLOCK = 1 << 20
+_PIPE_BLOCK = 1 << 16
 
 _MFD_CLOEXEC = 0x0001
 _MFD_ALLOW_SEALING = 0x0002
@@ -108,3 +118,88 @@ def sealed_readonly(data: bytes) -> int:
     finally:
         if writer >= 0:
             os.close(writer)
+
+
+def read_descriptor(fd: int, *, byte_limit: int, deadline: float | None = None,
+                    clock=time.monotonic) -> bytes:
+    """Return the bytes behind a caller's audio descriptor, bounded, or refuse.
+
+    A08: audio arrives as a pre-opened descriptor, never as a path, so the
+    daemon reads with the caller's own access and opens nothing on its
+    behalf. The read is bounded in bytes and in time and refuses rather than
+    truncates. A regular file, a memfd included, is refused unread when it is
+    larger than ``byte_limit``. A pipe is read until end-of-file, within
+    INGEST_READ_TIMEOUT_S or the caller's ``deadline`` (an absolute instant
+    on ``clock``), whichever comes first. A device, a socket or a directory
+    is refused without being read.
+
+    Raises DescriptorError: malformed, unsupported, too-large or deadline.
+    The caller keeps ownership of ``fd``.
+    """
+    try:
+        info = os.fstat(fd)
+        access = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
+    except OSError as error:
+        raise DescriptorError(
+            f"cannot inspect the audio descriptor: {error}. Attach an open "
+            "descriptor.", protocol.ERR_MALFORMED) from error
+    if access not in (os.O_RDONLY, os.O_RDWR):
+        raise DescriptorError(
+            "the audio descriptor is not open for reading. Attach a read-only "
+            "descriptor, or the read end of the pipe.", protocol.ERR_MALFORMED)
+    if stat.S_ISREG(info.st_mode):
+        if info.st_size > byte_limit:
+            raise DescriptorError(
+                f"the audio is {info.st_size} bytes and the byte limit is "
+                f"{byte_limit}. It was refused without being read.",
+                protocol.ERR_TOO_LARGE)
+        chunks, total = [], 0
+        while total <= byte_limit:
+            block = os.pread(fd, min(_READ_BLOCK, byte_limit + 1 - total), total)
+            if not block:
+                break
+            chunks.append(block)
+            total += len(block)
+        if total > byte_limit:
+            raise DescriptorError(
+                f"the audio grew past the byte limit of {byte_limit} while it "
+                "was read. It was refused, not truncated.", protocol.ERR_TOO_LARGE)
+        return b"".join(chunks)
+    if stat.S_ISFIFO(info.st_mode):
+        # Never O_NONBLOCK: the descriptor shares its open file description
+        # with the sender, whose own end would change under it.
+        started = clock()
+        chunks, total = [], 0
+        while True:
+            now = clock()
+            window = started + INGEST_READ_TIMEOUT_S - now
+            budget = None if deadline is None else deadline - now
+            left = window if budget is None else min(window, budget)
+            if left <= 0:
+                if budget is not None and budget <= window:
+                    raise DescriptorError(
+                        "the request deadline elapsed while the audio pipe was "
+                        "being read; nothing was returned.", protocol.ERR_DEADLINE)
+                raise DescriptorError(
+                    f"the audio pipe did not reach end-of-file within "
+                    f"{INGEST_READ_TIMEOUT_S:g} s. Close the write end once the "
+                    "audio is written, or attach a regular file or memfd.",
+                    protocol.ERR_MALFORMED)
+            ready, _, _ = select.select([fd], [], [], left)
+            if not ready:
+                continue
+            block = os.read(fd, min(_PIPE_BLOCK, byte_limit + 1 - total))
+            if not block:
+                return b"".join(chunks)
+            chunks.append(block)
+            total += len(block)
+            if total > byte_limit:
+                # Stop here: never drain the rest of a pipe that is too big.
+                raise DescriptorError(
+                    f"the audio pipe carried more than the byte limit of "
+                    f"{byte_limit}. It was refused, not truncated.",
+                    protocol.ERR_TOO_LARGE)
+    raise DescriptorError(
+        "the audio descriptor must be a pipe, a regular file or a memfd. A "
+        "device, socket or directory is refused without being read.",
+        protocol.ERR_UNSUPPORTED)

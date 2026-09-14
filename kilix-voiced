@@ -22,6 +22,8 @@ accepted connection is checked with ``SO_PEERCRED``.
                                      -> {"ok":true,"id":"","stopped":true,
                                          "quiesced":true,"mode":"abort"}
     {"op":"status"}                  -> {"ok":true,"id":"","status":{…}}
+    {"op":"ingest-audio"} + 1 fd     -> {"ok":true,"id":"","job":"ingest-1",
+                                         "audio_fd":0,"pcm_bytes":…} + 1 fd
 
 Dictation results go to the caller's socket as datagrams — ``{"partial":…}``
 while the person is still speaking, one ``{"final":…}`` at the end, or
@@ -78,8 +80,8 @@ for _package_root in (_INSTALLED_LIB, _HERE):
 
 from voicelib import (
     consent,  # noqa: E402  (the import follows the path bootstrap)
-    __version__, audio, audiofd, daemon_config, events, jobs, models, paths,
-    protocol, settings, stt as stt_lib, tts as tts_lib, util)
+    __version__, audio, audio_input, audiofd, daemon_config, events, jobs,
+    models, paths, protocol, settings, stt as stt_lib, tts as tts_lib, util)
 from voicelib.arbiter import Arbiter, ArbiterError  # noqa: E402
 from voicelib.cancel import (  # noqa: E402
     Cancellation, Cancelled, CancellationError, DeadlineExceeded)
@@ -916,6 +918,9 @@ class Daemon:
             protocol.OP_DICTATE: self._op_dictate,
             protocol.OP_STOP_DICTATION: self._op_stop_dictation,
             protocol.OP_STATUS: self._op_status,
+            # The one op that reads the descriptors its request arrived with.
+            protocol.OP_INGEST_AUDIO: lambda request: self._op_ingest_audio(
+                request, fds, truncated),
         }
         try:
             return handlers[request["op"]](request)
@@ -936,6 +941,67 @@ class Daemon:
                 f"kilix-voiced could not handle {request['op']}: {error}. "
                 "This is a bug — the daemon is still running, and its stderr "
                 "has the details.")
+
+    def _op_ingest_audio(self, request: dict, fds: tuple[int, ...] = (),
+                         truncated: bool = False) -> dict:
+        """A01/A08: normalise audio a caller handed over by descriptor.
+
+        The reply carries a canonical s16le mono WAV as a sealed, read-only
+        descriptor (audio_fd 0), with metadata that matches its bytes. It runs
+        synchronously on the control connection. No worker, microphone,
+        arbiter claim, consent gate or model is involved, since nothing is
+        captured or recognised, and the read is bounded in bytes and time.
+        A refusal is not a job; its reply is its only outcome.
+        """
+        # The budget starts HERE, as every other handler's does.
+        deadline_ms = request.get("deadline_ms")
+        deadline = (time.monotonic() + deadline_ms / 1000.0
+                    if deadline_ms is not None else None)
+        if deadline is not None and time.monotonic() >= deadline:
+            return protocol.reply_error(
+                f"the request deadline of {deadline_ms} ms elapsed before the "
+                "audio could be read; nothing was read.", protocol.ERR_DEADLINE)
+        if truncated or len(fds) != 1:
+            carried = f"more than {len(fds)}" if truncated else str(len(fds))
+            return protocol.reply_error(
+                f"ingest-audio takes exactly one audio descriptor, attached by "
+                f"SCM_RIGHTS, and this request carried {carried}. Attach the "
+                "read end of a pipe, a regular file or a memfd.",
+                protocol.ERR_MALFORMED)
+        try:
+            data = audiofd.read_descriptor(
+                fds[0], byte_limit=request.get("byte_limit", protocol.MAX_AUDIO_BYTES),
+                deadline=deadline)
+            audio = audio_input.normalize(data, request)
+            wav = util.write_wav(audio.pcm, audio.sample_rate)
+            if deadline is not None and time.monotonic() >= deadline:
+                # The delivery boundary, as dictation has one: a result the
+                # caller has given up on is not handed back as a success.
+                return protocol.reply_error(
+                    f"the request deadline of {deadline_ms} ms elapsed while the "
+                    "audio was normalised; nothing is returned.",
+                    protocol.ERR_DEADLINE)
+            fd = audiofd.sealed_readonly(wav)
+        except (audiofd.DescriptorError, audio_input.AudioInputError) as error:
+            return protocol.reply_error(str(error), error.code)
+        try:
+            job = self._next_turn_id("ingest")
+            if self._jobs is not None:
+                self._jobs.record(jobs.JobOutcome(
+                    job=job, kind=jobs.KIND_INGEST,
+                    outcome=jobs.OUTCOME_COMPLETED, code=None))
+            self._touch()
+            return _Outbound(protocol.reply_ok(
+                request["id"], job=job, media_type=protocol.AUDIO_MEDIA_TYPE,
+                sample_format=protocol.SAMPLE_FORMATS[0], channels=1,
+                sample_rate=audio.sample_rate, pcm_bytes=len(audio.pcm),
+                byte_length=len(wav), duration_ms=audio.duration_ms,
+                sha256=hashlib.sha256(wav).hexdigest(), audio_fd=0), fds=(fd,))
+        except BaseException:
+            # Handed to _accept_one only inside a reply; anything short of
+            # that must not leave the sealed copy open.
+            os.close(fd)
+            raise
 
     def _refuse_own_control_socket(self, path: str, field: str) -> None:
         """Refuse a receiver that is this daemon's own control socket.

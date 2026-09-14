@@ -59,7 +59,26 @@ def rms16(frame: bytes) -> float:
     return math.sqrt(total / len(samples)) / 32768.0
 
 
-def parse_wav_bytes(data: bytes) -> tuple[bytes, int]:
+class WavFormatError(ValueError):
+    """A WAV stream kilix-voice cannot use; ``code`` says broken or unsupported.
+
+    A ValueError, so every caller that already catches ValueError is unchanged.
+    The codes are the protocol's `malformed` and `unsupported`, spelled out
+    because this module imports nothing from voicelib.
+    """
+
+    def __init__(self, message: str, code: str = "malformed") -> None:
+        if code not in ("malformed", "unsupported"):
+            raise ValueError(f"unknown WAV error code {code!r}")
+        super().__init__(message)
+        self.code = code
+
+
+# The data sizes a writer that cannot seek back leaves in the header.
+_PLACEHOLDER_DATA_SIZES = frozenset({0, 0x7FFFFF80, 0x7FFFFFFF, 0xFFFFFFFF})
+
+
+def parse_wav_bytes(data: bytes, strict: bool = False) -> tuple[bytes, int]:
     """Return (s16le mono PCM, sample rate) from an in-memory WAV.
 
     Walks the RIFF chunk list instead of assuming header offsets: real engine
@@ -68,9 +87,16 @@ def parse_wav_bytes(data: bytes) -> tuple[bytes, int]:
     number of bytes it went on to write.  Raises ValueError for anything that
     is not uncompressed 16-bit mono PCM — resampling and downmixing belong to
     the caller that knows what the audio is for.
+
+    The ValueError is a WavFormatError whose code says whether the stream is
+    broken (`malformed`) or a valid WAV of a kind not supported
+    (`unsupported`). ``strict`` is for audio a CALLER handed over rather than
+    an engine produced: a data chunk declaring more bytes than arrived, other
+    than a known placeholder, and data that is not whole samples are refused
+    instead of trimmed, because trimming would answer about a different clip.
     """
     if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WAVE":
-        raise ValueError(
+        raise WavFormatError(
             "not a WAV stream: missing the RIFF/WAVE header. Check that the "
             "engine was asked for WAV on stdout and that stderr was not mixed "
             "into the same pipe.")
@@ -82,42 +108,52 @@ def parse_wav_bytes(data: bytes) -> tuple[bytes, int]:
         body = pos + 8
         if chunk_id == b"fmt ":
             if size < 16 or body + 16 > len(data):
-                raise ValueError(
+                raise WavFormatError(
                     "truncated WAV 'fmt ' chunk: the stream ended mid-header. "
                     "Read the engine's output to completion before parsing.")
             fmt = struct.unpack_from("<HHIIHH", data, body)
         elif chunk_id == b"data":
             if fmt is None:
-                raise ValueError(
+                raise WavFormatError(
                     "malformed WAV: the 'data' chunk precedes 'fmt '. Re-run "
                     "the engine; this stream cannot be interpreted.")
             tag, channels, rate, _byte_rate, _align, bits = fmt
             if tag != _WAVE_FORMAT_PCM:
-                raise ValueError(
+                raise WavFormatError(
                     f"unsupported WAV format tag {tag}: kilix-voice needs "
                     "uncompressed PCM (tag 1). Ask the engine for raw PCM/WAV "
-                    "output rather than a compressed container.")
+                    "output rather than a compressed container.", "unsupported")
             if channels != 1:
-                raise ValueError(
+                raise WavFormatError(
                     f"WAV declares {channels} channels: kilix-voice audio is "
-                    "mono. Configure the engine for 1 channel.")
+                    "mono. Configure the engine for 1 channel.", "unsupported")
             if bits != 16:
-                raise ValueError(
+                raise WavFormatError(
                     f"WAV declares {bits}-bit samples: kilix-voice audio is "
-                    "signed 16-bit. Configure the engine for 16-bit output.")
+                    "signed 16-bit. Configure the engine for 16-bit output.",
+                    "unsupported")
             if rate <= 0:
-                raise ValueError(
+                raise WavFormatError(
                     "WAV header declares a sample rate of 0. Re-run the "
                     "engine; the stream is corrupt.")
+            available = len(data) - body
+            if strict and size not in _PLACEHOLDER_DATA_SIZES and size > available:
+                raise WavFormatError(
+                    f"truncated WAV: the 'data' chunk declares {size} bytes and "
+                    f"{available} arrived. Send the whole file.")
             # A writer piping WAV cannot seek back to patch its header, so the
             # declared length is a placeholder: espeak leaves 0x7FFFFF80,
             # others leave 0 or ~0u. Trust the bytes that actually arrived.
-            end = body + size if 0 < size <= len(data) - body else len(data)
+            end = body + size if 0 < size <= available else len(data)
             pcm = data[body:end]
+            if strict and len(pcm) % 2:
+                raise WavFormatError(
+                    f"WAV data is {len(pcm)} bytes, not whole 16-bit samples. "
+                    "Send the file as it was written.")
             return pcm[:len(pcm) - (len(pcm) % 2)], rate
         # Chunks are word-aligned: an odd size is followed by a pad byte.
         pos = body + size + (size % 2)
-    raise ValueError(
+    raise WavFormatError(
         "WAV stream has no 'data' chunk: nothing was synthesised. Check the "
         "engine's exit status and stderr.")
 

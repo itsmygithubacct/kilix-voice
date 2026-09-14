@@ -21,8 +21,21 @@ OP_STOP_SPEECH = "stop-speech"
 OP_DICTATE = "dictate"
 OP_STOP_DICTATION = "stop-dictation"
 OP_STATUS = "status"
+# A01/A08: caller-facing audio input, handed over as a descriptor.
+OP_INGEST_AUDIO = "ingest-audio"
 
-OPS = (OP_SPEAK, OP_STOP_SPEECH, OP_DICTATE, OP_STOP_DICTATION, OP_STATUS)
+OPS = (OP_SPEAK, OP_STOP_SPEECH, OP_DICTATE, OP_STOP_DICTATION, OP_STATUS,
+       OP_INGEST_AUDIO)
+
+# ingest-audio's declarations. Every one is optional: the V19 contract vector
+# requires each op to validate with nothing but {op, deadline_ms}, so what
+# must be present is decided by the handler, which answers with a code.
+SAMPLE_FORMATS = ("s16le",)
+CHANNEL_COUNTS = (1,)
+CONTAINERS = ("wav", "raw")
+MIN_SAMPLE_RATE = 8000
+MAX_SAMPLE_RATE = 48000
+MAX_INGEST_DURATION_MS = 10 * 60 * 1000
 
 # Protocol identity. A caller MAY declare the wire contract it was written
 # against; omitting it means "whatever the daemon speaks", which is what every
@@ -646,6 +659,42 @@ def validate_request(msg: dict, session_dir: str) -> dict:
                 msg.get("chunk_sock"), session_dir)
     elif op == OP_DICTATE:
         request["sock"] = _validated_socket(msg.get("sock"), session_dir)
+    elif op == OP_INGEST_AUDIO:
+        # A01/A08: the caller's declarations about the audio it attaches.
+        # Every one is optional -- V19 requires this op to validate with
+        # nothing but {op, deadline_ms} -- and each is checked when sent: a
+        # value of the wrong type is malformed, and a well-formed value this
+        # daemon does not handle is unsupported. Inserted only when sent.
+        for key, choices in (("sample_format", SAMPLE_FORMATS),
+                             ("container", CONTAINERS)):
+            if key in msg:
+                value = msg.get(key)
+                if not isinstance(value, str):
+                    raise ProtocolError(
+                        f"{key!r} must be a string such as {choices[0]!r}, got "
+                        f"{type(value).__name__}.")
+                if value not in choices:
+                    raise ProtocolError(
+                        f"{key!r} {_echo(value)} is not supported; use one of: "
+                        f"{', '.join(choices)}.", code=ERR_UNSUPPORTED)
+                request[key] = value
+        for key, low, high, code, unit in (
+                ("channels", min(CHANNEL_COUNTS), max(CHANNEL_COUNTS),
+                 ERR_UNSUPPORTED, "channel(s)"),
+                ("sample_rate", MIN_SAMPLE_RATE, MAX_SAMPLE_RATE,
+                 ERR_UNSUPPORTED, "Hz"),
+                ("duration_limit_ms", 1, MAX_INGEST_DURATION_MS, None, "ms"),
+                ("byte_limit", 1, MAX_AUDIO_BYTES, None, "bytes")):
+            if key in msg:
+                value = msg.get(key)
+                if not isinstance(value, int) or isinstance(value, bool):
+                    raise ProtocolError(
+                        f"{key!r} must be an integer, got {type(value).__name__}.")
+                if not low <= value <= high:
+                    raise ProtocolError(
+                        f"{key!r} is {_echo(value)}; this daemon takes "
+                        f"{low}-{high} {unit}.", code=code)
+                request[key] = value
     elif op == OP_STOP_DICTATION and "mode" in msg:
         # P09. Inserted only when sent, so a stop that names no mode is the
         # same normalised request it always was.
