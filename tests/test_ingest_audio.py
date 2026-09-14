@@ -8,6 +8,7 @@ no worker thread was started.
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import importlib.machinery
@@ -30,6 +31,8 @@ voiced = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(voiced)
 
 from voicelib import audiofd, jobs, protocol, util  # noqa: E402
+
+from tests.livedaemon import LiveDaemonTestCase  # noqa: E402
 
 _INT = struct.calcsize("i")
 PCM = bytes((i * 13) & 0xFF for i in range(3200))          # 100 ms at 16 kHz
@@ -298,6 +301,296 @@ class IngestRefused(_IngestFixture):
                 (read_end,), False)
         self.assertEqual(reply["code"], protocol.ERR_DEADLINE, reply)
         reader.assert_not_called()
+
+
+def attempts(name: str):
+    """Record every call to os.<name> as it is MADE, so one that raises counts."""
+    real = getattr(os, name)
+    calls = []
+
+    def wrapper(*args, **kwargs):
+        calls.append(args[0] if args else None)
+        return real(*args, **kwargs)
+
+    return mock.patch.object(audiofd.os, name, wrapper), calls
+
+
+def reopens(calls) -> list:
+    return [c for c in calls if isinstance(c, str) and c.startswith("/proc/self/fd/")]
+
+
+class IngestDescriptorAccess(_IngestFixture):
+    """A descriptor that grants no read is refused before anything reads it.
+
+    Reopening through /proc/self/fd would read an O_PATH file or a pipe's
+    write end that the caller never opened for reading, so the checks come
+    before any read or reopen, and these tests watch for both.
+    """
+
+    def assert_refused_unread(self, fd: int) -> None:
+        pread_patch, preads = attempts("pread")
+        read_patch, reads = attempts("read")
+        open_patch, opens = attempts("open")
+        with pread_patch, read_patch, open_patch:
+            self.assert_refused({}, [fd], protocol.ERR_MALFORMED)
+        self.assertEqual((preads, reads, reopens(opens)), ([], [], []))
+
+    def test_an_o_path_descriptor_is_malformed_and_never_read(self) -> None:
+        regular = self.file_with(wav_bytes(PCM))
+        o_path = os.open(f"/proc/self/fd/{regular}", os.O_PATH)
+        os.close(regular)
+        with self.subTest(kind="regular file"):
+            self.assert_refused_unread(o_path)
+        read_end = self.pipe_with(wav_bytes(PCM))
+        pipe_path = os.open(f"/proc/self/fd/{read_end}", os.O_PATH)
+        self.addCleanup(os.close, read_end)
+        with self.subTest(kind="pipe"):
+            self.assert_refused_unread(pipe_path)
+
+    def test_a_write_only_descriptor_is_malformed_and_never_read(self) -> None:
+        path = os.path.join(self.session, "write-only.wav")
+        with open(path, "wb") as handle:
+            handle.write(wav_bytes(PCM))
+        with self.subTest(kind="regular file"):
+            self.assert_refused_unread(os.open(path, os.O_WRONLY))
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, read_end)
+        os.write(write_end, wav_bytes(PCM))
+        with self.subTest(kind="pipe write end"):
+            self.assert_refused_unread(write_end)
+
+
+class _AlwaysReady:
+    """A poll that reports the pipe readable every time: the sender won the race."""
+
+    def register(self, *args) -> None:
+        pass
+
+    def poll(self, timeout=None):
+        time.sleep(0.005)
+        return [(0, 1)]
+
+
+class IngestPipeRace(unittest.TestCase):
+    """AUD-02: the sender shares the pipe, and may take the bytes first.
+
+    Readiness can be stale by the time the read runs: the sender kept its own
+    read end and drained what the check saw. A blocking read of the shared
+    description then waited for as long as the sender held its writer open,
+    in the daemon's one accept loop. Here the race is forced every time.
+    """
+
+    def read_in_thread(self, fd: int) -> dict:
+        box: dict = {}
+
+        def run() -> None:
+            try:
+                box["data"] = audiofd.read_descriptor(fd, byte_limit=65536)
+            except BaseException as error:
+                box["error"] = error
+
+        with mock.patch.object(audiofd.select, "poll", _AlwaysReady):
+            reader = threading.Thread(target=run, daemon=True)
+            reader.start()
+            reader.join(audiofd.INGEST_READ_TIMEOUT_S + 2.0)
+        self.assertFalse(reader.is_alive(), "the read blocked on the sender's pipe")
+        return box
+
+    def setUp(self) -> None:
+        self.writers: set[int] = set()
+        self.addCleanup(self.close_writers)
+
+    def close_writers(self) -> None:
+        # Closing a writer ends any read still blocked on it, even a broken one's.
+        for fd in sorted(self.writers):
+            os.close(fd)
+        self.writers.clear()
+
+    def pipe(self) -> tuple[int, int]:
+        read_end, write_end = os.pipe()
+        self.addCleanup(os.close, read_end)
+        self.writers.add(write_end)
+        return read_end, write_end
+
+    def test_a_sender_that_holds_and_drains_the_pipe_gets_a_bounded_refusal(self) -> None:
+        read_end, _write_end = self.pipe()
+        flags = fcntl.fcntl(read_end, fcntl.F_GETFL)
+        started = time.monotonic()
+        box = self.read_in_thread(read_end)
+        self.assertIsInstance(box.get("error"), audiofd.DescriptorError, box)
+        self.assertEqual(box["error"].code, protocol.ERR_MALFORMED)
+        self.assertLess(time.monotonic() - started, audiofd.INGEST_READ_TIMEOUT_S + 0.5)
+        self.assertEqual(fcntl.fcntl(read_end, fcntl.F_GETFL), flags,
+                         "the sender's own end of the pipe was changed")
+
+    def test_a_sender_that_set_o_nonblock_gets_a_code_not_a_fault(self) -> None:
+        read_end, write_end = self.pipe()
+        flags = fcntl.fcntl(read_end, fcntl.F_GETFL) | os.O_NONBLOCK
+        fcntl.fcntl(read_end, fcntl.F_SETFL, flags)
+        box = self.read_in_thread(read_end)
+        self.assertIsInstance(box.get("error"), audiofd.DescriptorError, box)
+        self.assertEqual(box["error"].code, protocol.ERR_MALFORMED)
+        os.write(write_end, b"all of it")                      # control
+        self.writers.discard(write_end)
+        os.close(write_end)
+        self.assertEqual(self.read_in_thread(read_end), {"data": b"all of it"})
+        self.assertEqual(fcntl.fcntl(read_end, fcntl.F_GETFL), flags)
+
+    def test_a_read_the_system_refuses_carries_a_code(self) -> None:
+        for number, code in ((errno.EIO, protocol.ERR_UNAVAILABLE),
+                             (errno.EBADF, protocol.ERR_MALFORMED)):
+            with self.subTest(errno=errno.errorcode[number]):
+                fd = os.memfd_create("kv-ingest-eio")
+                self.addCleanup(os.close, fd)
+                os.write(fd, wav_bytes(PCM))
+                failing = mock.Mock(side_effect=OSError(number, os.strerror(number)))
+                with mock.patch.object(audiofd.os, "pread", failing):
+                    with self.assertRaises(audiofd.DescriptorError) as caught:
+                        audiofd.read_descriptor(fd, byte_limit=65536)
+                self.assertEqual(caught.exception.code, code)
+
+
+class IngestStalledDescriptor(_IngestFixture):
+    """A descriptor whose inspection never answers cannot hold the accept loop.
+
+    A file on a filesystem the caller serves can hold fstat or pread for as
+    long as it likes. Here fstat is held until the test releases it.
+    """
+
+    def stalled_exchange(self, request: dict) -> tuple[dict, float]:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        client.settimeout(5)
+        with client:
+            client.connect(self.path)
+            fd = self.memfd_with(wav_bytes(PCM))
+            client.sendmsg([protocol.encode(dict(request, op="ingest-audio"))],
+                           [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))])
+            os.close(fd)
+            started = time.monotonic()
+            voiced.Daemon._accept_one(self.daemon)
+            elapsed = time.monotonic() - started
+            data, ancillary, _flags, _ = client.recvmsg(1 << 16, socket.CMSG_SPACE(4 * _INT))
+        for received in _received(ancillary):
+            os.close(received)
+        return protocol.decode(data), elapsed
+
+    def test_a_stalled_descriptor_is_refused_in_bound_and_stalls_are_capped(self) -> None:
+        release, entered = threading.Event(), []
+        real_fstat = os.fstat
+
+        def held_fstat(fd, *args, **kwargs):
+            if threading.current_thread().name == "kilix-voice-ingest-read":
+                entered.append(fd)
+                release.wait(20)
+            return real_fstat(fd, *args, **kwargs)
+
+        self.addCleanup(release.set)
+        bound = audiofd.INGEST_READ_TIMEOUT_S + audiofd._READ_GRACE_S + 0.3
+        with mock.patch.object(audiofd.os, "fstat", held_fstat):
+            reply, elapsed = self.stalled_exchange({"id": "one"})
+            self.assertEqual(reply.get("code"), protocol.ERR_UNAVAILABLE, reply)
+            self.assertLess(elapsed, bound)
+            reply, elapsed = self.stalled_exchange({"id": "two", "deadline_ms": 200})
+            self.assertEqual(reply.get("code"), protocol.ERR_DEADLINE, reply)
+            self.assertLess(elapsed, 0.2 + audiofd._READ_GRACE_S + 0.3)
+            self.assertEqual(len(entered), audiofd.MAX_STALLED_READS)
+            reply, elapsed = self.stalled_exchange({"id": "three"})
+            self.assertEqual(reply.get("code"), protocol.ERR_BUSY, reply)
+            self.assertLess(elapsed, 0.3)
+            self.assertEqual(len(entered), audiofd.MAX_STALLED_READS,
+                             "a descriptor was inspected past the stall cap")
+            release.set()
+            # Once the stuck reads end, their slots come back.
+            self.assertTrue(_eventually(lambda: self.stalled_exchange({"id": "four"})[0]
+                                        .get("ok") is True, 5))
+
+
+def _eventually(predicate, timeout: float) -> bool:
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+class IngestLiveControlPlane(LiveDaemonTestCase):
+    """A real kilix-voiced: a hostile ingest pipe cannot hold stop-speech or status."""
+
+    SETTINGS = ("KILIX_VOICE_TTS_ENGINE=off\n"
+                "KILIX_VOICE_STT_ENGINE=vosk\n"
+                "KILIX_VOICE_STT_MODEL=small-en-us\n")
+    HOLD_S = 4.0
+
+    def ingest(self, fd: int, box: dict) -> None:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        client.settimeout(15)
+        with client:
+            client.connect(self.control)
+            started = time.monotonic()
+            client.sendmsg([b'{"op":"ingest-audio","id":"hostile"}\n'],
+                           [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))])
+            data, ancillary, _flags, _ = client.recvmsg(1 << 16, socket.CMSG_SPACE(4 * _INT))
+            box["elapsed"] = time.monotonic() - started
+        for received in _received(ancillary):
+            os.close(received)
+        box["reply"] = protocol.decode(data)
+
+    def test_a_pipe_its_sender_holds_and_drains_never_holds_the_control_plane(self) -> None:
+        read_end, write_end = os.pipe()
+        stop, writer_closed = threading.Event(), threading.Event()
+
+        def writer() -> None:
+            # ONE byte, once the daemon is waiting on the pipe, and then the
+            # writer is held open with nothing more written. When the drainer
+            # wins that byte, a read of the shared description has nothing to
+            # return until the writer closes. The writer closes itself after
+            # HOLD_S: a stalled daemon stalls this test's own probes too.
+            time.sleep(0.2)
+            os.write(write_end, b"R")
+            stop.wait(self.HOLD_S)
+            os.close(write_end)
+            writer_closed.set()
+
+        def drainer() -> None:
+            while not stop.is_set():
+                try:
+                    if not os.read(read_end, 1):
+                        return
+                except OSError:
+                    return
+
+        helpers = [threading.Thread(target=writer, daemon=True),
+                   threading.Thread(target=drainer, daemon=True)]
+        for helper in helpers:
+            helper.start()
+        box: dict = {}
+        ingest = threading.Thread(target=self.ingest, args=(read_end, box), daemon=True)
+        ingest.start()
+        latencies = []
+        end = time.monotonic() + self.HOLD_S
+        try:
+            while time.monotonic() < end:
+                for op in ("stop-speech", "status"):
+                    started = time.monotonic()
+                    reply = self.request({"op": op})
+                    latencies.append((time.monotonic() - started, op))
+                    self.assertTrue(reply["ok"], reply)
+                time.sleep(0.05)
+            ingest.join(5)
+        finally:
+            stop.set()                  # the writer closes; a blocked read sees end-of-file
+            self.assertTrue(writer_closed.wait(self.HOLD_S + 5))
+            for helper in helpers:
+                helper.join(2)
+            os.close(read_end)
+        bound = audiofd.INGEST_READ_TIMEOUT_S + audiofd._READ_GRACE_S + 0.5
+        self.assertFalse(ingest.is_alive(), "the ingest request was never answered")
+        self.assertEqual(box["reply"].get("code"), protocol.ERR_MALFORMED, box)
+        self.assertLess(box["elapsed"], bound, box)
+        worst, op = max(latencies)
+        self.assertLess(worst, bound, f"{op} waited {worst:.3f} s: the control plane was held")
+        self.assert_still_serving()
 
 
 class IngestRequestValidation(unittest.TestCase):

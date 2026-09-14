@@ -229,15 +229,27 @@ may declare `sample_format` (`s16le`), `channels` (1), `sample_rate`
 daemon reads the descriptor within the byte limit, and a pipe within one second
 or the request's deadline. It refuses, never truncates, anything that breaks a
 declaration or a ceiling: `malformed`, `unsupported`, `too-large` or
-`deadline`. A regular file over the byte limit is refused unread, and a device,
-socket or directory is refused unread. No path is ever opened on the caller's
-behalf, and nothing is resampled or downmixed. The reply carries a canonical
-s16le mono WAV as a sealed, read-only descriptor (`audio_fd` 0), with
-`sample_rate`, `pcm_bytes`, `byte_length`, `duration_ms`, `sha256` and
-`media_type` that match its bytes, and the `job` it was recorded under. It runs
-on the control connection: no worker, microphone, arbiter claim, consent gate
-or model is involved, so a slow pipe can hold the accept loop for at most one
-second.
+`deadline`. A regular file over the byte limit is refused unread. A device,
+socket or directory is refused unread, and so is a descriptor that grants no
+read (write-only, or opened with O_PATH). A read the system refuses is
+`unavailable`, or `malformed` when the descriptor itself cannot be read. No path
+is ever opened on the caller's behalf, and nothing is resampled or downmixed.
+The reply carries a canonical s16le mono WAV as a sealed, read-only descriptor
+(`audio_fd` 0), with `sample_rate`, `pcm_bytes`, `byte_length`, `duration_ms`,
+`sha256` and `media_type` that match its bytes, and the `job` it was recorded
+under.
+
+It answers on the control connection: no worker, microphone, arbiter claim,
+consent gate or model is involved. No descriptor can hold the accept loop past
+that one second, or the deadline if sooner, plus a quarter-second grace. A pipe
+is read through the daemon's own non-blocking description of it, so a sender
+that keeps its read end and drains what the daemon was about to read gets a
+refusal at the bound rather than a stalled daemon. It also leaves the sender's
+own O_NONBLOCK setting alone. Every step that touches the descriptor, fstat
+included, runs on a helper thread. A read that has not finished by the bound, a
+file on a filesystem the caller serves for example, is refused `unavailable`
+(or `deadline`) and left to end on its own. At most two are ever left running;
+beyond that a descriptor is refused `busy` without being inspected.
 
 ### voicelib/audio.py
 

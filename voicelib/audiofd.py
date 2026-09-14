@@ -22,6 +22,7 @@ import fcntl
 import os
 import select
 import stat
+import threading
 import time
 
 from . import protocol
@@ -36,6 +37,17 @@ MAX_INBOUND_FDS = 4
 INGEST_READ_TIMEOUT_S = 1.0
 _READ_BLOCK = 1 << 20
 _PIPE_BLOCK = 1 << 16
+# Every step that touches a caller's descriptor runs on a helper thread. The
+# accept loop waits for it no longer than the read's own bound plus this grace.
+_READ_GRACE_S = 0.25
+# A read still running when that wait ends is left to finish on its own
+# thread, holding its own duplicate of the descriptor. At most this many are
+# left running at once. Beyond that, a descriptor is refused busy before it is
+# even inspected, so a caller cannot pile up stuck threads.
+MAX_STALLED_READS = 2
+_O_PATH = getattr(os, "O_PATH", 0o10000000)
+_stalled_lock = threading.Lock()
+_stalled = 0
 
 _MFD_CLOEXEC = 0x0001
 _MFD_ALLOW_SEALING = 0x0002
@@ -130,44 +142,172 @@ def read_descriptor(fd: int, *, byte_limit: int, deadline: float | None = None,
     truncates. A regular file, a memfd included, is refused unread when it is
     larger than ``byte_limit``. A pipe is read until end-of-file, within
     INGEST_READ_TIMEOUT_S or the caller's ``deadline`` (an absolute instant
-    on ``clock``), whichever comes first. A device, a socket or a directory
-    is refused without being read.
+    on ``clock``), whichever comes first. A device, a socket, a directory or
+    an O_PATH descriptor is refused without being read.
 
-    Raises DescriptorError: malformed, unsupported, too-large or deadline.
-    The caller keeps ownership of ``fd``.
+    Whoever calls this -- the daemon's single accept loop -- is never held
+    past that bound by a descriptor the caller controls. Every step that
+    touches the descriptor, fstat included, runs on a helper thread against a
+    duplicate: a descriptor on a filesystem the caller serves can hold even
+    fstat or pread indefinitely. This thread waits at most
+    INGEST_READ_TIMEOUT_S, or until the deadline if that comes first, plus
+    _READ_GRACE_S. A read that has not finished by then is refused and left to
+    end on its own, and no more than MAX_STALLED_READS are ever left that way.
+
+    Raises DescriptorError: malformed, unsupported, too-large, deadline,
+    unavailable or busy. The caller keeps ownership of ``fd``.
     """
+    global _stalled
+    with _stalled_lock:
+        if _stalled >= MAX_STALLED_READS:
+            raise DescriptorError(
+                f"{_stalled} earlier audio descriptors are still being read and "
+                "have not answered, so this one was not inspected. Attach a "
+                "pipe, a memfd or a regular file on a local filesystem, and try "
+                "again.", protocol.ERR_BUSY)
     try:
-        info = os.fstat(fd)
-        access = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
+        own = os.dup(fd)
     except OSError as error:
         raise DescriptorError(
             f"cannot inspect the audio descriptor: {error}. Attach an open "
             "descriptor.", protocol.ERR_MALFORMED) from error
-    if access not in (os.O_RDONLY, os.O_RDWR):
+    started = clock()
+    budget = None if deadline is None else deadline - started
+    wait = (INGEST_READ_TIMEOUT_S if budget is None
+            else max(0.0, min(INGEST_READ_TIMEOUT_S, budget)))
+    result: dict = {}
+    state = {"done": False, "abandoned": False}
+
+    def work() -> None:
+        global _stalled
+        try:
+            result["data"] = _read_now(own, byte_limit=byte_limit,
+                                       deadline=deadline, clock=clock)
+        except BaseException as error:          # handed to the waiting thread
+            result["error"] = error
+        finally:
+            os.close(own)
+            with _stalled_lock:
+                state["done"] = True
+                if state["abandoned"]:
+                    _stalled -= 1
+
+    reader = threading.Thread(target=work, name="kilix-voice-ingest-read",
+                              daemon=True)
+    try:
+        reader.start()
+    except RuntimeError as error:
+        os.close(own)
+        raise DescriptorError(
+            f"cannot start a thread to read the audio descriptor: {error}. The "
+            "system is out of threads; try again later.",
+            protocol.ERR_UNAVAILABLE) from error
+    reader.join(wait + _READ_GRACE_S)
+    with _stalled_lock:
+        stalled = not state["done"]
+        if stalled:
+            state["abandoned"] = True
+            _stalled += 1
+    if stalled:
+        if budget is not None and budget <= INGEST_READ_TIMEOUT_S:
+            raise DescriptorError(
+                "the request deadline elapsed while the audio descriptor was "
+                "being read; nothing was returned.", protocol.ERR_DEADLINE)
+        raise DescriptorError(
+            f"the audio descriptor did not answer within "
+            f"{INGEST_READ_TIMEOUT_S:g} s and was refused. Attach a pipe, a "
+            "memfd or a regular file on a local filesystem.",
+            protocol.ERR_UNAVAILABLE)
+    if "error" in result:
+        raise result["error"]
+    return result["data"]
+
+
+def _read_now(fd: int, *, byte_limit: int, deadline: float | None,
+              clock) -> bytes:
+    """The read itself, run on read_descriptor's helper thread."""
+    try:
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        info = os.fstat(fd)
+    except OSError as error:
+        raise DescriptorError(
+            f"cannot inspect the audio descriptor: {error}. Attach an open "
+            "descriptor.", protocol.ERR_MALFORMED) from error
+    # Checked before anything reads or reopens the descriptor. An O_PATH
+    # descriptor's access mode reads as O_RDONLY, yet it grants no read, and
+    # reopening either kind through /proc would read what the caller never
+    # opened for reading.
+    if flags & _O_PATH:
+        raise DescriptorError(
+            "the audio descriptor was opened with O_PATH, which grants no read "
+            "access. Attach a descriptor opened for reading.",
+            protocol.ERR_MALFORMED)
+    if (flags & os.O_ACCMODE) not in (os.O_RDONLY, os.O_RDWR):
         raise DescriptorError(
             "the audio descriptor is not open for reading. Attach a read-only "
             "descriptor, or the read end of the pipe.", protocol.ERR_MALFORMED)
     if stat.S_ISREG(info.st_mode):
-        if info.st_size > byte_limit:
-            raise DescriptorError(
-                f"the audio is {info.st_size} bytes and the byte limit is "
-                f"{byte_limit}. It was refused without being read.",
-                protocol.ERR_TOO_LARGE)
-        chunks, total = [], 0
+        return _read_file(fd, info.st_size, byte_limit)
+    if stat.S_ISFIFO(info.st_mode):
+        return _read_pipe(fd, byte_limit, deadline, clock)
+    raise DescriptorError(
+        "the audio descriptor must be a pipe, a regular file or a memfd. A "
+        "device, socket or directory is refused without being read.",
+        protocol.ERR_UNSUPPORTED)
+
+
+def _unreadable(error: OSError) -> DescriptorError:
+    """Code a read the descriptor refused: the caller's descriptor or the system."""
+    reason = os.strerror(error.errno) if error.errno else str(error)
+    if error.errno in (errno.EBADF, errno.EINVAL, errno.EISDIR, errno.ESPIPE):
+        return DescriptorError(
+            f"the audio descriptor cannot be read ({reason}). Attach a pipe, a "
+            "regular file or a memfd opened for reading.", protocol.ERR_MALFORMED)
+    return DescriptorError(
+        f"reading the audio descriptor failed ({reason}); nothing was returned. "
+        "Try again, or attach the audio as a memfd.", protocol.ERR_UNAVAILABLE)
+
+
+def _read_file(fd: int, size: int, byte_limit: int) -> bytes:
+    if size > byte_limit:
+        raise DescriptorError(
+            f"the audio is {size} bytes and the byte limit is "
+            f"{byte_limit}. It was refused without being read.",
+            protocol.ERR_TOO_LARGE)
+    chunks, total = [], 0
+    try:
         while total <= byte_limit:
             block = os.pread(fd, min(_READ_BLOCK, byte_limit + 1 - total), total)
             if not block:
                 break
             chunks.append(block)
             total += len(block)
-        if total > byte_limit:
-            raise DescriptorError(
-                f"the audio grew past the byte limit of {byte_limit} while it "
-                "was read. It was refused, not truncated.", protocol.ERR_TOO_LARGE)
-        return b"".join(chunks)
-    if stat.S_ISFIFO(info.st_mode):
-        # Never O_NONBLOCK: the descriptor shares its open file description
-        # with the sender, whose own end would change under it.
+    except OSError as error:
+        raise _unreadable(error) from error
+    if total > byte_limit:
+        raise DescriptorError(
+            f"the audio grew past the byte limit of {byte_limit} while it "
+            "was read. It was refused, not truncated.", protocol.ERR_TOO_LARGE)
+    return b"".join(chunks)
+
+
+def _read_pipe(fd: int, byte_limit: int, deadline: float | None, clock) -> bytes:
+    # The descriptor's open file description is the SENDER's too. Read
+    # blocking, it stalled whenever the sender took the bytes a readiness check
+    # had just seen. Setting O_NONBLOCK on it would change the sender's own end,
+    # and a sender that had set it made the read raise EAGAIN. A private
+    # description of the same pipe, opened non-blocking, has neither problem.
+    try:
+        mine = os.open(f"/proc/self/fd/{fd}",
+                       os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as error:
+        raise DescriptorError(
+            f"cannot open a private read end of the audio pipe "
+            f"({os.strerror(error.errno) if error.errno else error}). Attach a "
+            "regular file or a memfd instead.", protocol.ERR_UNSUPPORTED) from error
+    try:
+        poller = select.poll()
+        poller.register(mine, select.POLLIN)
         started = clock()
         chunks, total = [], 0
         while True:
@@ -185,10 +325,16 @@ def read_descriptor(fd: int, *, byte_limit: int, deadline: float | None = None,
                     f"{INGEST_READ_TIMEOUT_S:g} s. Close the write end once the "
                     "audio is written, or attach a regular file or memfd.",
                     protocol.ERR_MALFORMED)
-            ready, _, _ = select.select([fd], [], [], left)
-            if not ready:
+            if not poller.poll(int(left * 1000) + 1):
                 continue
-            block = os.read(fd, min(_PIPE_BLOCK, byte_limit + 1 - total))
+            try:
+                block = os.read(mine, min(_PIPE_BLOCK, byte_limit + 1 - total))
+            except BlockingIOError:
+                # The sender read what poll saw first: not an error, and no
+                # reason to wait past the bound either.
+                continue
+            except OSError as error:
+                raise _unreadable(error) from error
             if not block:
                 return b"".join(chunks)
             chunks.append(block)
@@ -199,7 +345,5 @@ def read_descriptor(fd: int, *, byte_limit: int, deadline: float | None = None,
                     f"the audio pipe carried more than the byte limit of "
                     f"{byte_limit}. It was refused, not truncated.",
                     protocol.ERR_TOO_LARGE)
-    raise DescriptorError(
-        "the audio descriptor must be a pipe, a regular file or a memfd. A "
-        "device, socket or directory is refused without being read.",
-        protocol.ERR_UNSUPPORTED)
+    finally:
+        os.close(mine)
