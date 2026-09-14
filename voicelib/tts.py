@@ -129,6 +129,58 @@ class RenderedSpeech(NamedTuple):
     rate: int
 
 
+class SynthesisProvenance(NamedTuple):
+    """What actually produced one clip: A13 family and voice, A14 seed.
+
+    Each real engine records one at the end of a SUCCESSFUL synth, so a failed
+    attempt -- the mbrola voice that is not installed -- never leaves
+    provenance behind, and the fallback's success overwrites it. The daemon
+    reads it on the worker thread straight after synth and carries it with
+    the clip, so a descriptor describes the clip it announces, not whatever
+    the engine did last.
+    """
+
+    model: str
+    voice: str
+    seed: int = 0
+    seed_consumed: bool = False
+    reproducible: bool = False
+    rate_wpm: int = 0
+
+
+def clip_provenance(engine: object) -> SynthesisProvenance:
+    """Return the provenance of ``engine``'s last clip.
+
+    A real engine records it. One that does not -- a third-party engine or a
+    test double -- is described from its attributes, each type-checked, with
+    its seed marked not consumed and its output not reproducible, which claims
+    nothing the engine did not say. A voice string is passed through as given:
+    an unusable voice is refused where the descriptor is built, not papered
+    over here.
+    """
+    recorded = getattr(engine, "last_provenance", None)
+    if isinstance(recorded, SynthesisProvenance):
+        return recorded
+    effective = getattr(engine, "effective_model", None)
+    model = getattr(engine, "model", None)
+    if isinstance(effective, str) and effective:
+        family = effective
+    elif isinstance(model, str) and model:
+        family = model
+    else:
+        family = "unset"
+    voice = getattr(engine, "voice", None)
+    seed = getattr(engine, "seed", None)
+    rate = getattr(engine, "rate", None)
+    return SynthesisProvenance(
+        model=family,
+        voice=voice if isinstance(voice, str) and voice else "unset",
+        seed=seed if isinstance(seed, int) and not isinstance(seed, bool) else 0,
+        seed_consumed=False,
+        reproducible=False,
+        rate_wpm=rate if isinstance(rate, int) and not isinstance(rate, bool) else 0)
+
+
 # --------------------------------------------------------------------------
 # Conditioning
 # --------------------------------------------------------------------------
@@ -421,10 +473,12 @@ class NullTts:
     model = "off"
     voice = ""
     rate = 0
+    last_provenance: SynthesisProvenance | None = None
 
     def synth(self, text: str, *,
               budget: float | None = None) -> tuple[bytes, int]:
         """Return an empty clip regardless of ``text``."""
+        self.last_provenance = SynthesisProvenance(self.model, "none")
         return b"", ESPEAK_SAMPLE_RATE
 
     def cancel(self) -> None:
@@ -512,6 +566,19 @@ class EspeakTts:
         # explain why the voice sounds like plain espeak.
         self.mbrola_error = ""
         self._mbrola_ok = self.mbrola
+        # A13: what produced the last clip. Set only when a synthesis
+        # succeeds, so the failed mbrola attempt never leaves it behind.
+        self.last_provenance: SynthesisProvenance | None = None
+
+    @property
+    def effective_model(self) -> str | None:
+        """The family that produced the last clip, for a TUI; None before one.
+
+        Read-only and derived: the daemon carries the full provenance with
+        each clip instead of reading this afterwards.
+        """
+        recorded = self.last_provenance
+        return None if recorded is None else recorded.model
 
     @staticmethod
     def _checked_voice(voice: str) -> str:
@@ -591,12 +658,19 @@ class EspeakTts:
         try:
             # Trusting the header rather than a fixed rate: mbrola voices and
             # espeak builds do not all synthesise at the same rate.
-            return util.parse_wav_bytes(out)
+            clip = util.parse_wav_bytes(out)
         except ValueError as error:
             raise TtsError(
                 f"{command[0]} produced no usable audio: {error}"
                 f"{_stderr_note(err)} "
                 f"{_failure_hint(command[0], voice)}.") from error
+        # Only here, after audio was actually produced: the family is decided
+        # by the voice this run used, so the mbrola fallback's success records
+        # espeak and a failed mb- attempt records nothing.
+        self.last_provenance = SynthesisProvenance(
+            models.TTS_ENGINE_MBROLA if voice.startswith("mb-")
+            else models.TTS_ENGINE_ESPEAK, voice)
+        return clip
 
     def cancel(self) -> None:
         """eSpeak clips are short and have no persistent process to close."""
@@ -696,6 +770,8 @@ class PiperTts:
     name = models.TTS_ENGINE_PIPER
     model = models.PIPER_KRISTIN_MODEL
     voice = PIPER_VOICE
+    # A13: set when a synthesis completes or is cancelled; None before one.
+    last_provenance: SynthesisProvenance | None = None
 
     def __init__(self, *, voice: str | None = None,
                  rate: int | None = None) -> None:
@@ -772,6 +848,8 @@ class PiperTts:
         with self._lock:
             cancelled = self._cancelled
         if cancelled:
+            # The fixed model and voice were what ran; the clip is empty.
+            self.last_provenance = SynthesisProvenance(self.model, self.voice)
             return b"", PIPER_SAMPLE_RATE
         if process.returncode != 0:
             raise TtsError(
@@ -780,6 +858,7 @@ class PiperTts:
             )
         if len(out) % 2:
             raise TtsError(f"{binary} returned an odd-length s16le PCM stream")
+        self.last_provenance = SynthesisProvenance(self.model, self.voice)
         return out, PIPER_SAMPLE_RATE
 
     def cancel(self) -> None:

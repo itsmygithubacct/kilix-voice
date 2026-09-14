@@ -203,6 +203,25 @@ def _stamp() -> str:
     return time.strftime("%H:%M:%S")
 
 
+class _Clip(tuple):
+    """One synthesised clip, (pcm, rate), carrying the provenance that made it.
+
+    Still a two-tuple: it unpacks to two names and compares equal to (pcm,
+    rate) wherever a caller already expects that. The provenance is read on
+    the worker thread straight after synth and travels with the clip, so the
+    descriptor published when the clip is queued describes THIS clip, not
+    whichever synth the engine ran last.
+    """
+
+    provenance: tts_lib.SynthesisProvenance | None
+
+    def __new__(cls, pcm: bytes, rate: int,
+                provenance: tts_lib.SynthesisProvenance | None = None) -> "_Clip":
+        clip = super().__new__(cls, (pcm, rate))
+        clip.provenance = provenance
+        return clip
+
+
 class _SpeechTurn:
     """One read-aloud turn: its clips, its thread, and its cancel flag."""
 
@@ -905,8 +924,13 @@ class Daemon:
             index = 1
             while pending is not None and not turn.cancel.is_set():
                 pcm, rate = pending
+                # The provenance _synth read for THIS clip. The next clip is
+                # synthesised before this one finishes playing, so reading the
+                # engine at publish time would be right only by ordering luck.
+                provenance = getattr(pending, "provenance", None)
                 pending = None
-                if not self._play_if_current(turn, player, pcm, rate):
+                if not self._play_if_current(turn, player, pcm, rate,
+                                             provenance):
                     break
                 if index < len(turn.chunks):
                     pending = self._synth(turn, turn.chunks[index])
@@ -968,15 +992,25 @@ class Daemon:
         # progress. Hand it the remaining budget so a 210 s engine ceiling
         # cannot outlive a 2 s request.
         pcm, rate = turn.engine.synth(chunk, budget=turn.cancel.remaining())
+        # A13: read HERE, on the worker thread, straight after the synth that
+        # produced this clip. The engine is the turn's own and only this
+        # worker calls synth, so nothing can overwrite it in between.
+        provenance = tts_lib.clip_provenance(turn.engine)
         # A06 reaches real output here, not only the helper's unit tests. An
         # engine that returns an absurd clip is refused rather than queued:
         # playing a truncated prefix would be a wrong answer wearing a success.
         protocol.check_audio_bytes(len(pcm))
-        return pcm, rate
+        return _Clip(pcm, rate, provenance)
 
     def _play_if_current(self, turn: _SpeechTurn, player: audio.Player,
-                         pcm: bytes, rate: int) -> bool:
-        """Queue a clip unless this turn was cancelled or already replaced."""
+                         pcm: bytes, rate: int,
+                         provenance: tts_lib.SynthesisProvenance | None = None
+                         ) -> bool:
+        """Queue a clip unless this turn was cancelled or already replaced.
+
+        ``provenance`` is what _synth recorded for this clip. A caller that
+        has none gets the engine's own description at publish time.
+        """
         with self._lock:
             if turn.cancel.is_set() or self._speech is not turn:
                 return False
@@ -985,10 +1019,13 @@ class Daemon:
                 # just before the budget ran out must not still be played.
                 return False
             player.play(pcm, rate)
-            self._publish_chunk(turn, pcm, rate)
+            self._publish_chunk(turn, pcm, rate,
+                                provenance or tts_lib.clip_provenance(turn.engine))
             return True
 
-    def _publish_chunk(self, turn: _SpeechTurn, pcm: bytes, rate: int) -> None:
+    def _publish_chunk(self, turn: _SpeechTurn, pcm: bytes, rate: int,
+                       provenance: tts_lib.SynthesisProvenance | None = None
+                       ) -> None:
         """Emit one A12-A15 chunk descriptor as the clip is queued.
 
         Queued, not finished: A15 asks for bounded playable audio to arrive
@@ -1010,16 +1047,17 @@ class Daemon:
         ordinal = turn.sequence
         turn.sequence += 1
         final = ordinal == len(turn.chunks) - 1
+        # A13: the family and voice that ACTUALLY produced this clip, as the
+        # engine recorded them and _synth carried them here. The old read of
+        # engine.effective_model was true only of a Mock -- no real engine had
+        # that attribute -- so the mbrola fallback was reported as mbrola. A
+        # caller with no carried provenance gets the engine's own description.
+        prov = provenance or tts_lib.clip_provenance(engine)
         try:
             chunk = protocol.synthesis_chunk(
                 ordinal, pcm_bytes=len(pcm), sample_rate=rate,
-                voice=getattr(engine, "voice", "") or "unset",
-                # F06: the EFFECTIVE family, not the requested one. eSpeak's
-                # MBROLA fallback can synthesise through espeak while
-                # engine.model still reads "mbrola", so reporting the request
-                # would describe a path the clip did not take.
-                model=(getattr(engine, "effective_model", None)
-                       or getattr(engine, "model", "") or "unset"),
+                voice=prov.voice,
+                model=prov.model,
                 seed=getattr(engine, "seed", None),
                 final=final, turn=turn.id,
                 rate_wpm=getattr(engine, "rate", None))

@@ -575,6 +575,111 @@ class StreamedSynthesisTestCase(unittest.TestCase):
         self.assertEqual(len(warnings), 1, warnings)
         self.assertIn("chunk 0 of turn speak-9", warnings[0])
 
+    def _fallback_engine(self, tmp):
+        """A REAL EspeakTts on the mbrola tier whose mb- voice is not installed."""
+        import sys
+        from voicelib import tts as tts_lib
+        script = os.path.join(tmp, "synth.py")
+        with open(script, "w") as handle:
+            handle.write(
+                "import struct, sys\n"
+                "voice = sys.argv[1]\n"
+                "sys.stdin.buffer.read()\n"
+                "if voice.startswith('mb-'):\n"
+                "    sys.exit(1)\n"
+                "pcm = b'\\x01\\x00' * 400\n"
+                "fmt = struct.pack('<HHIIHH', 1, 1, 22050, 44100, 2, 16)\n"
+                "body = (b'fmt ' + struct.pack('<I', 16) + fmt + b'data'\n"
+                "        + struct.pack('<I', len(pcm)) + pcm)\n"
+                "sys.stdout.buffer.write(b'RIFF' + struct.pack('<I', 4 + len(body))"
+                " + b'WAVE' + body)\n")
+        return tts_lib.EspeakTts(
+            {"tts": {"cmd": [sys.executable, "-I", script, "{voice}"]}},
+            voice="en-us", rate=170, mbrola=True)
+
+    def test_real_espeak_fallback_reaches_the_descriptor(self) -> None:
+        # AUD-04 / V24 A13: the provenance test above passes only because a
+        # Mock sets effective_model. This drives a real engine through _synth
+        # and _play_if_current: the descriptor must name the path the clip
+        # actually took, not the family the settings asked for.
+        import tempfile
+        global sent; sent = []
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self._fallback_engine(tmp)
+            turn = voiced._SpeechTurn("speak-9", ["one", "two"], engine)
+            turn.receiver = mock.Mock()
+            daemon = self._daemon(); daemon._speech = turn
+            for chunk in turn.chunks:
+                clip = voiced.Daemon._synth(daemon, turn, chunk)
+                pcm, rate = clip
+                self.assertTrue(voiced.Daemon._play_if_current(
+                    daemon, turn, mock.Mock(), pcm, rate,
+                    getattr(clip, "provenance", None)))
+        self.assertEqual(engine.model, "mbrola")                  # the request
+        self.assertEqual([(c["model"], c["voice"]) for c in sent],
+                         [("espeak", "en-us"), ("espeak", "en-us")])
+
+    def test_the_descriptor_describes_the_clip_not_the_engines_last_synth(self) -> None:
+        # The carried provenance is what the descriptor reports, even when the
+        # engine has since synthesised something else -- _run_speech does
+        # synthesise the next clip while the current one plays.
+        import tempfile
+        from voicelib import tts as tts_lib
+        global sent; sent = []
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = self._fallback_engine(tmp)
+            turn = voiced._SpeechTurn("speak-9", ["one"], engine)
+            turn.receiver = mock.Mock()
+            daemon = self._daemon(); daemon._speech = turn
+            clip = voiced.Daemon._synth(daemon, turn, "one")
+        engine.last_provenance = tts_lib.SynthesisProvenance("mbrola", "mb-en-us")
+        pcm, rate = clip
+        voiced.Daemon._play_if_current(daemon, turn, mock.Mock(), pcm, rate,
+                                       getattr(clip, "provenance", None))
+        self.assertEqual((sent[0]["model"], sent[0]["voice"]), ("espeak", "en-us"))
+
+    def test_the_speech_loop_publishes_what_synth_recorded_for_each_clip(self) -> None:
+        # _run_speech happens to publish clip N before it synthesises clip
+        # N+1, so reading the engine at publish time used to give the right
+        # answer by ordering alone. This engine's recorded provenance moves
+        # the moment it has been read once -- as any engine that updates what
+        # it reports after a clip would -- so only provenance CARRIED from
+        # _synth through the real loop can describe each clip correctly.
+        from voicelib import tts as tts_lib
+
+        class DriftingEngine:
+            model, voice, rate, seed = "espeak", "en-us", 170, 0
+
+            def __init__(self):
+                self.calls = 0
+                self.recorded = None
+
+            @property
+            def last_provenance(self):
+                recorded, self.recorded = self.recorded, None
+                return recorded or tts_lib.SynthesisProvenance("mbrola", "moved")
+
+            def synth(self, text, *, budget=None):
+                self.calls += 1
+                self.recorded = tts_lib.SynthesisProvenance("espeak", f"v{self.calls}")
+                return b"\x00\x00", 24000
+
+            def cancel(self):
+                pass
+
+        global sent; sent = []
+        turn = voiced._SpeechTurn("speak-9", ["one", "two"], DriftingEngine())
+        turn.receiver = mock.Mock()
+        daemon = self._daemon(); daemon._speech = turn
+        daemon._touch = lambda: None
+        daemon._arbiter = mock.Mock()
+        daemon._report_speech_failure = lambda t, m: None
+        player = mock.Mock(playing=False, error="")
+        daemon._get_player = lambda: player
+        voiced.Daemon._run_speech(daemon, turn)
+        self.assertEqual([(c["model"], c["voice"]) for c in sent],
+                         [("espeak", "v1"), ("espeak", "v2")])
+
     def test_speak_validates_the_chunk_socket_inside_the_session(self) -> None:
         from voicelib import protocol
         import tempfile

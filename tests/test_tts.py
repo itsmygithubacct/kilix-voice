@@ -9,8 +9,10 @@ also the guarantee DESIGN.md makes about this module.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import struct
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -458,6 +460,124 @@ class Synthesis(unittest.TestCase):
                 with self.assertRaises(tts.TtsError) as caught:
                     tts.EspeakTts(self.CFG, voice=bad, rate=170)
                 self.assertIn("A-Za-z0-9_+-", str(caught.exception))
+
+
+_FAKE_SYNTHESISER = r'''
+import json, struct, sys
+voice, rate, log, mode = sys.argv[1:5]
+sys.stdin.buffer.read()
+with open(log, "a") as fh:
+    fh.write(json.dumps({"voice": voice, "rate": rate}) + "\n")
+if mode == "mb-fails" and voice.startswith("mb-"):
+    sys.stderr.write("mbrola voice %s is not installed\n" % voice)
+    sys.exit(1)
+pcm = b"\x01\x00" * 800
+fmt = struct.pack("<HHIIHH", 1, 1, 22050, 44100, 2, 16)
+body = (b"fmt " + struct.pack("<I", 16) + fmt + b"data"
+        + struct.pack("<I", len(pcm)) + pcm)
+sys.stdout.buffer.write(b"RIFF" + struct.pack("<I", 4 + len(body)) + b"WAVE" + body)
+'''
+
+_FAKE_PIPER = r"""#!/bin/sh
+cat > /dev/null
+printf '\001\000\002\000'
+"""
+
+
+class Provenance(unittest.TestCase):
+    """A13: each engine records the family and voice that produced its clip.
+
+    Driven through each engine's REAL synthesis path, a real process behind
+    the tts.cmd seam or the provider command. The shipped descriptor test
+    passes only because a Mock sets effective_model, which proves nothing
+    about the engines the daemon actually runs.
+    """
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.dir = directory.name
+        self.script = os.path.join(self.dir, "fake_synthesiser.py")
+        with open(self.script, "w", encoding="utf-8") as handle:
+            handle.write(_FAKE_SYNTHESISER)
+        self.log = os.path.join(self.dir, "invocations.log")
+
+    def espeak(self, mode: str = "ok", **kwargs: object) -> tts.EspeakTts:
+        cfg = {"tts": {"cmd": [sys.executable, "-I", self.script, "{voice}",
+                               "{rate}", self.log, mode]}}
+        return tts.EspeakTts(cfg, voice="en-us", rate=170, **kwargs)
+
+    def invocations(self) -> list[dict]:
+        try:
+            with open(self.log, encoding="utf-8") as handle:
+                return [json.loads(line) for line in handle if line.strip()]
+        except FileNotFoundError:
+            return []
+
+    @staticmethod
+    def family_and_voice(engine) -> tuple[str, str]:
+        return engine.last_provenance.model, engine.last_provenance.voice
+
+    def test_espeak_plain(self) -> None:
+        engine = self.espeak()
+        self.assertIsNone(engine.last_provenance)        # nothing synthesised yet
+        engine.synth("hello")
+        self.assertEqual(self.family_and_voice(engine), ("espeak", "en-us"))
+        self.assertEqual([i["voice"] for i in self.invocations()], ["en-us"])
+
+    def test_mbrola_success_reports_mbrola_and_mb_voice(self) -> None:
+        engine = self.espeak(mbrola=True)
+        engine.synth("hello")
+        self.assertEqual(self.family_and_voice(engine), ("mbrola", "mb-en-us"))
+        self.assertEqual([i["voice"] for i in self.invocations()], ["mb-en-us"])
+
+    def test_mbrola_fallback_reports_espeak(self) -> None:
+        engine = self.espeak("mb-fails", mbrola=True)
+        engine.synth("hello")
+        self.assertEqual([i["voice"] for i in self.invocations()],
+                         ["mb-en-us", "en-us"])
+        self.assertEqual(self.family_and_voice(engine), ("espeak", "en-us"))
+        self.assertEqual(engine.model, "mbrola")            # the request, unchanged
+        self.assertEqual(engine.effective_model, "espeak")  # what was used
+        engine.synth("again")
+        self.assertEqual(self.family_and_voice(engine), ("espeak", "en-us"))
+
+    def test_explicit_mbrola_failure_leaves_no_provenance(self) -> None:
+        engine = self.espeak("mb-fails", mbrola=True, mbrola_fallback=False)
+        with self.assertRaises(tts.TtsError):
+            engine.synth("hello")
+        self.assertIsNone(engine.last_provenance)
+        self.assertIsNone(engine.effective_model)
+
+    def test_piper_provenance(self) -> None:
+        provider = os.path.join(self.dir, "kilix-piper-tts")
+        with open(provider, "w", encoding="utf-8") as handle:
+            handle.write(_FAKE_PIPER)
+        os.chmod(provider, 0o755)
+        with mock.patch.dict(os.environ, {tts.PIPER_ENV_COMMAND: provider}):
+            engine = tts.PiperTts(rate=170)
+            self.assertIsNone(engine.last_provenance)
+            pcm, _rate = engine.synth("hello")
+        self.assertEqual(pcm, b"\x01\x00\x02\x00")           # it really ran
+        self.assertEqual(self.family_and_voice(engine),
+                         (models.PIPER_KRISTIN_MODEL, tts.PIPER_VOICE))
+
+    def test_null_provenance(self) -> None:
+        engine = tts.NullTts()
+        engine.synth("anything")
+        self.assertEqual(self.family_and_voice(engine), ("off", "none"))
+
+    def test_an_engine_that_records_nothing_is_described_from_its_attributes(self) -> None:
+        class ThirdParty:
+            model, voice, rate, seed = "m", "v1", 150, 3
+
+        class Odd:
+            model, voice, rate, seed = None, 7, True, True
+
+        self.assertEqual(tts.clip_provenance(ThirdParty()),
+                         tts.SynthesisProvenance("m", "v1", 3, False, False, 150))
+        self.assertEqual(tts.clip_provenance(Odd()),
+                         tts.SynthesisProvenance("unset", "unset", 0, False, False, 0))
 
 
 class EngineSelection(unittest.TestCase):
