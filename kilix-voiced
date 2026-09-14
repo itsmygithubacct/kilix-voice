@@ -73,8 +73,8 @@ for _package_root in (_INSTALLED_LIB, _HERE):
 
 from voicelib import (
     consent,  # noqa: E402  (the import follows the path bootstrap)
-    __version__, audio, daemon_config, events, models, paths, protocol,
-    settings, stt as stt_lib, tts as tts_lib, util)
+    __version__, audio, audiofd, daemon_config, events, models, paths,
+    protocol, settings, stt as stt_lib, tts as tts_lib, util)
 from voicelib.arbiter import Arbiter, ArbiterError  # noqa: E402
 from voicelib.cancel import (  # noqa: E402
     Cancellation, Cancelled, CancellationError, DeadlineExceeded)
@@ -201,6 +201,101 @@ def clean_for_injection(text: str) -> str:
 
 def _stamp() -> str:
     return time.strftime("%H:%M:%S")
+
+
+# The size of one descriptor in an SCM_RIGHTS array.
+_FD_SIZE = struct.calcsize("i")
+
+
+def _transmit(endpoint: socket.socket, frame: bytes,
+              fds: tuple[int, ...] = ()) -> None:
+    """Send one frame, attaching ``fds`` by SCM_RIGHTS when there are any."""
+    if fds:
+        endpoint.sendmsg([frame], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                    struct.pack(f"{len(fds)}i", *fds))])
+    else:
+        endpoint.send(frame)
+
+
+def _reply_frame(reply: dict) -> tuple[bytes, tuple[int, ...]]:
+    """Return the frame for a control reply and the descriptors that go with it.
+
+    Descriptors travel only with the reply they belong to. A reply carrying
+    descriptors that will not encode is replaced by encode_reply's bounded
+    refusal, which goes out alone.
+    """
+    fds = tuple(getattr(reply, "fds", ()))
+    if fds:
+        try:
+            return protocol.encode(reply, limit=protocol.MAX_REPLY_BYTES), fds
+        except protocol.ProtocolError:
+            pass
+    return protocol.encode_reply(reply), ()
+
+
+class _Outbound(dict):
+    """A message plus how to send it: descriptors to attach, and whether to wait.
+
+    A dict subclass rather than a keyword on _send, because shipped and
+    independent-review tests replace _send with a two-argument stub
+    (receiver, msg), and a new parameter would break every one. It still
+    compares equal to the plain dict it carries, so a stub that records what
+    was sent sees exactly what it saw before.
+    """
+
+    def __init__(self, message: dict, *, fds: tuple[int, ...] = (),
+                 nonblocking: bool = False, droppable: bool = False) -> None:
+        super().__init__(message)
+        self.fds = tuple(fds)
+        # A droppable message is progress: when the receiver is not keeping up
+        # it is dropped and the receiver still counts as alive. Dropping only
+        # makes sense without waiting, so it implies nonblocking.
+        self.droppable = bool(droppable)
+        self.nonblocking = bool(nonblocking) or self.droppable
+
+
+class _ReceivingConnection:
+    """A control connection whose recv also takes the request's descriptors.
+
+    A plain recv discards any SCM_RIGHTS descriptors sent with the request.
+    _answer reads with conn.recv, and so do the test doubles that stand in
+    for it; this wrapper keeps that seam. The read underneath is a recvmsg
+    that moves up to ``max_fds`` descriptors into ``fds``, close-on-exec, for
+    _accept_one to own and close. Everything else is the connection's own.
+    """
+
+    def __init__(self, conn: socket.socket, max_fds: int) -> None:
+        self._conn = conn
+        self._max_fds = max_fds
+        self.fds: list[int] = []
+        self.truncated = False
+
+    def recv(self, size: int, flags: int = 0) -> bytes:
+        if not isinstance(self._conn, socket.socket):
+            # Not a kernel socket -- an observing wrapper, say. Ancillary data
+            # cannot be relied on through it, so it is read plainly: no
+            # descriptor is taken, and the wrapper still sees the one recv.
+            return self._conn.recv(size, flags)
+        data, ancillary, msg_flags, _address = self._conn.recvmsg(
+            size, socket.CMSG_SPACE(self._max_fds * _FD_SIZE),
+            flags | socket.MSG_CMSG_CLOEXEC)
+        for level, kind, blob in ancillary:
+            if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+                self.fds.extend(struct.unpack(f"{len(blob) // _FD_SIZE}i", blob))
+        # More descriptors than fit: the kernel closed the rest and says so.
+        self.truncated = bool(msg_flags & socket.MSG_CTRUNC)
+        return data
+
+    def close_descriptors(self) -> None:
+        fds, self.fds = self.fds, []
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def __getattr__(self, name: str):
+        return getattr(self._conn, name)
 
 
 class _Clip(tuple):
@@ -608,18 +703,23 @@ class Daemon:
                 self._warn(f"cannot accept a connection: {error}")
             return
         with conn:
+            # Owns every descriptor that arrives with the request, from the
+            # read until this connection is done, on every path: an op that
+            # takes none ignores them, and none outlives the reply.
+            inbound = _ReceivingConnection(conn, audiofd.MAX_INBOUND_FDS)
+            reply = None
             try:
                 conn.settimeout(REQUEST_TIMEOUT_S)
-                reply = self._answer(conn)
+                reply = self._answer(inbound)
                 if reply is None:
                     return
                 # Bounded before it is sent. Four same-user requests below
                 # MAX_REQUEST_BYTES built refusals too large to encode, and the
                 # MessageTooLarge that raised here ended the serve loop -- one
                 # request, and the voice session was gone.
-                frame = protocol.encode_reply(reply)
+                frame, fds = _reply_frame(reply)
                 try:
-                    conn.send(frame)
+                    _transmit(conn, frame, fds)
                 except OSError as error:
                     self._debug(f"client left before the reply: {error}")
                     return
@@ -630,6 +730,15 @@ class Daemon:
                 # message, which can carry what the request said.
                 self._warn(f"a connection failed unexpectedly "
                            f"({type(error).__name__}); still serving")
+            finally:
+                inbound.close_descriptors()
+                # A reply's descriptors were duplicated into the peer by
+                # sendmsg, or never sent; either way this copy is ours.
+                for fd in getattr(reply, "fds", ()):
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
     def _linger_for_peer(self, conn: socket.socket) -> None:
         """Let a peer that sent more than was read see the reply before close.
@@ -698,9 +807,20 @@ class Daemon:
                 f"smaller extent by lowering {settings.KEY_TTS_MAX_CHARS}, or "
                 "send the text as several speak requests.",
                 protocol.ERR_TOO_LARGE)
+        if isinstance(conn, _ReceivingConnection) and (conn.fds or conn.truncated):
+            return self._dispatch(raw, tuple(conn.fds), conn.truncated)
         return self._dispatch(raw)
 
-    def _dispatch(self, raw: bytes) -> dict:
+    def _dispatch(self, raw: bytes, fds: tuple[int, ...] = (),
+                  truncated: bool = False) -> dict:
+        """Answer one request frame.
+
+        ``fds`` are the SCM_RIGHTS descriptors that arrived with it. They are
+        still owned by _accept_one, which closes them. ``truncated`` says the
+        caller sent more than audiofd.MAX_INBOUND_FDS. Only an op that takes a
+        descriptor reads either; every other op is served as if none had been
+        sent.
+        """
         try:
             request = protocol.validate_request(protocol.decode(raw),
                                                 self._session_dir)
@@ -1453,19 +1573,47 @@ class Daemon:
         return heard
 
     def _send(self, receiver: socket.socket, message: dict) -> bool:
-        """Send one dictation datagram; False when the receiver has gone.
+        """Send one datagram; False when the receiver has gone or cannot take it.
 
         Encoded against MAX_REPLY_BYTES, the size the kitty fork's receiver
         reads: a larger datagram would arrive truncated and fail to decode.
         MessageTooLarge propagates, so an over-size transcript is REFUSED with
         a too-large datagram by _run_dictation rather than cut short.
+        Returning False instead would leave that caller with no terminal
+        datagram at all.
+
+        An _Outbound message may attach descriptors by SCM_RIGHTS, and may
+        decline to wait. A non-blocking send to a receiver whose queue is full
+        returns at once: False, or True for a droppable message, whose loss
+        costs only progress. Descriptors are never closed here: the kernel
+        holds its own reference once sendmsg returns, and the caller closes
+        its copy.
         """
+        frame = protocol.encode(message, limit=protocol.MAX_REPLY_BYTES)
+        fds = tuple(getattr(message, "fds", ()))
         try:
-            receiver.send(protocol.encode(message, limit=protocol.MAX_REPLY_BYTES))
+            if not getattr(message, "nonblocking", False):
+                _transmit(receiver, frame, fds)
+                return True
+            # MSG_DONTWAIT alone would not stop Python waiting: a socket with a
+            # timeout polls for writability for that long before it sends. A
+            # zero timeout makes the call itself non-blocking, and the
+            # receiver's own timeout is restored straight after.
+            previous = receiver.gettimeout()
+            receiver.settimeout(0.0)
+            try:
+                _transmit(receiver, frame, fds)
+            finally:
+                receiver.settimeout(previous)
             return True
+        except BlockingIOError:
+            if getattr(message, "droppable", False):
+                return True
+            self._warn("a receiver is not reading; the message was not delivered")
+            return False
         except OSError as error:
             # The message itself is never logged: it is what the user said.
-            self._warn(f"the dictation receiver stopped listening: {error}")
+            self._warn(f"the receiver stopped listening: {error}")
             return False
 
     # -- status -------------------------------------------------------------
