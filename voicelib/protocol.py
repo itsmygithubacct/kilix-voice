@@ -253,9 +253,21 @@ def _echo(value: object, limit: int = 80) -> str:
 
 
 def _cut_prose(message: object, limit: int) -> object:
-    """Return error prose no longer than ``limit`` characters plus a marker."""
-    if isinstance(message, str) and len(message) > limit:
-        return message[:limit] + _TRUNCATED
+    """Return error prose that encodes, cut to ``limit`` characters plus a marker.
+
+    Refusal prose quotes names the daemon read from the filesystem: the path
+    realpath resolved through a symlink, or the name an OSError reports. A
+    Linux name is bytes, and one that is not UTF-8 decodes to lone surrogates,
+    which no UTF-8 frame can carry. Such a refusal failed to encode, and the
+    caller got `internal` in place of the refusal's own code, on the control
+    reply and on the dictation datagram alike. Each lone surrogate is written
+    as its backslash escape, BEFORE the cut, so the escape counts against the
+    limit.
+    """
+    if isinstance(message, str):
+        message = message.encode("utf-8", "backslashreplace").decode("utf-8")
+        if len(message) > limit:
+            return message[:limit] + _TRUNCATED
     return message
 
 

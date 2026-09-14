@@ -135,6 +135,73 @@ class OwnControlSocketTestCase(unittest.TestCase):
                 turn.receiver.close()
         self.assertEqual(len(self.started), 2)
 
+    # W1-R3 residual and the dangling-symlink class: a name that is not UTF-8
+    # decodes to lone surrogates, and a refusal quoting it could not be
+    # encoded, so the caller was told `internal` instead of the refusal.
+
+    def assert_sent_as(self, reply: dict, code: str) -> dict:
+        self.assertIs(reply["ok"], False, reply)
+        self.assertEqual(reply["code"], code, reply)
+        # What _accept_one sends: the reply as built, never its internal stand-in.
+        return protocol.decode(protocol.encode(reply, limit=protocol.MAX_REPLY_BYTES))
+
+    def receiver_ops(self, prefix: str):
+        for op, field in (("dictate", "sock"), ("speak", "chunk_sock")):
+            link = os.path.join(self.session, f"{prefix}-{op}.sock")
+            message = {"op": op, field: link}
+            if op == "speak":
+                message["text"] = "hello"
+            yield op, link, message
+
+    def test_a_symlink_to_a_non_utf8_link_of_the_control_socket_is_malformed(self) -> None:
+        hidden = os.path.join(os.fsencode(self.session), b"\xff")
+        os.link(os.fsencode(self.control), hidden)
+        for op, link, message in self.receiver_ops("hidden"):
+            with self.subTest(op=op):
+                os.symlink(hidden, os.fsencode(link))
+                sent = self.assert_sent_as(self.dispatch(self.daemon(), message),
+                                           protocol.ERR_MALFORMED)
+                self.assertIn("control socket", sent["error"])
+                self.assertIn("\\udcff", sent["error"])       # the name, escaped
+        with self.assertRaises(socket.timeout):
+            conn, _ = self.listener.accept()
+            conn.close()
+        self.assertEqual(self.started, [])
+
+    def test_a_non_utf8_name_that_is_missing_or_no_socket_is_not_found(self) -> None:
+        plain = os.path.join(os.fsencode(self.session), b"file-\xfd")
+        open(plain, "wb").close()
+        targets = (("dangling", b"gone-\xfe", "\\udcfe"), ("plain", b"file-\xfd", "\\udcfd"))
+        for prefix, name, shown in targets:
+            for op, link, message in self.receiver_ops(prefix):
+                with self.subTest(target=prefix, op=op):
+                    os.symlink(os.path.join(os.fsencode(self.session), name),
+                               os.fsencode(link))
+                    sent = self.assert_sent_as(self.dispatch(self.daemon(), message),
+                                               protocol.ERR_NOT_FOUND)
+                    self.assertIn(shown, sent["error"])
+        self.assertEqual(self.started, [])
+
+
+class RefusalProseTestCase(unittest.TestCase):
+    """The prose rule itself, on both channels a refusal can take."""
+
+    def test_prose_quoting_a_non_utf8_name_encodes_on_both_channels(self) -> None:
+        name = "/session/voice/\udcff"
+        for built in (protocol.reply_error(f"{name} is not there", protocol.ERR_NOT_FOUND),
+                      protocol.dictation_error(f"{name} is not there",
+                                               protocol.ERR_NOT_FOUND, segment="listen-1")):
+            with self.subTest(keys=sorted(built)):
+                frame = protocol.encode(built, limit=protocol.MAX_REPLY_BYTES)
+                self.assertEqual(protocol.decode(frame)["error"],
+                                 "/session/voice/\\udcff is not there")
+
+    def test_escaped_prose_is_still_cut_to_the_limit(self) -> None:
+        limit = protocol.MAX_ERROR_PROSE_CHARS
+        reply = protocol.reply_error("\udcff" * limit, protocol.ERR_NOT_FOUND)
+        self.assertLessEqual(len(reply["error"]), limit + len(protocol._TRUNCATED))
+        self.assertTrue(reply["error"].startswith("\\udcff"))
+
 
 class OwnControlSocketLiveTestCase(LiveDaemonTestCase):
     """The same refusal from a real kilix-voiced on its real control socket."""
@@ -163,6 +230,28 @@ class OwnControlSocketLiveTestCase(LiveDaemonTestCase):
         self.assertIs(reply["ok"], False, reply)
         self.assertEqual(reply["code"], protocol.ERR_MALFORMED, reply)
         self.assertFalse(self.request({"op": "status"})["status"]["speaking"])
+        self.assert_still_serving()
+
+    def test_non_utf8_names_keep_their_refusal_code_over_the_wire(self) -> None:
+        session = os.fsencode(self.session_dir)
+        hidden = os.path.join(session, b"\xff")
+        os.link(os.fsencode(self.control), hidden)
+        cases = (
+            ("dictate-8.sock", hidden, {"op": "dictate"}, "sock", protocol.ERR_MALFORMED),
+            ("chunks-8.sock", hidden, {"op": "speak", "text": "Hello there."},
+             "chunk_sock", protocol.ERR_MALFORMED),
+            ("dictate-9.sock", os.path.join(session, b"gone-\xfe"), {"op": "dictate"},
+             "sock", protocol.ERR_NOT_FOUND),
+        )
+        for name, target, message, field, code in cases:
+            with self.subTest(name=name):
+                link = os.path.join(self.session_dir, name)
+                os.symlink(target, os.fsencode(link))
+                reply = self.request(dict(message, **{field: link}))
+                self.assertIs(reply["ok"], False, reply)
+                self.assertEqual(reply["code"], code, reply)
+        status = self.request({"op": "status"})["status"]
+        self.assertFalse(status["listening"] or status["speaking"], status)
         self.assert_still_serving()
 
 
