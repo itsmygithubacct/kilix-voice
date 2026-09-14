@@ -561,6 +561,20 @@ class StreamedSynthesisTestCase(unittest.TestCase):
         player.play.assert_called_once()      # audio still queued
         self.assertEqual(sent, [])            # descriptor dropped, not raised
 
+    def test_failed_descriptor_warning_names_the_clip_ordinal(self) -> None:
+        # AUD-07: the warning read turn.sequence AFTER the increment, so a
+        # descriptor that failed for clip 0 was logged as chunk 1, and the
+        # log never said which turn it belonged to.
+        global sent; sent = []
+        warnings = []
+        turn = self._turn(("a", "b")); daemon = self._daemon(); daemon._speech = turn
+        daemon._warn = warnings.append
+        turn.engine.voice = "not a valid token"        # clip 0's descriptor fails
+        voiced.Daemon._play_if_current(daemon, turn, mock.Mock(), b"\x00\x00", 24000)
+        self.assertEqual(sent, [])
+        self.assertEqual(len(warnings), 1, warnings)
+        self.assertIn("chunk 0 of turn speak-9", warnings[0])
+
     def test_speak_validates_the_chunk_socket_inside_the_session(self) -> None:
         from voicelib import protocol
         import tempfile

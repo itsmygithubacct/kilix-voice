@@ -1029,7 +1029,10 @@ class Daemon:
             self._send(turn.receiver, chunk)
         except protocol.ProtocolError as error:
             # A malformed descriptor must not take the audio down with it.
-            self._warn(f"synthesis chunk {turn.sequence} not published: {error}")
+            # The ordinal, not turn.sequence: the counter has already moved on
+            # to the next clip, so it named the wrong one.
+            self._warn(f"synthesis chunk {ordinal} of turn {turn.id} not "
+                       f"published: {error}")
 
     def _await_clip(self, turn: _SpeechTurn, player: audio.Player) -> bool:
         """Wait out the queued clip; False when the turn was cancelled."""
