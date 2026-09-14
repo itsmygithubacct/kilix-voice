@@ -386,7 +386,7 @@ class _SpeechTurn(_JobTurn):
         return self.cancel.expired()
 
 
-class _DictationTurn:
+class _DictationTurn(_JobTurn):
     """One dictation turn: the socket it delivers to, and its stop token."""
 
     def __init__(self, turn_id: str, receiver: socket.socket,
@@ -1368,12 +1368,19 @@ class Daemon:
         turn.thread = threading.Thread(
             target=self._run_dictation, args=(turn,),
             name=f"kilix-voice-{turn.id}", daemon=True)
+        # P11, as speak does it: hooked before the worker can settle, and
+        # recorded as begun only once the worker is really running.
+        ledger = self._jobs
+        if ledger is not None:
+            turn.on_settle = ledger.record   # before the worker can settle
         try:
             with self._lock:
                 # Taking the microphone cancels read-aloud on the way in.
                 self._arbiter.begin_listen(turn.id)
                 self._dictation = turn
                 self._start(turn.thread, lambda: self._clear_dictation(turn))
+                if ledger is not None:
+                    ledger.begin(turn.id, jobs.KIND_DICTATION)
         except BaseException:
             receiver.close()
             raise
@@ -1422,13 +1429,13 @@ class Daemon:
         # ProtocolError and therefore a ValueError, so it must be caught before
         # the tuple that contains ValueError, or it never reaches here.
         except protocol.MessageTooLarge as error:
-            self._send(turn.receiver, protocol.dictation_error(
+            self._deliver_terminal(turn, protocol.dictation_error(
                 str(error), protocol.ERR_TOO_LARGE))
         except DeadlineExceeded as error:
-            self._send(turn.receiver, protocol.dictation_error(
+            self._deliver_terminal(turn, protocol.dictation_error(
                 f"dictation stopped: {error}.", protocol.ERR_DEADLINE))
         except Cancelled as error:
-            self._send(turn.receiver, protocol.dictation_error(
+            self._deliver_terminal(turn, protocol.dictation_error(
                 f"dictation stopped: {error}.", protocol.ERR_CANCELLED))
         except (DaemonError, audio.AudioError, stt_lib.SttError,
                 settings.SettingsError, paths.PathError, OSError,
@@ -1449,20 +1456,70 @@ class Daemon:
             # receive NO datagram at all: strictly worse than the flattening
             # this replaced. _carried_code is that validation, shared with the
             # control path so the two cannot code one family differently.
-            self._send(turn.receiver, protocol.dictation_error(
+            self._deliver_terminal(turn, protocol.dictation_error(
                 str(error), _carried_code(error, protocol.ERR_UNAVAILABLE)))
         except Exception as error:  # a worker thread must not die silently
             self._warn(f"dictation failed: {error!r}")
             # F08: this arm called dictation_error with NO code at all, so an
             # unexpected worker failure was indistinguishable from a
             # well-understood one at the protocol level.
-            self._send(turn.receiver, protocol.dictation_error(
+            self._deliver_terminal(turn, protocol.dictation_error(
                 f"dictation failed unexpectedly: {error}. Try again; the "
                 "daemon's stderr has the details.", protocol.ERR_INTERNAL))
         finally:
+            if turn.outcome is None:
+                # No terminal was delivered: a worker that returned without
+                # one, or a delivery that itself raised. The job still ends,
+                # recorded failed, and nothing is sent -- a datagram now could
+                # follow one already on its way.
+                try:
+                    turn.settle(jobs.JobOutcome(
+                        job=turn.id, kind=jobs.KIND_DICTATION,
+                        outcome=jobs.OUTCOME_FAILED, code=protocol.ERR_INTERNAL,
+                        message="dictation ended without a terminal result."))
+                except Exception as error:
+                    self._warn(f"could not settle turn {turn.id} "
+                               f"({type(error).__name__})")
             turn.receiver.close()
             self._clear_dictation(turn)
             self._touch()
+
+    def _deliver_terminal(self, turn: _DictationTurn, message: dict) -> bool:
+        """Send a dictation job's one terminal datagram and settle its outcome.
+
+        The only way a dictation terminal leaves the daemon. The outcome is
+        settled FIRST, first-writer-wins, so a second terminal is refused by
+        structure -- not, as before, by there happening to be no code that can
+        raise after the final. The job id rides as `segment` on every
+        terminal, error included: a SOCK_DGRAM receiver has no end of stream
+        to join a failure on. The frame is encoded before anything is
+        settled, so a final too large to send is refused by its own too-large
+        terminal instead of being settled undelivered. Recognised text never
+        enters the ledger: a final settles with no message.
+        """
+        if "error" in message and "segment" not in message:
+            message = dict(message, segment=turn.id)
+        protocol.encode(message, limit=protocol.MAX_REPLY_BYTES)
+        code = message.get("code")
+        if "final" in message:
+            outcome, code, prose = jobs.OUTCOME_COMPLETED, None, ""
+        elif code == protocol.ERR_CANCELLED:
+            outcome, prose = jobs.OUTCOME_CANCELLED, message.get("error", "")
+        elif code == protocol.ERR_DEADLINE:
+            outcome, prose = jobs.OUTCOME_DEADLINE, message.get("error", "")
+        else:
+            outcome, prose = jobs.OUTCOME_FAILED, message.get("error", "")
+            if code not in protocol.ERROR_CODES:
+                code = protocol.ERR_INTERNAL
+        if not turn.settle(jobs.JobOutcome(job=turn.id, kind=jobs.KIND_DICTATION,
+                                           outcome=outcome, code=code,
+                                           message=prose)):
+            self._warn(f"dictation {turn.id}: a second terminal was suppressed")
+            return False
+        delivered = self._send(turn.receiver, message)
+        if self._jobs is not None:
+            self._jobs.mark_delivered(turn.id, delivered)
+        return delivered
 
     def _dictate(self, turn: _DictationTurn) -> None:
         """Run one whole turn: capture, recognise, deliver."""
@@ -1530,7 +1587,7 @@ class Daemon:
             # dictation never presses Enter (DESIGN.md safety rule 2).
             # Same segment id as this turn's partials, marked stable: the
             # consumer replaces the running text rather than appending to it.
-            self._send(turn.receiver, protocol.dictation_final(text, turn.id))
+            self._deliver_terminal(turn, protocol.dictation_final(text, turn.id))
         finally:
             capture.stop()
             engine.close()

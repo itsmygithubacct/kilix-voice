@@ -392,6 +392,157 @@ class TerminalMessages(_LiveTurnsFixture):
                 self.assertTrue(wait_until(self.idle, 5))
 
 
+def _worker_daemon(sent: list, ledger: jobs.JobLedger | None = None):
+    d = object.__new__(voiced.Daemon)
+    d._warn = d._debug = lambda *a, **k: None
+    d._send = lambda receiver, msg: sent.append(msg) or True
+    d._clear_dictation = lambda turn: None
+    d._touch = lambda: None
+    if ledger is not None:
+        d._jobs = ledger
+    return d
+
+
+class _WeirdError(Exception):
+    """A failure no arm knows by name."""
+
+
+class DictationTerminals(unittest.TestCase):
+    """TERM-02: one terminal datagram per dictation job, joinable, settled once."""
+
+    ARMS = (
+        (lambda: protocol.MessageTooLarge("too big"), "failed", protocol.ERR_TOO_LARGE),
+        (lambda: voiced.DeadlineExceeded("the request deadline elapsed"),
+         "deadline", protocol.ERR_DEADLINE),
+        (lambda: voiced.Cancelled("the turn was stopped"), "cancelled", protocol.ERR_CANCELLED),
+        (lambda: voiced.DaemonBusy("busy"), "failed", protocol.ERR_BUSY),
+        (lambda: voiced.ConsentDenied("no consent"), "failed", protocol.ERR_DENIED),
+        (lambda: OSError("gone"), "failed", protocol.ERR_UNAVAILABLE),
+        (lambda: ValueError("odd"), "failed", protocol.ERR_UNAVAILABLE),
+        (lambda: _WeirdError("a bug"), "failed", protocol.ERR_INTERNAL),
+    )
+
+    def run_turn(self, dictate):
+        sent, ledger = [], jobs.JobLedger()
+        d = _worker_daemon(sent, ledger)
+        turn = voiced._DictationTurn("listen-7", mock.Mock())
+        turn.on_settle = ledger.record
+        d._dictate = dictate
+        voiced.Daemon._run_dictation(d, turn)
+        return sent, turn, ledger
+
+    def test_every_error_arm_carries_segment(self) -> None:
+        for make, _outcome, code in self.ARMS:
+            error = make()
+            with self.subTest(error=type(error).__name__):
+                sent, _turn, _ledger = self.run_turn(mock.Mock(side_effect=error))
+                self.assertEqual(len(sent), 1, sent)
+                self.assertEqual(sent[0]["segment"], "listen-7")
+                self.assertEqual(sent[0]["code"], code)
+
+    def test_outcome_matches_datagram_for_each_arm(self) -> None:
+        for make, outcome, code in self.ARMS:
+            error = make()
+            with self.subTest(error=type(error).__name__):
+                sent, turn, ledger = self.run_turn(mock.Mock(side_effect=error))
+                record = ledger.get("listen-7")
+                self.assertEqual((record["outcome"], record.get("code")), (outcome, code))
+                self.assertEqual(turn.outcome.code, sent[0]["code"])
+                self.assertIs(record["delivered"], True)
+
+    def test_ledger_never_holds_recognised_text(self) -> None:
+        def dictate(turn):
+            voiced.Daemon._deliver_terminal(
+                daemon_of[0], turn, protocol.dictation_final("secret words", turn.id))
+
+        daemon_of = []
+        sent, ledger = [], jobs.JobLedger()
+        d = _worker_daemon(sent, ledger)
+        daemon_of.append(d)
+        turn = voiced._DictationTurn("listen-8", mock.Mock())
+        turn.on_settle = ledger.record
+        d._dictate = dictate
+        voiced.Daemon._run_dictation(d, turn)
+        self.assertEqual([m.get("final") for m in sent], ["secret words"])
+        record = ledger.get("listen-8")
+        self.assertEqual((record["outcome"], record["delivered"]), ("completed", True))
+        self.assertNotIn("secret", json.dumps(record))
+
+    def test_second_terminal_is_suppressed(self) -> None:
+        # The real _dictate sends its final, then the recogniser fails to close
+        # in its finally. The worker's broad arm used to send a second, error
+        # datagram for that: two terminals for one job.
+        from types import SimpleNamespace
+        sent, ledger = [], jobs.JobLedger()
+        d = _worker_daemon(sent, ledger)
+        d._cfg = {"stt": {"engine": "vosk", "model_path": "/nonexistent",
+                          "max_seconds": 120}, "vad": {"silence_ms": 900}}
+        d._stopping = threading.Event()
+        d._require_capture_consent = lambda resolved=None: None
+        turn = voiced._DictationTurn("listen-9", mock.Mock())
+        turn.on_settle = ledger.record
+        frames = [b"\x00" * 320, b"\x00" * 320]
+        capture = mock.Mock(rate=16000, frame_bytes=320, overruns=0, error="")
+        capture.read.side_effect = lambda *a, **k: frames.pop(0) if frames else None
+        engine = mock.Mock(supports_partials=False)
+        engine.feed.return_value = None
+        engine.end_utterance.return_value = "the words"
+        engine.close.side_effect = stt_lib.SttError("the recogniser would not close")
+        events = iter([voiced.events.VAD_SPEECH_START, voiced.events.VAD_SPEECH_END])
+        with mock.patch.object(voiced.audio, "MicCapture", lambda cfg: capture), \
+             mock.patch.object(voiced.stt_lib, "make_stt", lambda *a, **k: engine), \
+             mock.patch.object(voiced, "Vad", lambda cfg: SimpleNamespace(
+                 feed=lambda frame: next(events, ""))):
+            voiced.Daemon._run_dictation(d, turn)
+        self.assertEqual(len(sent), 1, sent)
+        self.assertEqual((sent[0].get("final"), sent[0].get("segment")),
+                         ("the words", "listen-9"))
+        self.assertEqual(ledger.get("listen-9")["outcome"], "completed")
+
+    def test_an_over_size_final_is_refused_as_the_one_terminal(self) -> None:
+        # The final must not be settled before it is known to fit: settled
+        # first, its too-large refusal would be suppressed as a second terminal
+        # and the caller would receive nothing at all.
+        def dictate(turn):
+            voiced.Daemon._deliver_terminal(
+                d, turn, protocol.dictation_final("word " * 14_000, turn.id))
+
+        sent, ledger = [], jobs.JobLedger()
+        d = _worker_daemon(sent, ledger)
+        d._send = lambda receiver, msg: voiced.Daemon._send(d, receiver, msg) and (
+            sent.append(msg) or True)
+        turn = voiced._DictationTurn("listen-3", mock.Mock())
+        turn.on_settle = ledger.record
+        d._dictate = dictate
+        voiced.Daemon._run_dictation(d, turn)
+        self.assertEqual([m.get("code") for m in sent], [protocol.ERR_TOO_LARGE])
+        self.assertEqual(ledger.get("listen-3")["code"], protocol.ERR_TOO_LARGE)
+
+    def test_a_job_that_ends_without_a_terminal_still_settles(self) -> None:
+        sent, turn, ledger = self.run_turn(lambda turn: None)
+        self.assertEqual(sent, [])
+        self.assertEqual((ledger.get("listen-7")["outcome"], ledger.get("listen-7")["code"]),
+                         ("failed", protocol.ERR_INTERNAL))
+
+
+class DictationOutcomes(_LiveTurnsFixture):
+
+    def test_a_dictation_job_settles_completed_and_its_final_carries_the_job_id(self) -> None:
+        self.grant_consent()
+        receiver = self.receiver()
+        reply = self.call(op="dictate", id="d", sock=receiver.path)
+        self.assertTrue(reply["ok"], reply)
+        job = reply["turn"]
+        self.assertTrue(wait_until(lambda: receiver.eof, 20))
+        terminals = [m for m in receiver.msgs if "final" in m or "error" in m]
+        self.assertEqual(len(terminals), 1, receiver.msgs)
+        self.assertEqual(terminals[0].get("segment"), job)
+        record = self.settled(job)
+        self.assertEqual((record["kind"], record["outcome"], record["delivered"]),
+                         ("dictation", "completed", True))
+        self.assertNotIn("hello world", json.dumps(self.status()["status"]))
+
+
 class SettleOnce(unittest.TestCase):
 
     def test_settle_attempted_from_many_threads_records_one_outcome(self) -> None:

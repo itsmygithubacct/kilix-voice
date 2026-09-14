@@ -807,7 +807,8 @@ def _speaker(raw: object) -> dict:
     return {"label": label, "confidence": float(confidence)}
 
 
-def dictation_error(message: str, code: str | None = None) -> dict:
+def dictation_error(message: str, code: str | None = None,
+                    segment: str | None = None) -> dict:
     """Return a dictation failure datagram, with a closed code when given.
 
     P12 applies to this channel too, and it was left prose-only when
@@ -817,15 +818,22 @@ def dictation_error(message: str, code: str | None = None) -> dict:
     would change that shipped wire shape, which is a contract change belonging
     to the successor seam freeze, not to this commit. Runtime callers pass one;
     the bare form is unchanged.
+
+    ``segment`` is the job id, as partial and final datagrams already carry
+    it. A receiver on SOCK_DGRAM has no end-of-stream to lean on, so without
+    it a failure could not be joined to the dictation that failed (P11).
     """
     message = _cut_prose(message, MAX_ERROR_PROSE_CHARS)
-    if code is None:
-        return {"error": message}
-    if code not in ERROR_CODES:
-        raise ProtocolError(
-            f"unknown error code {code!r}. Use one of: "
-            f"{', '.join(ERROR_CODES)}.")
-    return {"error": message, "code": code}
+    datagram: dict = {"error": message}
+    if code is not None:
+        if code not in ERROR_CODES:
+            raise ProtocolError(
+                f"unknown error code {code!r}. Use one of: "
+                f"{', '.join(ERROR_CODES)}.")
+        datagram["code"] = code
+    if segment is not None:
+        datagram["segment"] = _segment_id(segment)
+    return datagram
 
 
 def synthesis_chunk(sequence: int, *, pcm_bytes: int, sample_rate: int,
