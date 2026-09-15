@@ -785,11 +785,57 @@ class EngineSelection(unittest.TestCase):
         self.assertEqual(engine.rate, 200)
         self.assertTrue(engine.mbrola)
 
+    def _mbrola_share(self, *databases: str) -> str:
+        """A data directory in which exactly ``databases`` are installed."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        os.makedirs(os.path.join(directory.name, "mbrola"))
+        for name in databases:
+            os.makedirs(os.path.join(directory.name, "mbrola", name))
+            with open(os.path.join(directory.name, "mbrola", name, name), "wb") as db:
+                db.write(b"fixture diphone database\n")
+        return directory.name
+
     def test_each_catalogued_tts_model_selects_its_declared_engine(self) -> None:
-        for spec in models.TTS_MODELS:
-            with self.subTest(model=spec.catalog_id):
-                engine = tts.make_tts(model=spec.catalog_id)
-                self.assertEqual(engine.model, spec.catalog_id)
+        # model=mbrola resolves the default voice, en-us, to an installed
+        # MBROLA database, so what is "installed" is decided here, through
+        # XDG_DATA_DIRS, espeak-ng's own search path. Inheriting the host's
+        # /usr/share made this test pass only where mbrola-us1 was installed.
+        # Both states are asserted: with a US English database every
+        # catalogued model constructs its own engine; with none, model=mbrola
+        # is refused before anything runs and no other model is affected.
+        for share, installed in ((self._mbrola_share("us1"), True),
+                                 (self._mbrola_share(), False)):
+            with mock.patch.dict(os.environ, {"XDG_DATA_DIRS": share}):
+                for spec in models.TTS_MODELS:
+                    with self.subTest(model=spec.catalog_id, mbrola_installed=installed):
+                        if spec.catalog_id == models.TTS_ENGINE_MBROLA and not installed:
+                            with self.assertRaises(tts.TtsError) as caught:
+                                tts.make_tts(model=spec.catalog_id)
+                            self.assertIn("no MBROLA voice for 'en-us' is installed",
+                                          str(caught.exception))
+                            continue
+                        engine = tts.make_tts(model=spec.catalog_id)
+                        self.assertEqual(engine.model, spec.catalog_id)
+                        if spec.catalog_id == models.TTS_ENGINE_MBROLA:
+                            self.assertEqual(engine.selected_voice, "us1")
+
+    def test_without_xdg_data_dirs_the_search_is_espeak_ngs_default(self) -> None:
+        # With XDG_DATA_DIRS unset espeak-ng searches /usr/local/share, then
+        # /usr/share. Decided with a stand-in for the filesystem, so the host's
+        # installed voices change nothing.
+        for root in ("/usr/local/share", "/usr/share"):
+            with self.subTest(root=root):
+                present = {os.path.join(root, "mbrola", "us1", "us1")}
+                environ = {k: v for k, v in os.environ.items() if k != "XDG_DATA_DIRS"}
+                with mock.patch.dict(os.environ, environ, clear=True), \
+                        mock.patch.object(tts.os.path, "isfile", present.__contains__):
+                    self.assertEqual(tts.resolve_mbrola_voice("en-us"), "mb-us1")
+        with mock.patch.dict(os.environ, {k: v for k, v in os.environ.items()
+                                          if k != "XDG_DATA_DIRS"}, clear=True), \
+                mock.patch.object(tts.os.path, "isfile", lambda path: False):
+            with self.assertRaises(tts.TtsError):                          # control
+                tts.resolve_mbrola_voice("en-us")
 
     def test_unknown_explicit_model_is_never_treated_as_a_command(self) -> None:
         with self.assertRaises(tts.TtsError) as caught:
