@@ -3,11 +3,20 @@
 Importing this package must stay free of side effects: no audio device, no
 microphone, no subprocess, no network.  It exposes the release version and
 nothing else; every module is imported explicitly by its consumer.
+
+The one exception runs only in a process that is running one of this
+checkout's own tests: voicelib._test_isolation then loads tests/__init__.py
+first, so no test can reach the invoking user's store however it was started.
+Anywhere else it does nothing.
 """
 
 from __future__ import annotations
 
 import pathlib
+
+from . import _test_isolation
+
+_test_isolation.guard()
 
 
 def _read_version() -> str:

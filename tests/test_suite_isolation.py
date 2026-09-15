@@ -10,8 +10,9 @@ directory in it must be unchanged afterwards: bytes, size, mode, mtime and
 ctime, and no entry added or removed.
 
 A comparison that cannot fail proves nothing, so a control runs the incident's
-own test the one way the package guard does not cover, and requires that the
-same comparison sees the store change.
+own test, in every form that never imports the tests package, in a copy of the
+checkout whose voicelib guard does nothing, and requires that the same
+comparison and audit see the store change there.
 """
 
 from __future__ import annotations
@@ -180,18 +181,131 @@ class SentinelStoreTestCase(unittest.TestCase):
         self.assertRegex(proc.stderr, r"(?m)^Ran 11 tests")
         self.assertEqual(self.changed(), [], "a test wrote into the exported store")
 
-    def test_control_the_unguarded_incident_test_is_seen_writing(self) -> None:
-        # The incident's own test, run where nothing isolates it: it installs
-        # fixture model files and a grant through the exported data root. If
-        # the comparison cannot see that, its passes above mean nothing.
-        self.run_unittest("discover", "-s", "tests", "-p", "test_r6_attack.py",
-                          "-k", "test_control_catalogue_model_grant_is_accepted")
-        changed = self.changed()
-        model_conf = os.path.join("gpu_terminal", "kilix", "data", "voice", "models",
-                                  "small-en-us", "conf", "model.conf")
-        self.assertIn(model_conf, changed)
-        self.assertIn(os.path.join("gpu_terminal", "kilix", "data", "voice",
-                                   "consent.json"), changed)
+
+# ISO-01R: the incident's own module, tests/test_r6_attack.py, started in each
+# way that never imports the tests package. Its bytes are a verbatim review
+# artefact, so it is protected from outside, by voicelib/_test_isolation.py.
+R6_WRITERS = ("ATTACK_GrantCannotSatisfyTheGateUnderAModelOverride",
+              "ATTACK_BrokenConsentRecordCodedUnavailable")
+UNPACKAGED_FORMS = (
+    ("script from the checkout", ".", ("tests/test_r6_attack.py",) + R6_WRITERS),
+    ("script from tests/", "tests", ("test_r6_attack.py",) + R6_WRITERS),
+    ("discover -s tests without -t", ".",
+     ("-m", "unittest", "discover", "-s", "tests", "-p", "test_r6_attack.py",
+      "-k", R6_WRITERS[0], "-k", R6_WRITERS[1])),
+    ("unittest from inside tests/", "tests",
+     ("-m", "unittest") + tuple(f"test_r6_attack.{name}" for name in R6_WRITERS)),
+)
+# Loaded by every child through PYTHONPATH: records each open, mkdir, rename,
+# replace, remove and chmod naming the sentinel, reads included, so a test that
+# only READS the exported store is seen too.
+AUDIT_HOOK = '''
+import os, sys
+_root, _log = os.environ.get("KV_ISO_SENTINEL"), os.environ.get("KV_ISO_AUDIT")
+if _root and _log:
+    def _audit(event, args, _root=_root, _log=_log):
+        if event in ("open", "os.mkdir", "os.rename", "os.replace", "os.remove", "os.chmod"):
+            path = args[0] if args else None
+            if isinstance(path, bytes):
+                path = os.fsdecode(path)
+            if isinstance(path, str) and os.path.realpath(path).startswith(_root):
+                with open(_log, "a") as handle:
+                    handle.write(event + " " + path + "\\n")
+    sys.addaudithook(_audit)
+'''
+
+
+class UnpackagedFormsTestCase(unittest.TestCase):
+    """Every way of starting a test file leaves an exported store untouched."""
+
+    def sentinel(self) -> tuple[str, dict[str, str], list[tuple]]:
+        root = os.path.realpath(tempfile.mkdtemp(prefix="kv-sentinel-"))
+        self.addCleanup(_remove, root)
+        env = seed_sentinel(root)
+        return root, env, snapshot(root)
+
+    def run_form(self, tree: str, cwd: str, argv: tuple[str, ...]):
+        """Run one form in ``tree`` against a fresh sentinel; return (proc, changed, audited)."""
+        root, session_env, before = self.sentinel()
+        hooks = tempfile.mkdtemp(prefix="kv-audit-")
+        self.addCleanup(shutil.rmtree, hooks, True)
+        with open(os.path.join(hooks, "sitecustomize.py"), "w", encoding="utf-8") as handle:
+            handle.write(AUDIT_HOOK)
+        log = os.path.join(hooks, "audit.log")
+        env = {name: value for name, value in os.environ.items()
+               if not name.startswith(PREFIXES)}
+        env.update(session_env)
+        env.update(PYTHONDONTWRITEBYTECODE="1", KV_ISO_SENTINEL=root, KV_ISO_AUDIT=log,
+                   PYTHONPATH=os.pathsep.join(
+                       part for part in (hooks, os.environ.get("PYTHONPATH")) if part))
+        proc = subprocess.run([sys.executable, "-B", *argv], cwd=os.path.join(tree, cwd),
+                              env=env, capture_output=True, text=True, timeout=300)
+        after = {entry[0]: entry for entry in snapshot(root)}
+        earlier = {entry[0]: entry for entry in before}
+        changed = sorted(name for name in set(after) | set(earlier)
+                         if after.get(name) != earlier.get(name))
+        audited = []
+        if os.path.exists(log):
+            with open(log, encoding="utf-8") as handle:
+                audited = handle.read().splitlines()
+        return proc, changed, audited
+
+    def test_the_incident_module_run_unpackaged_neither_reads_nor_writes_the_store(self) -> None:
+        for label, cwd, argv in UNPACKAGED_FORMS:
+            with self.subTest(form=label):
+                proc, changed, audited = self.run_form(ROOT, cwd, argv)
+                self.assertEqual(proc.returncode, 0, proc.stderr[-3000:])
+                self.assertRegex(proc.stderr, r"(?m)^Ran 3 tests")
+                self.assertRegex(proc.stderr, r"(?m)^OK")
+                self.assertEqual(changed, [], "a test wrote into the exported store")
+                self.assertEqual(audited, [], "a test opened the exported store")
+
+    def test_control_without_the_guard_the_unpackaged_forms_are_seen_writing(self) -> None:
+        # The same forms in a copy of the checkout whose guard does nothing.
+        # If the comparison and the audit could not see the incident's writes
+        # there, their silence above would mean nothing.
+        tree = tempfile.mkdtemp(prefix="kv-unguarded-")
+        self.addCleanup(shutil.rmtree, tree, True)
+        ignore = shutil.ignore_patterns("__pycache__")
+        for name in ("voicelib", "tests"):
+            shutil.copytree(os.path.join(ROOT, name), os.path.join(tree, name), ignore=ignore)
+        # Every executable the incident's tests load: a copy missing one fails
+        # those tests before they write, and would pass for the wrong reason.
+        for name in ("kilix-voiced", "kilix-stt", "kilix-tts", "VERSION"):
+            shutil.copy2(os.path.join(ROOT, name), os.path.join(tree, name))
+        with open(os.path.join(tree, "voicelib", "_test_isolation.py"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("def guard():\n    pass\n")
+        voice = os.path.join("gpu_terminal", "kilix", "data", "voice")
+        for label, cwd, argv in UNPACKAGED_FORMS:
+            with self.subTest(form=label):
+                proc, changed, audited = self.run_form(tree, cwd, argv)
+                self.assertEqual(proc.returncode, 0, proc.stderr[-3000:])
+                self.assertRegex(proc.stderr, r"(?m)^Ran 3 tests")
+                self.assertIn(os.path.join(voice, "models", "small-en-us", "conf",
+                                           "model.conf"), changed)
+                self.assertIn(os.path.join(voice, "consent.json"), changed)
+                self.assertNotEqual(audited, [])
+
+    def test_an_installed_runtime_is_never_isolated(self) -> None:
+        # No tests/ beside voicelib: importing it changes nothing in the
+        # environment, even for a process whose main file sits in a tests/
+        # directory of its own.
+        tree = tempfile.mkdtemp(prefix="kv-installed-")
+        self.addCleanup(shutil.rmtree, tree, True)
+        shutil.copytree(os.path.join(ROOT, "voicelib"), os.path.join(tree, "lib", "voicelib"),
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        os.mkdir(os.path.join(tree, "tests"))
+        script = os.path.join(tree, "tests", "probe.py")
+        with open(script, "w", encoding="utf-8") as handle:
+            handle.write("import os, sys\nsys.path.insert(0, sys.argv[1])\nimport voicelib\n"
+                         "print(os.environ.get('KILIX_DATA_HOME'), 'tests' in sys.modules)\n")
+        env = dict(os.environ, KILIX_DATA_HOME="/nonexistent/kilix-data",
+                   PYTHONDONTWRITEBYTECODE="1")
+        proc = subprocess.run([sys.executable, "-B", script, os.path.join(tree, "lib")],
+                              env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["/nonexistent/kilix-data", "False"])
 
 
 if __name__ == "__main__":

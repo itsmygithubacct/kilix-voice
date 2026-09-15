@@ -18,9 +18,12 @@ same care. Here one rule covers every test.
 What remains is the environment tests/cleanenv.sh builds, a private HOME and
 XDG tree with no stack variable, so the suite behaves the same under either
 runner. tests/test_suite_isolation.py checks the guard against a sentinel store.
-Two invocations bypass this package: ``discover -s tests`` without ``-t .``,
-and running a test file as a script. Modules that write a store also protect
-themselves (see tests/test_consent_gate.py).
+Some invocations never import this package: a test file run as a script,
+``discover -s tests`` without ``-t .``, and ``python -m unittest test_<name>``
+from inside tests/. For those, voicelib loads this file when it is first
+imported (voicelib/_test_isolation.py), before any test can reach a store.
+Modules that write a store also protect themselves (see
+tests/test_consent_gate.py).
 """
 
 from __future__ import annotations
