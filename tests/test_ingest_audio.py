@@ -272,6 +272,12 @@ class IngestRefused(_IngestFixture):
         self.assert_refused({"sample_rate": 16000, "container": "raw"},
                             [self.pipe_with(PCM + b"\x01")], protocol.ERR_MALFORMED)
 
+    def test_more_descriptors_than_the_daemon_takes_is_malformed(self) -> None:
+        # V16-X4b: a caller reaches this refusal, and its code is the contract.
+        fds = [self.memfd_with(wav_bytes(PCM)) for _ in range(audiofd.MAX_INBOUND_FDS + 1)]
+        reply = self.assert_refused({}, fds, protocol.ERR_MALFORMED)
+        self.assertIn(f"more than {audiofd.MAX_INBOUND_FDS}", reply["error"])
+
     def test_a_truncated_wav_is_malformed_not_trimmed(self) -> None:
         self.assert_refused({}, [self.pipe_with(wav_bytes(PCM)[:-100])], protocol.ERR_MALFORMED)
 

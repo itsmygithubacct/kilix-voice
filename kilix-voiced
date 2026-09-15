@@ -230,9 +230,216 @@ def _stamp() -> str:
 _FD_SIZE = struct.calcsize("i")
 
 
+# -- the send side (SEND-01) ------------------------------------------------
+#
+# The closed error vocabulary used to be enforced only by the constructors that
+# build a refusal: reply_error, dictation_error and job_terminal. A reply or
+# datagram a handler or worker built by hand -- an unknown code, no code at
+# all, no ok -- crossed the wire exactly as it was built. The guard sits where
+# every frame leaves the daemon, _transmit, on both kinds of endpoint: the
+# control connection, and a receiver socket, which carries dictation datagrams
+# and speech chunk messages alike. A refusal, an error, or a terminal that did
+# not complete, whose code is missing or not in ERROR_CODES, goes out coded
+# `internal`: never dropped, and never raised out of the send path. A
+# well-formed frame goes out byte for byte as it was built.
+#
+# The job ledger must agree with what crossed (P11). A terminal is therefore
+# guarded BEFORE its job settles, by the same functions, and the job settles
+# with the code the guarded terminal carries; _transmit then has nothing left
+# to change.
+
+_CHANNEL_REPLY = "reply"
+_CHANNEL_MESSAGE = "message"
+_UNSTATED_REFUSAL = ("kilix-voiced sent a refusal that gave no reason. This is a "
+                     "bug; the daemon is still running.")
+_UNSTATED_ERROR = ("kilix-voiced sent an error that gave no reason. This is a "
+                   "bug; the daemon is still running.")
+_NOT_A_TERMINAL = ("kilix-voiced ended this dictation with a message that is "
+                   "neither its transcript nor an error. This is a bug; the "
+                   "daemon is still running.")
+_UNSENDABLE = ("kilix-voiced built a message it could not send. This is a bug; "
+               "the daemon is still running.")
+_UNBUILDABLE_TERMINAL = ("kilix-voiced could not build this job's terminal "
+                         "message. This is a bug; the daemon is still running.")
+# What makes a message a result, or names attached audio. A message recoded as
+# an error keeps none of them: an error is never also a transcript, and no
+# descriptor field is sent without its descriptor.
+_RESULT_KEYS = frozenset({"final", "partial", "stable", "words", "speaker",
+                          "audio_fd", "media_type", "byte_length", "sha256"})
+_FIXED_OUTCOME_CODES = {jobs.OUTCOME_CANCELLED: protocol.ERR_CANCELLED,
+                        jobs.OUTCOME_DEADLINE: protocol.ERR_DEADLINE}
+
+
+def _closed_code(code: object) -> bool:
+    """True when ``code`` is a member of the closed error vocabulary."""
+    return isinstance(code, str) and code in protocol.ERROR_CODES
+
+
+def _guard_reply(reply: object) -> dict:
+    """Return ``reply`` as it may cross the control wire.
+
+    A success -- ok exactly true, with neither error nor code -- and a
+    well-formed refusal -- ok false, str prose, a closed code, no descriptors
+    -- are returned as they are, the same object. Anything else is a refusal:
+    ok false, its prose kept when it has some, its code kept only when it is
+    closed and `internal` otherwise, and its other fields kept. Its
+    descriptors are not: a refusal carries no data.
+    """
+    if not isinstance(reply, dict):
+        return {"ok": False, "error": _UNSTATED_REFUSAL, "code": protocol.ERR_INTERNAL}
+    ok, error, code = reply.get("ok"), reply.get("error"), reply.get("code")
+    if ok is True and "error" not in reply and "code" not in reply:
+        return reply
+    if (ok is False and isinstance(error, str) and _closed_code(code)
+            and not getattr(reply, "fds", ())):
+        return reply
+    guarded = {"ok": False,
+               "error": error if isinstance(error, str) else _UNSTATED_REFUSAL,
+               "code": code if _closed_code(code) else protocol.ERR_INTERNAL}
+    for key, value in reply.items():
+        if key not in guarded:
+            guarded[key] = value
+    return guarded
+
+
+def _guard_terminal(message: dict) -> dict:
+    """Return a protocol-1.2 chunk terminal as it may cross.
+
+    completed with neither error nor code, cancelled or deadline with that
+    same code, and failed with any other closed code are the only endings the
+    vocabulary states. One of those with str prose wherever it carries a code
+    is returned as it is. Any other ending goes out failed, coded internal,
+    and a code without prose gets some.
+    """
+    outcome, code, error = message.get("outcome"), message.get("code"), message.get("error")
+    if outcome == jobs.OUTCOME_COMPLETED and "code" not in message and "error" not in message:
+        return message
+    stated = ((outcome in _FIXED_OUTCOME_CODES and code == _FIXED_OUTCOME_CODES[outcome])
+              or (outcome == jobs.OUTCOME_FAILED and _closed_code(code)
+                  and code not in _FIXED_OUTCOME_CODES.values()))
+    if stated and isinstance(error, str) and not getattr(message, "fds", ()):
+        return message
+    guarded = dict(message)
+    if not stated:
+        guarded["outcome"], guarded["code"] = jobs.OUTCOME_FAILED, protocol.ERR_INTERNAL
+    if not isinstance(error, str):
+        guarded["error"] = f"the job ended: {guarded['outcome']}"
+    return guarded
+
+
+def _guard_message(message: object) -> dict:
+    """Return ``message`` as it may cross a receiver socket.
+
+    A chunk terminal is guarded by _guard_terminal. Any other message carrying
+    neither error nor code -- a partial, a final, a chunk descriptor -- is
+    returned as it is, and so is a well-formed error: str prose, a closed code,
+    and no result or descriptor field. Anything else that carries error or
+    code is an error: its prose kept when it has some, its code kept only when
+    closed and `internal` otherwise, every result and descriptor field dropped.
+    """
+    if not isinstance(message, dict):
+        return {"error": _UNSTATED_ERROR, "code": protocol.ERR_INTERNAL}
+    if message.get("terminal") is True:
+        return _guard_terminal(message)
+    if "error" not in message and "code" not in message:
+        return message
+    error, code = message.get("error"), message.get("code")
+    if (isinstance(error, str) and _closed_code(code)
+            and not _RESULT_KEYS & message.keys() and not getattr(message, "fds", ())):
+        return message
+    guarded = {"error": error if isinstance(error, str) else _UNSTATED_ERROR,
+               "code": code if _closed_code(code) else protocol.ERR_INTERNAL}
+    for key, value in message.items():
+        if key not in guarded and key not in _RESULT_KEYS:
+            guarded[key] = value
+    return guarded
+
+
+def _joinable(value: object) -> bool:
+    """True for an id a constant fallback message can carry as it is."""
+    return (isinstance(value, str) and 0 < len(value) <= protocol.MAX_ID_CHARS
+            and value.isascii() and value.isprintable())
+
+
+def _message_frame(message: dict) -> bytes:
+    """Return the frame for a guarded receiver message.
+
+    A transcript or chunk descriptor that is too large or will not encode
+    raises, as it always has: its caller refuses it with a terminal of its
+    own. An error or terminal that carries prose always has a frame: failing
+    as built, with its prose escaped and cut; failing that, as a constant
+    internal message that keeps only the ids joining it to its job.
+    """
+    try:
+        return protocol.encode(message, limit=protocol.MAX_REPLY_BYTES)
+    except protocol.ProtocolError:
+        if not isinstance(message, dict) or "error" not in message:
+            raise
+    shorter = dict(message)
+    shorter["error"] = protocol._cut_prose(
+        str(message["error"]), protocol.MAX_ERROR_PROSE_CHARS // 2)
+    try:
+        return protocol.encode(shorter, limit=protocol.MAX_REPLY_BYTES)
+    except protocol.ProtocolError:
+        pass
+    if message.get("terminal") is True:
+        fallback: dict = {"terminal": True}
+        for key in ("job", "kind"):
+            if _joinable(message.get(key)):
+                fallback[key] = message[key]
+        chunks = message.get("chunks")
+        fallback.update(
+            outcome=jobs.OUTCOME_FAILED,
+            chunks=chunks if isinstance(chunks, int) and not isinstance(chunks, bool)
+            and 0 <= chunks < 1 << 31 else 0)
+        fallback.update(code=protocol.ERR_INTERNAL, error=_UNSENDABLE)
+    else:
+        fallback = {"error": _UNSENDABLE, "code": protocol.ERR_INTERNAL}
+        if _joinable(message.get("segment")):
+            fallback["segment"] = message["segment"]
+    return protocol.encode(fallback, limit=protocol.MAX_REPLY_BYTES)
+
+
+def _outcome_as_sent(outcome: jobs.JobOutcome, terminal: dict) -> jobs.JobOutcome:
+    """``outcome`` as the guarded terminal sent for it states it (P11)."""
+    if (terminal.get("outcome"), terminal.get("code")) == (outcome.outcome, outcome.code):
+        return outcome
+    return jobs.JobOutcome(
+        job=outcome.job, kind=outcome.kind, outcome=terminal["outcome"],
+        code=terminal.get("code"),
+        message=outcome.message or str(terminal.get("error", "")),
+        chunks_published=outcome.chunks_published,
+        subscriber_lost=outcome.subscriber_lost)
+
+
+def _guarded_frame(frame: bytes, fds: tuple[int, ...],
+                   channel: str) -> tuple[bytes, tuple[int, ...]]:
+    """Return ``frame`` and ``fds`` as they may leave on ``channel``."""
+    try:
+        decoded = json.loads(frame)
+    except (ValueError, RecursionError):
+        decoded = None
+    if channel == _CHANNEL_REPLY:
+        guarded = _guard_reply(decoded)
+        if guarded is decoded:
+            return frame, (tuple(fds) if guarded.get("ok") is True else ())
+        return protocol.encode_reply(guarded), ()
+    guarded = _guard_message(decoded)
+    if guarded is decoded:
+        return frame, (() if "error" in guarded else tuple(fds))
+    return _message_frame(guarded), ()
+
+
 def _transmit(endpoint: socket.socket, frame: bytes,
-              fds: tuple[int, ...] = ()) -> None:
-    """Send one frame, attaching ``fds`` by SCM_RIGHTS when there are any."""
+              fds: tuple[int, ...] = (), *, channel: str) -> None:
+    """Send one frame, attaching ``fds`` by SCM_RIGHTS when there are any.
+
+    The final wire boundary. Every frame the daemon sends passes here, and is
+    guarded here whatever built it: ``channel`` is _CHANNEL_REPLY for the
+    control connection and _CHANNEL_MESSAGE for a receiver socket. A frame the
+    guard leaves as it is goes out byte for byte.
+    """
+    frame, fds = _guarded_frame(frame, fds, channel)
     if fds:
         endpoint.sendmsg([frame], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
                                     struct.pack(f"{len(fds)}i", *fds))])
@@ -245,7 +452,8 @@ def _reply_frame(reply: dict) -> tuple[bytes, tuple[int, ...]]:
 
     Descriptors travel only with the reply they belong to. A reply carrying
     descriptors that will not encode is replaced by encode_reply's bounded
-    refusal, which goes out alone.
+    refusal, which goes out alone. What the frame may carry is decided where
+    it is sent, by _transmit's guard.
     """
     fds = tuple(getattr(reply, "fds", ()))
     if fds:
@@ -804,7 +1012,7 @@ class Daemon:
                 # request, and the voice session was gone.
                 frame, fds = _reply_frame(reply)
                 try:
-                    _transmit(conn, frame, fds)
+                    _transmit(conn, frame, fds, channel=_CHANNEL_REPLY)
                 except OSError as error:
                     self._debug(f"client left before the reply: {error}")
                     return
@@ -1302,9 +1510,17 @@ class Daemon:
                     code=code, message=message,
                     chunks_published=turn.chunks_published,
                     subscriber_lost=turn.subscriber_lost)
-                if (turn.settle(settled) and turn.terminal_events
-                        and turn.receiver is not None and not turn.subscriber_lost):
-                    self._send(turn.receiver, protocol.job_terminal(settled))
+                terminal = None
+                if (turn.terminal_events and turn.receiver is not None
+                        and not turn.subscriber_lost):
+                    # SEND-01 and P11: built and guarded before the job
+                    # settles, and the job settles as the terminal states it,
+                    # so what the subscriber receives and what status reports
+                    # cannot disagree.
+                    terminal = self._speech_terminal(settled)
+                    settled = _outcome_as_sent(settled, terminal)
+                if turn.settle(settled) and terminal is not None:
+                    self._send(turn.receiver, terminal)
             except Exception as error:
                 # The device is still released below, whatever went wrong.
                 self._warn(f"could not settle turn {turn.id} "
@@ -1316,6 +1532,40 @@ class Daemon:
                     turn.receiver = None
             self._arbiter.end_speech(turn.id)
             self._touch()
+
+    def _speech_terminal(self, outcome: jobs.JobOutcome) -> dict:
+        """Return the one terminal a protocol-1.2 subscriber is sent for ``outcome``.
+
+        Built by protocol.job_terminal and guarded as _transmit guards it,
+        before the job settles. A terminal that does not state this outcome --
+        its code missing or not closed, or the job ending some other way --
+        and one that cannot be built or encoded at all, becomes the job's
+        failed, internal terminal, and _outcome_as_sent settles the job the
+        same way.
+        """
+        try:
+            built = protocol.job_terminal(outcome)
+        except Exception as error:
+            self._warn(f"could not build the terminal of turn {outcome.job} "
+                       f"({type(error).__name__})")
+            built = None
+        terminal = None
+        if isinstance(built, dict) and built.get("terminal") is True:
+            terminal = _guard_message(built)
+            if ((terminal.get("outcome"), terminal.get("code"))
+                    != (outcome.outcome, outcome.code)):
+                terminal = _guard_message(dict(
+                    terminal, outcome=jobs.OUTCOME_FAILED, code=protocol.ERR_INTERNAL))
+            try:
+                _message_frame(terminal)
+            except protocol.ProtocolError:
+                terminal = None
+        if terminal is None:
+            terminal = {"terminal": True, "job": outcome.job, "kind": outcome.kind,
+                        "outcome": jobs.OUTCOME_FAILED,
+                        "chunks": outcome.chunks_published,
+                        "code": protocol.ERR_INTERNAL, "error": _UNBUILDABLE_TERMINAL}
+        return terminal
 
     def _synth(self, turn: _SpeechTurn,
                chunk: str) -> tuple[bytes, int] | None:
@@ -1661,20 +1911,28 @@ class Daemon:
         terminal instead of being settled undelivered. Recognised text never
         enters the ledger: a final settles with no message.
         """
+        if not isinstance(message, dict) or not (
+                "final" in message or "error" in message or "code" in message):
+            message = {"error": _NOT_A_TERMINAL, "code": protocol.ERR_INTERNAL}
+        # SEND-01: guarded before it settles, by the function _transmit uses,
+        # so the job settles with the code that crosses the wire.
+        message = _guard_message(message)
         if "error" in message and "segment" not in message:
             message = dict(message, segment=turn.id)
-        protocol.encode(message, limit=protocol.MAX_REPLY_BYTES)
+        if "final" in message:
+            # Only a transcript is refused for its size here. An error always
+            # has a frame (_message_frame), so it is never refused after it
+            # settles.
+            protocol.encode(message, limit=protocol.MAX_REPLY_BYTES)
         code = message.get("code")
         if "final" in message:
             outcome, code, prose = jobs.OUTCOME_COMPLETED, None, ""
         elif code == protocol.ERR_CANCELLED:
-            outcome, prose = jobs.OUTCOME_CANCELLED, message.get("error", "")
+            outcome, prose = jobs.OUTCOME_CANCELLED, message["error"]
         elif code == protocol.ERR_DEADLINE:
-            outcome, prose = jobs.OUTCOME_DEADLINE, message.get("error", "")
+            outcome, prose = jobs.OUTCOME_DEADLINE, message["error"]
         else:
-            outcome, prose = jobs.OUTCOME_FAILED, message.get("error", "")
-            if code not in protocol.ERROR_CODES:
-                code = protocol.ERR_INTERNAL
+            outcome, prose = jobs.OUTCOME_FAILED, message["error"]
         # A final settles only if, at that instant and under the lock
         # stop-dictation decides under, no abort has won and the budget is not
         # spent. The boundary checks before this leave a gap an abort can land
@@ -1960,7 +2218,8 @@ class Daemon:
         MessageTooLarge propagates, so an over-size transcript is REFUSED with
         a too-large datagram by _run_dictation rather than cut short.
         Returning False instead would leave that caller with no terminal
-        datagram at all.
+        datagram at all. An error or terminal never raises here: it is guarded
+        (SEND-01) and always has a frame.
 
         An _Outbound message may attach descriptors by SCM_RIGHTS, and may
         decline to wait. A non-blocking send to a receiver whose queue is full
@@ -1969,11 +2228,12 @@ class Daemon:
         holds its own reference once sendmsg returns, and the caller closes
         its copy.
         """
-        frame = protocol.encode(message, limit=protocol.MAX_REPLY_BYTES)
-        fds = tuple(getattr(message, "fds", ()))
+        guarded = _guard_message(message)
+        frame = _message_frame(guarded)
+        fds = tuple(getattr(guarded, "fds", ()))
         try:
             if not getattr(message, "nonblocking", False):
-                _transmit(receiver, frame, fds)
+                _transmit(receiver, frame, fds, channel=_CHANNEL_MESSAGE)
                 return True
             # MSG_DONTWAIT alone would not stop Python waiting: a socket with a
             # timeout polls for writability for that long before it sends. A
@@ -1982,7 +2242,7 @@ class Daemon:
             previous = receiver.gettimeout()
             receiver.settimeout(0.0)
             try:
-                _transmit(receiver, frame, fds)
+                _transmit(receiver, frame, fds, channel=_CHANNEL_MESSAGE)
             finally:
                 receiver.settimeout(previous)
             return True

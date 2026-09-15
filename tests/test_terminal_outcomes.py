@@ -394,7 +394,49 @@ class TerminalMessages(_LiveTurnsFixture):
         self.assertEqual([m["sequence"] for m in receiver.msgs[:-1]], [0, 1])
         self.assertEqual((last["job"], last["kind"], last["chunks"]),
                          (reply["turn"], "speech", 2))
+        # A completed job's terminal states no failure, in prose or in code.
+        self.assertNotIn("error", last)
+        self.assertNotIn("code", last)
         self.assertEqual(self.settled(reply["turn"])["outcome"], "completed")
+
+    def test_a_terminal_that_misstates_the_job_goes_out_internal_and_status_agrees(self) -> None:
+        # SEND-01 and P11 on the chunk wire: whatever the terminal's builder
+        # returns, the one terminal that crosses carries a closed code, and
+        # status reports the job exactly as that terminal states it.
+        real = protocol.job_terminal
+
+        def code_removed(outcome):
+            message = dict(real(outcome))
+            message.pop("code", None)
+            return message
+
+        def raises(outcome):
+            raise RuntimeError("the builder failed")
+
+        builders = (
+            ("code removed", code_removed, True),
+            ("code 'bogus'", lambda outcome: dict(real(outcome), code="bogus"), True),
+            ("builder raises", raises, True),
+            # Well formed, and stating an ending this job did not have.
+            ("states another ending", lambda outcome: {
+                "terminal": True, "job": outcome.job, "kind": outcome.kind,
+                "outcome": "completed", "chunks": outcome.chunks_published}, True),
+            ("completed, carrying prose", lambda outcome: dict(
+                real(outcome), error="read-aloud finished"), False),
+        )
+        for label, builder, fail in builders:
+            with self.subTest(terminal=label):
+                self.flag("fail", fail)
+                with mock.patch.object(protocol, "job_terminal", builder):
+                    receiver, reply = self.stream(text="Only one sentence here.", v="1.2")
+                    last = self.assert_one_terminal_last(receiver, "failed")
+                    record = self.settled(reply["turn"])
+                self.assertEqual(last["code"], protocol.ERR_INTERNAL, last)
+                self.assertIsInstance(last["error"], str)
+                self.assertEqual((record["outcome"], record["code"]),
+                                 ("failed", protocol.ERR_INTERNAL))
+                self.flag("fail", False)
+                self.assertTrue(wait_until(self.idle, 5))
 
     def test_a_cancelled_1_2_stream_ends_with_a_cancelled_terminal(self) -> None:
         self.tts_sizes = [BIG]
