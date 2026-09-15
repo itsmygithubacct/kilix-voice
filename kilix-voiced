@@ -460,6 +460,7 @@ def _reply_frame(reply: dict) -> tuple[bytes, tuple[int, ...]]:
     refusal, which goes out alone. What the frame may carry is decided where
     it is sent, by _transmit's guard.
     """
+    reply = _escaped(reply)
     fds = tuple(getattr(reply, "fds", ()))
     if fds:
         try:
@@ -467,6 +468,36 @@ def _reply_frame(reply: dict) -> tuple[bytes, tuple[int, ...]]:
         except protocol.ProtocolError:
             pass
     return protocol.encode_reply(reply), ()
+
+
+def _escaped(value: object) -> object:
+    """``value`` with each lone surrogate in its text written as its backslash escape.
+
+    UTF8-S. A success reply quotes what the daemon took from its environment
+    and configuration: the session directory, a model or library path, a
+    capture command, a failure's prose kept in the job ledger. A Linux name is
+    bytes, and one that is not UTF-8 decodes to lone surrogates, which no
+    UTF-8 frame can carry, so such a status went out as `internal` in place of
+    the answer. Refusal prose already got this escape (protocol._cut_prose);
+    every string in a reply, keys included, now gets the same one. Text that
+    encodes is returned as the same object, and a reply's descriptors stay
+    with it.
+    """
+    if isinstance(value, str):
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            return value.encode("utf-8", "backslashreplace").decode("utf-8")
+        return value
+    if isinstance(value, dict):
+        escaped = {_escaped(key): _escaped(item) for key, item in value.items()}
+        if isinstance(value, _Outbound):
+            return _Outbound(escaped, fds=value.fds, nonblocking=value.nonblocking,
+                             droppable=value.droppable)
+        return escaped
+    if isinstance(value, (list, tuple)):
+        return [_escaped(item) for item in value]
+    return value
 
 
 class _Outbound(dict):
