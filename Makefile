@@ -4,18 +4,24 @@ PYTHON ?= python3
 # independent reviews ran; PATH inside tests/cleanenv.sh is /usr/bin:/bin.
 CLEAN_PYTHON ?= /usr/bin/python3
 PREFIX ?= $(HOME)/.local
+# S04: the accelerator lease has one home, the kilix-device-lease component of
+# kilix-system-monitor. kilix-voice imports it and carries no copy, so its
+# tests need that source on the import path; tests/test_accelerator.py fails,
+# naming this variable, when it is not.
+LEASE_SRC ?= ../../kilix-system-monitor/components/kilix-device-lease/src
 
 .PHONY: all test test-clean lint install clean
 
 all: test
 
 test:
-	$(PYTHON) -m unittest discover -s tests -t . -v
+	PYTHONPATH="$(abspath $(LEASE_SRC))" $(PYTHON) -m unittest discover -s tests -t . -v
 
 # Same suite, no inherited environment: no KILIX_* or GPU_TERMINAL_* variable,
 # a temporary HOME and XDG tree. Both targets must report no failures.
 test-clean:
-	./tests/cleanenv.sh $(CLEAN_PYTHON) -m unittest discover -s tests -t .
+	./tests/cleanenv.sh /usr/bin/env PYTHONPATH="$(abspath $(LEASE_SRC))" \
+	  $(CLEAN_PYTHON) -m unittest discover -s tests -t .
 
 lint:
 	$(PYTHON) -m compileall -q voicelib tests

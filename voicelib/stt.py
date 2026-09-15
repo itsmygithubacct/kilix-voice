@@ -24,7 +24,7 @@ import re
 
 from typing import NamedTuple
 
-from . import consent, models, paths, protocol, settings
+from . import consent, models, paths, protocol, resources, settings
 from .util import cfg_get
 
 DEFAULT_RATE = 16000
@@ -474,6 +474,13 @@ class ResolvedStt:
     model_dir: str | None
     settings_path: str | None
     lib_path: str | None
+    # S04: where the engine runs and the task it runs, from the catalogue entry
+    # of model_id. Decided here, in the one resolution, so the accelerator
+    # lease is taken for the same identity consent and construction use. An
+    # engine that builds no recogniser, and an id the catalogue does not hold,
+    # is a CPU transcription, as every Vosk model is.
+    device_class: str = resources.DEVICE_CPU
+    task: str = "transcribe"
 
 
 def resolve_stt(cfg: dict | None = None) -> ResolvedStt:
@@ -507,9 +514,11 @@ def resolve_stt(cfg: dict | None = None) -> ResolvedStt:
             model_id=cfg_get(config, "stt.model"),
             model_path=cfg_get(config, "stt.model_path"),
             settings_path=settings_path)
+    spec = models.MODEL_BY_ID.get(model_id) if engine == ENGINE_VOSK else None
     return ResolvedStt(
         engine=engine, model_id=model_id, model_dir=model_dir,
-        settings_path=settings_path, lib_path=cfg_get(config, "stt.lib_path"))
+        settings_path=settings_path, lib_path=cfg_get(config, "stt.lib_path"),
+        device_class=spec.device_class if spec is not None else resources.DEVICE_CPU)
 
 
 class ConsentIdentity(NamedTuple):

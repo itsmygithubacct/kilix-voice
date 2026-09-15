@@ -80,8 +80,8 @@ for _package_root in (_INSTALLED_LIB, _HERE):
 
 from voicelib import (
     consent,  # noqa: E402  (the import follows the path bootstrap)
-    __version__, audio, audio_input, audiofd, daemon_config, events, jobs,
-    models, paths, protocol, settings, stt as stt_lib, tts as tts_lib, util)
+    __version__, accelerator, audio, audio_input, audiofd, daemon_config, events,
+    jobs, models, paths, protocol, settings, stt as stt_lib, tts as tts_lib, util)
 from voicelib.arbiter import Arbiter, ArbiterError  # noqa: E402
 from voicelib.cancel import (  # noqa: E402
     Cancellation, Cancelled, CancellationError, DeadlineExceeded)
@@ -1959,7 +1959,7 @@ class Daemon:
                 f"dictation stopped: {error}.", protocol.ERR_CANCELLED))
         except (DaemonError, audio.AudioError, stt_lib.SttError,
                 settings.SettingsError, paths.PathError, OSError,
-                ValueError) as error:
+                ValueError, accelerator.AcceleratorRefused) as error:
             # A refusal that knows its own code keeps it. Everything else is
             # still `unavailable`, which R4 confirmed is the right default.
             #
@@ -2070,6 +2070,29 @@ class Daemon:
         turn.stop.check()
         self._require_capture_consent(resolved)
         turn.stop.check()
+        # S04 (LEASE-02): an engine on an accelerator runs only under a grant
+        # from the one lease home, waited for here, before the engine is
+        # built, with this turn's id, budget and stop. A CPU engine -- every
+        # engine shipped today -- acquires nothing. A refusal carries its
+        # closed code to the dictation-error arm like any other.
+        with accelerator.execution(
+                device_class=resolved.device_class, task=resolved.task,
+                job_id=turn.id, deadline_monotonic=turn.deadline, token=turn.stop,
+                peer_gone=self._stopping.is_set,
+                progress=lambda state: self._debug(
+                    f"{turn.id}: waiting for the accelerator ({state['state']}, "
+                    f"position {state['position']})"),
+                device_label=str(util.cfg_get(self._cfg, accelerator.DEVICE_KEY, "") or "")
+                ) as grant:
+            self._record_turn(turn, resolved, grant)
+
+    def _record_turn(self, turn: _DictationTurn, resolved: stt_lib.ResolvedStt,
+                     grant: accelerator.ExecutionGrant | None) -> None:
+        """Capture, recognise and deliver one turn, with the engine ``resolved`` names.
+
+        ``grant`` is held around all of it for an accelerator engine, and is
+        marked reaped only once the engine has closed.
+        """
         capture = audio.MicCapture(self._cfg)
         engine = stt_lib.make_stt(self._cfg, capture.rate, resolved=resolved)
         try:
@@ -2126,6 +2149,10 @@ class Daemon:
         finally:
             capture.stop()
             engine.close()
+            if grant is not None:
+                # Only after a close that did not raise: an engine whose
+                # teardown failed leaves the accelerator quarantined.
+                grant.reaped()
 
     @staticmethod
     def _check_delivery(turn: _DictationTurn, where: str) -> None:

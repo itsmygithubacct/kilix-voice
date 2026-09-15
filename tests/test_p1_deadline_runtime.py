@@ -1102,11 +1102,43 @@ class R3SurvivorTestCase(unittest.TestCase):
 
     # M10 -----------------------------------------------------------------
     def test_the_recogniser_is_closed_when_dictation_ends(self) -> None:
-        source = open(os.path.join(ROOT, "kilix-voiced")).read()
-        body = source[source.index("def _dictate(self"):]
-        body = body[:body.index("\n    def ", 10)]
-        self.assertIn("engine.close()", body)
-        self.assertLess(body.index("finally:"), body.index("engine.close()"))
+        # Asserted by effect: the recogniser a turn builds is closed once when
+        # the turn ends, whether it delivered its transcript or recording
+        # failed to start. This used to read the source text of _dictate, and
+        # broke when the turn's body moved into a method of its own with the
+        # close still in its finally.
+        import threading
+        from types import SimpleNamespace
+        for failure in (None, voiced.DaemonError("the recorder would not start")):
+            with self.subTest(failure=failure):
+                daemon = object.__new__(voiced.Daemon)
+                daemon._cfg = {"stt": {"engine": "vosk", "model_path": "/nonexistent",
+                                       "max_seconds": 120}, "vad": {"silence_ms": 900}}
+                daemon._stopping = threading.Event()
+                daemon._warn = daemon._debug = lambda *a, **k: None
+                sent = []
+                daemon._send = lambda receiver, msg: sent.append(msg) or True
+                daemon._clear_dictation = lambda turn: None
+                daemon._touch = lambda: None
+                daemon._require_capture_consent = lambda resolved=None: None
+                turn = voiced._DictationTurn("listen-10", mock.Mock())
+                frames = [b"\x00" * 320, b"\x00" * 320]
+                capture = mock.Mock(rate=16000, frame_bytes=320, overruns=0, error="")
+                capture.read.side_effect = lambda *a, **k: frames.pop(0) if frames else None
+                if failure is not None:
+                    capture.start.side_effect = failure
+                engine = mock.Mock(supports_partials=False)
+                engine.feed.return_value = None
+                engine.end_utterance.return_value = "the words"
+                events = iter([voiced.events.VAD_SPEECH_START, voiced.events.VAD_SPEECH_END])
+                with mock.patch.object(voiced.audio, "MicCapture", lambda cfg: capture), \
+                        mock.patch.object(voiced.stt_lib, "make_stt", lambda *a, **k: engine), \
+                        mock.patch.object(voiced, "Vad", lambda cfg: SimpleNamespace(
+                            feed=lambda frame: next(events, ""))):
+                    voiced.Daemon._run_dictation(daemon, turn)
+                engine.close.assert_called_once_with()
+                self.assertEqual(len(sent), 1, sent)
+                self.assertEqual("final" in sent[0], failure is None, sent)
 
     # M11 -----------------------------------------------------------------
     def test_a_finished_dictation_turn_is_not_retained(self) -> None:
