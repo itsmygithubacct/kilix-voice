@@ -511,6 +511,29 @@ class IngestStalledDescriptor(_IngestFixture):
                                         .get("ok") is True, 5))
 
 
+    def test_a_stalled_descriptor_is_refused_within_a_second_and_a_half(self) -> None:
+        # Wave-3a survivor A1: the bounds above are computed from the read's
+        # own constants, so a grace raised from a quarter of a second to three
+        # seconds moved them with it. A read that never answers is refused
+        # within a second and a quarter; this bound is a figure of its own.
+        release = threading.Event()
+        real_fstat = os.fstat
+
+        def held_fstat(fd, *args, **kwargs):
+            if threading.current_thread().name == "kilix-voice-ingest-read":
+                release.wait(20)
+            return real_fstat(fd, *args, **kwargs)
+
+        self.addCleanup(release.set)
+        with mock.patch.object(audiofd.os, "fstat", held_fstat):
+            reply, elapsed = self.stalled_exchange({"id": "bounded"})
+            release.set()
+        self.assertEqual(reply.get("code"), protocol.ERR_UNAVAILABLE, reply)
+        self.assertLess(elapsed, 1.6)
+        self.assertTrue(_eventually(lambda: audiofd._stalled == 0, 5),
+                        "the stalled read never gave its slot back")
+
+
 def _eventually(predicate, timeout: float) -> bool:
     end = time.monotonic() + timeout
     while time.monotonic() < end:

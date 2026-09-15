@@ -131,6 +131,40 @@ class PackageGuardTestCase(unittest.TestCase):
                                 f"{name} resolves outside the private tree")
 
 
+    def test_every_stack_variable_is_taken_out_whatever_the_runner_exported(self) -> None:
+        # Wave-3a survivor I1: the scrubbed runner exports no stack variable,
+        # so a prefix dropped from the guard went unseen there. This child is
+        # handed one of each, all naming a tree outside its own.
+        import json
+        outside = tempfile.mkdtemp(prefix="kv-exported-")
+        self.addCleanup(shutil.rmtree, outside, True)
+        exported = {
+            "GPU_TERMINAL_HOME": os.path.join(outside, "gpu_terminal"),
+            "GPU_TERMINAL_SETTINGS_FILE": os.path.join(outside, "settings.conf"),
+            "KILIX_STORAGE_HOME": os.path.join(outside, "storage"),
+            "KILIX_DATA_HOME": os.path.join(outside, "storage", "data"),
+            "PLEB_DATA_HOME": os.path.join(outside, "pleb"),
+            "XDG_DATA_HOME": os.path.join(outside, "share"),
+        }
+        probe = ("import json, os, tests\n"
+                 "from voicelib import paths\n"
+                 "print(json.dumps({'left': sorted(n for n in os.environ if n.startswith("
+                 "('KILIX', 'GPU_TERMINAL_', 'PLEB_')) or os.environ[n].startswith("
+                 + repr(outside) + ")),\n"
+                 "  'root': tests.ISOLATION_ROOT, 'settings': paths.settings_file(),\n"
+                 "  'home': paths.gpu_terminal_home(), 'data': paths.data_home()}))\n")
+        child = subprocess.run(
+            [sys.executable, "-B", "-c", probe], cwd=ROOT,
+            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1", **exported),
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        seen = json.loads(child.stdout)
+        self.assertEqual(seen["left"], [], "a stack variable reached the tests")
+        private = os.path.realpath(seen["root"]) + os.sep
+        for name in ("settings", "home", "data"):
+            with self.subTest(root=name):
+                self.assertTrue(os.path.realpath(seen[name]).startswith(private), seen)
+
     def test_the_private_tree_is_removed_when_the_process_exits(self) -> None:
         child = subprocess.run(
             [sys.executable, "-B", "-c",

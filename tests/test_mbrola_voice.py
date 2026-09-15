@@ -118,6 +118,12 @@ class ResolutionTestCase(_MbrolaFixture):
         with self.assertRaises(tts.TtsError):
             tts.resolve_mbrola_voice("en-us")
 
+    def test_a_voice_built_on_another_languages_database_resolves_by_that_database(self) -> None:
+        # Wave-3a survivor B2: de1-en speaks English with the de1 diphone
+        # database, so de1 is the file that must exist, not one named de1-en.
+        self.install("de1")
+        self.assertEqual(tts.resolve_mbrola_voice("en"), "mb-de1-en")
+
     def test_an_explicit_voice_id_is_used_as_named(self) -> None:
         for voice, expected in (("us1", "mb-us1"), ("de4-en", "mb-de4-en"), ("US2", "mb-us2")):
             with self.subTest(voice=voice):
