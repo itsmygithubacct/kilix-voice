@@ -744,14 +744,21 @@ class EmbeddedAudioRefusal(unittest.TestCase):
 
 
 class ResourceProfileTestCase(unittest.TestCase):
-    """C06/C12/C18 -- a device class and a MEASURED resource profile."""
+    """C06/C12/C18 -- a device class and a MEASURED resource profile.
+
+    Every row here is SYNTHETIC: its figures exercise the validator's contract
+    and were measured on no host, so each names itself a fixture. A test
+    presenting unmeasured figures as measured would ship a false record.
+    """
+
+    SYNTHETIC_HOST = "synthetic-fixture"
 
     def _p(self, **over):
         profile = {
             "schema": resources.RESOURCE_SCHEMA,
             "device_class": resources.DEVICE_CUDA,
-            "measured": {"host": "pleon", "date": "2026-09-13",
-                         "peak_vram_mib": 3629, "peak_ram_mib": 2048},
+            "measured": {"host": self.SYNTHETIC_HOST, "date": "2026-09-13",
+                         "peak_vram_mib": 4000, "peak_ram_mib": 1000},
         }
         profile.update(over)
         return profile
@@ -770,7 +777,8 @@ class ResourceProfileTestCase(unittest.TestCase):
     def test_an_empty_measurement_is_refused(self) -> None:
         # An empty profile would certify a model as measured when it is not.
         with self.assertRaises(resources.ResourceError) as caught:
-            resources.validate(self._p(measured={"host": "pleon", "date": "2026-09-13"}))
+            resources.validate(self._p(measured={"host": self.SYNTHETIC_HOST,
+                                                  "date": "2026-09-13"}))
         self.assertIn("carries no figure at all", str(caught.exception))
 
     def test_an_accelerator_must_report_vram(self) -> None:
@@ -826,10 +834,79 @@ class ResourceProfileTestCase(unittest.TestCase):
                     resources.fits(profile, available_vram_mib=bad,
                                    available_ram_mib=46000)
 
-    def test_pleon_measurements_fit_its_measured_headroom(self) -> None:
-        # The figures actually measured on pleon under the H2 fixture.
-        self.assertTrue(resources.fits(self._p(), available_vram_mib=8192,
-                                       available_ram_mib=46000))
+    def test_a_synthetic_row_fits_headroom_at_its_figures_and_not_below(self) -> None:
+        profile = self._p()
+        self.assertTrue(resources.fits(profile, available_vram_mib=4000,
+                                       available_ram_mib=1000))
+        self.assertFalse(resources.fits(profile, available_vram_mib=3999,
+                                        available_ram_mib=1000))
+        self.assertFalse(resources.fits(profile, available_vram_mib=4000,
+                                        available_ram_mib=999))
+
+
+# Internal host names never appear in this repository: the publication rules
+# forbid them in committed files. The one list, kept here, is the machine
+# names the publication message scan looks for. Each is spelt in two pieces
+# so that this file does not contain it.
+INTERNAL_HOSTNAMES = ("ple" "on", "ne" "on", "cyber" "ghost", "p" "50")
+_UNSCANNED = frozenset({".git", "__pycache__"})
+
+
+def internal_hostname_hits(root: str) -> list[tuple[str, str]]:
+    """Every whole-word internal host name in the files under ``root``.
+
+    Walks the tree rather than asking git, so an untracked file about to be
+    committed is scanned too. Skips git's own store, bytecode caches, and the
+    plain directory names .gitignore keeps out of the repository.
+    """
+    import re
+    pattern = re.compile(rb"(?i)\b(" + b"|".join(
+        re.escape(token.encode("ascii")) for token in INTERNAL_HOSTNAMES) + rb")\b")
+    skipped = set(_UNSCANNED)
+    try:
+        with open(os.path.join(root, ".gitignore"), encoding="utf-8") as handle:
+            for line in handle:
+                entry = line.strip()
+                if (entry.endswith("/") and "/" not in entry[:-1]
+                        and not any(mark in entry for mark in "*?[!#")):
+                    skipped.add(entry[:-1])
+    except OSError:
+        pass
+    hits = []
+    for directory, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(name for name in dirnames if name not in skipped)
+        for name in sorted(filenames):
+            path = os.path.join(directory, name)
+            if os.path.islink(path):
+                continue
+            with open(path, "rb") as handle:
+                data = handle.read()
+            hits.extend((os.path.relpath(path, root), match.group(1).decode("ascii").lower())
+                        for match in pattern.finditer(data))
+    return hits
+
+
+class HygieneTestCase(unittest.TestCase):
+    """RES-04: no internal host name ships in this repository."""
+
+    def test_no_internal_hostnames_in_tracked_files(self) -> None:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.assertEqual(internal_hostname_hits(root), [])
+
+    def test_control_a_planted_hostname_is_found_and_only_skipped_trees_hide_one(self) -> None:
+        root = tempfile.mkdtemp(prefix="kv-hygiene-")
+        self.addCleanup(shutil.rmtree, root, True)
+        planted = INTERNAL_HOSTNAMES[0]
+        for relative in ("kept.py", ".git/config", "tests/__pycache__/x.pyc",
+                         "models/m.bin", "examples/notes.txt"):
+            path = os.path.join(root, relative)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(f'host = "{planted.upper() if "notes" in relative else planted}"\n')
+        with open(os.path.join(root, ".gitignore"), "w", encoding="utf-8") as handle:
+            handle.write("__pycache__/\nmodels/\n*.so\n")
+        self.assertEqual(sorted(internal_hostname_hits(root)),
+                         [("examples/notes.txt", planted), ("kept.py", planted)])
 
 
 class LegacyCatalogEntryTestCase(unittest.TestCase):
@@ -859,9 +936,10 @@ class LegacyCatalogEntryTestCase(unittest.TestCase):
                            "resource_profile": {
                                "schema": resources.RESOURCE_SCHEMA,
                                "device_class": "cuda",
-                               "measured": {"host": "pleon", "date": "2026-09-13",
-                                            "peak_vram_mib": 3629,
-                                            "peak_ram_mib": 2048}}}]}
+                               "measured": {"host": "synthetic-fixture",
+                                            "date": "2026-09-13",
+                                            "peak_vram_mib": 4000,
+                                            "peak_ram_mib": 1000}}}]}
         self.assertEqual(models.read_catalog(doc)["models"][0]["device_class"], "cuda")
 
     def test_contradictory_device_declarations_are_refused(self) -> None:
@@ -1063,7 +1141,7 @@ class R2Findings3And5TestCase(unittest.TestCase):
     """R2 findings 3 and 5, the parts that are code rather than judgement."""
 
     def _cuda(self, **measured):
-        base = {"host": "pleon", "date": "2026-09-13",
+        base = {"host": "synthetic-fixture", "date": "2026-09-13",
                 "peak_vram_mib": 100, "peak_ram_mib": 64}
         base.update(measured)
         return {"schema": resources.RESOURCE_SCHEMA,
