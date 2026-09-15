@@ -599,6 +599,127 @@ class IngestLiveControlPlane(LiveDaemonTestCase):
         self.assert_still_serving()
 
 
+    def test_queued_hostile_ingest_requests_never_hold_the_control_plane(self) -> None:
+        # ING-02: six such requests delayed a following stop-speech by 5.86 s,
+        # each holding the single accept loop for about a second. The bound is
+        # a figure of its own, not one derived from the read's constants.
+        count, bound = 8, 0.75
+        writers: list[int] = []
+        sent = [threading.Event() for _ in range(count)]
+        replies: dict[int, dict] = {}
+
+        def ingest(index: int) -> None:
+            read_end, write_end = os.pipe()     # written never; closed at the end
+            writers.append(write_end)
+            client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+            client.settimeout(30)
+            with client:
+                client.connect(self.control)
+                client.sendmsg([b'{"op":"ingest-audio","id":"hostile"}\n'],
+                               [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                 struct.pack("i", read_end))])
+                os.close(read_end)
+                sent[index].set()
+                data, ancillary, _flags, _ = client.recvmsg(1 << 16, socket.CMSG_SPACE(4 * _INT))
+                frames = [data]
+                while data:                     # exactly one reply, then the hang-up
+                    data = client.recv(1 << 16)
+                    frames.append(data)
+            for received in _received(ancillary):
+                os.close(received)
+            replies[index] = {"frames": frames}
+
+        threads = [threading.Thread(target=ingest, args=(i,), daemon=True) for i in range(count)]
+        try:
+            for thread in threads:
+                thread.start()
+            self.assertTrue(all(event.wait(10) for event in sent))
+            latencies = []
+            end = time.monotonic() + 2.5
+            while time.monotonic() < end:
+                for op in ("stop-speech", "stop-dictation", "status"):
+                    started = time.monotonic()
+                    reply = self.request({"op": op})
+                    latencies.append((time.monotonic() - started, op))
+                    self.assertTrue(reply["ok"], reply)
+            for thread in threads:
+                thread.join(20)
+        finally:
+            for write_end in writers:
+                os.close(write_end)
+        worst, op = max(latencies)
+        self.assertLess(worst, bound, f"{op} waited {worst:.3f} s behind queued ingest requests")
+        self.assertEqual(len(replies), count, "an ingest request was never answered")
+        codes = []
+        for index in range(count):
+            frames = replies[index]["frames"]
+            self.assertEqual((len(frames), frames[-1]), (2, b""), frames)
+            reply = protocol.decode(frames[0])
+            self.assertIs(reply["ok"], False, reply)
+            codes.append(reply["code"])
+        self.assertTrue(set(codes) <= {protocol.ERR_MALFORMED, protocol.ERR_BUSY}, codes)
+        self.assertIn(protocol.ERR_MALFORMED, codes)      # the pipes really were read
+        self.assert_still_serving()
+
+
+class IngestOffload(_IngestFixture):
+    """ING-02 on a daemon that has ingest slots: reads happen off the accept loop."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        d = self.daemon
+        d._ingest_slots = threading.BoundedSemaphore(1)
+        d._speech = d._dictation = None
+        d._arbiter = mock.Mock(speaking=False, listening=False)
+
+    def connect_with(self, fd: int, request: bytes = b'{"op":"ingest-audio"}\n'):
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.addCleanup(client.close)
+        client.settimeout(10)
+        client.connect(self.path)
+        client.sendmsg([request], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("i", fd))])
+        os.close(fd)
+        return client
+
+    def test_with_no_free_slot_the_request_is_refused_busy_at_once(self) -> None:
+        slots = self.daemon._ingest_slots
+        self.assertTrue(slots.acquire(blocking=False))
+        self.addCleanup(slots.release)
+        client = self.connect_with(self.memfd_with(wav_bytes(PCM)))
+        started = time.monotonic()
+        voiced.Daemon._accept_one(self.daemon)
+        self.assertLess(time.monotonic() - started, 0.2)
+        reply = protocol.decode(client.recv(1 << 16))
+        self.assertEqual((reply["ok"], reply["code"]), (False, protocol.ERR_BUSY), reply)
+        self.assertEqual(client.recv(1 << 16), b"")
+
+    def test_a_slow_read_is_answered_from_its_own_thread_and_gives_its_slot_back(self) -> None:
+        before = _open_descriptors()
+        read_end, write_end = os.pipe()
+        client = self.connect_with(read_end)
+        started = time.monotonic()
+        voiced.Daemon._accept_one(self.daemon)
+        self.assertLess(time.monotonic() - started, 0.2, "the accept loop waited for the read")
+        self.assertTrue(voiced.Daemon._busy(self.daemon))
+        os.write(write_end, wav_bytes(PCM))
+        os.close(write_end)
+        data, ancillary, _flags, _ = client.recvmsg(1 << 16, socket.CMSG_SPACE(4 * _INT))
+        received = _received(ancillary)
+        for fd in received:
+            os.close(fd)
+        reply = protocol.decode(data)
+        self.assertIs(reply["ok"], True, reply)
+        self.assertEqual(len(received), 1)
+        self.assertEqual(client.recv(1 << 16), b"")
+        client.close()
+        self.assertTrue(_eventually(lambda: self.daemon._ingest_in_flight == 0, 5))
+        self.assertFalse(voiced.Daemon._busy(self.daemon))
+        self.assertTrue(self.daemon._ingest_slots.acquire(blocking=False))
+        self.daemon._ingest_slots.release()
+        self.assertTrue(_eventually(lambda: _open_descriptors() == before, 5),
+                        "a descriptor the request brought or made was left open")
+
+
 class IngestRequestValidation(unittest.TestCase):
     """The protocol side, including the V19 vector's frozen constraints."""
 

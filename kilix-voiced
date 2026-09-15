@@ -106,6 +106,11 @@ JOIN_TIMEOUT_S = 5.0
 # before it replies anyway. The same order as REQUEST_TIMEOUT_S: the accept
 # loop can already be held that long by a peer that sends nothing.
 STOP_QUIESCE_TIMEOUT_S = 1.0
+# ING-02: ingest-audio requests read their caller's descriptor on threads of
+# their own, at most this many at once. One more is refused busy at once,
+# rather than waiting, so neither the accept loop nor memory is ever held by
+# a pile of them.
+MAX_INGEST_IN_FLIGHT = 2
 
 # One control request is one datagram. The shared ceiling both bounds the
 # allocation and stays below the platform's AF_UNIX/SOCK_SEQPACKET send limit.
@@ -485,6 +490,24 @@ class _Outbound(dict):
         self.nonblocking = bool(nonblocking) or self.droppable
 
 
+class _Deferred:
+    """A reply that is computed off the accept loop, on its own thread.
+
+    ING-02: every ingest-audio request read its caller's descriptor on the
+    accept loop, which could take about a second each, so six queued hostile
+    requests held a following stop-speech for almost six seconds. _dispatch
+    returns one of these for ingest-audio, and _accept_one hands the
+    connection to a thread that calls it and sends what it returns. Every
+    other op is still answered on the loop, and so never waits for an ingest.
+    """
+
+    def __init__(self, compute: Callable[[], dict]) -> None:
+        self._compute = compute
+
+    def __call__(self) -> dict:
+        return self._compute()
+
+
 class _ReceivingConnection:
     """A control connection whose recv also takes the request's descriptors.
 
@@ -704,6 +727,11 @@ class Daemon:
     # ledger, and its turns still settle exactly once on their own.
     _jobs: jobs.JobLedger | None = None
     _speech_error_turn = ""
+    # ING-02: the slots ingest-audio requests are read in, and how many are
+    # in flight. Class-level None: a daemon built without __init__ answers
+    # ingest-audio on the calling thread, as the unit tests' daemons do.
+    _ingest_slots: threading.BoundedSemaphore | None = None
+    _ingest_in_flight = 0
 
     def __init__(self, *, config_path: str | None = None,
                  idle_seconds: float | None = None,
@@ -751,6 +779,8 @@ class Daemon:
         # polling client show each failure exactly once.
         self._speech_error = ""
         self._speech_error_serial = 0
+        self._ingest_slots = threading.BoundedSemaphore(MAX_INGEST_IN_FLIGHT)
+        self._ingest_in_flight = 0
         # P07/P11: every accepted job's single terminal outcome, by job id.
         self._jobs = jobs.JobLedger()
         self._speech_error_turn = ""
@@ -932,6 +962,9 @@ class Daemon:
                 if turn is not None and turn.thread is not None \
                         and turn.thread.is_alive():
                     return True
+            if self._ingest_in_flight > 0:
+                # An ingest request still being read is still owed its reply.
+                return True
             return self._arbiter.speaking or self._arbiter.listening
 
     def _touch(self) -> None:
@@ -995,15 +1028,80 @@ class Daemon:
             if not self._stopping.is_set():
                 self._warn(f"cannot accept a connection: {error}")
             return
-        with conn:
-            # Owns every descriptor that arrives with the request, from the
-            # read until this connection is done, on every path: an op that
-            # takes none ignores them, and none outlives the reply.
-            inbound = _ReceivingConnection(conn, audiofd.MAX_INBOUND_FDS)
+        # Owns every descriptor that arrives with the request, from the read
+        # until this connection is done, on every path: an op that takes none
+        # ignores them, and none outlives the reply.
+        inbound = _ReceivingConnection(conn, audiofd.MAX_INBOUND_FDS)
+        reply = None
+        try:
+            conn.settimeout(REQUEST_TIMEOUT_S)
+            reply = self._answer(inbound)
+        except Exception as error:
+            # BaseException still propagates: a signal or SystemExit keeps its
+            # meaning. Only the type is logged, never the message, which can
+            # carry what the request said.
+            self._warn(f"a connection failed unexpectedly "
+                       f"({type(error).__name__}); still serving")
             reply = None
+        if isinstance(reply, _Deferred):
+            refusal = self._hand_off(conn, inbound, reply)
+            if refusal is None:
+                return                  # the ingest thread owns the connection
+            reply = refusal
+        self._finish(conn, inbound, reply)
+
+    def _hand_off(self, conn: socket.socket, inbound: _ReceivingConnection,
+                  deferred: _Deferred) -> dict | None:
+        """Answer ``deferred`` on a thread of its own; a refusal if it cannot be.
+
+        ING-02. The thread owns the connection and the request's descriptors
+        from here on, and _finish closes both. When MAX_INGEST_IN_FLIGHT
+        requests are already being read, or no thread will start, the refusal
+        is returned for the accept loop to send at once.
+        """
+        slots = self._ingest_slots
+        if not slots.acquire(blocking=False):
+            return protocol.reply_error(
+                f"kilix-voiced is already reading {MAX_INGEST_IN_FLIGHT} "
+                "ingest-audio requests, so this one was not read. Send it again "
+                "once one of those has been answered.", protocol.ERR_BUSY)
+
+        def answer() -> None:
             try:
-                conn.settimeout(REQUEST_TIMEOUT_S)
-                reply = self._answer(inbound)
+                try:
+                    reply = deferred()
+                except Exception as error:
+                    self._warn(f"unhandled failure in {protocol.OP_INGEST_AUDIO} "
+                               f"({type(error).__name__})")
+                    reply = protocol.reply_error(
+                        f"kilix-voiced could not handle {protocol.OP_INGEST_AUDIO}. "
+                        "This is a bug; the daemon is still running.")
+                self._finish(conn, inbound, reply)
+            finally:
+                with self._lock:
+                    self._ingest_in_flight -= 1
+                slots.release()
+
+        with self._lock:
+            self._ingest_in_flight += 1
+        try:
+            threading.Thread(target=answer, name="kilix-voice-ingest",
+                             daemon=True).start()
+        except RuntimeError as error:
+            with self._lock:
+                self._ingest_in_flight -= 1
+            slots.release()
+            return protocol.reply_error(
+                f"cannot start a thread to read the audio: {error}. This machine "
+                "is out of threads or memory; try again later.",
+                protocol.ERR_UNAVAILABLE)
+        return None
+
+    def _finish(self, conn: socket.socket, inbound: _ReceivingConnection,
+                reply: dict | None) -> None:
+        """Send ``reply`` on ``conn``, then close it and every descriptor it held."""
+        with conn:
+            try:
                 if reply is None:
                     return
                 # Bounded before it is sent. Four same-user requests below
@@ -1018,9 +1116,7 @@ class Daemon:
                     return
                 self._linger_for_peer(conn)
             except Exception as error:
-                # BaseException still propagates: a signal or SystemExit
-                # keeps its meaning. Only the type is logged, never the
-                # message, which can carry what the request said.
+                # Only the type is logged, as in _accept_one.
                 self._warn(f"a connection failed unexpectedly "
                            f"({type(error).__name__}); still serving")
             finally:
@@ -1148,8 +1244,17 @@ class Daemon:
             protocol.OP_INGEST_AUDIO: lambda request: self._op_ingest_audio(
                 request, fds, truncated),
         }
+        handler = handlers[request["op"]]
+        if request["op"] == protocol.OP_INGEST_AUDIO and self._ingest_slots is not None:
+            # ING-02: read off the accept loop; see _Deferred.
+            return _Deferred(lambda: self._run_handler(request, handler))
+        return self._run_handler(request, handler)
+
+    def _run_handler(self, request: dict,
+                     handler: Callable[[dict], dict]) -> dict:
+        """Return ``handler``'s reply to ``request``, a failure coded as a refusal."""
         try:
-            return handlers[request["op"]](request)
+            return handler(request)
         except (DaemonError, ArbiterError, audio.AudioError, tts_lib.TtsError,
                 stt_lib.SttError, settings.SettingsError,
                 paths.PathError) as error:
@@ -1173,8 +1278,9 @@ class Daemon:
         """A01/A08: normalise audio a caller handed over by descriptor.
 
         The reply carries a canonical s16le mono WAV as a sealed, read-only
-        descriptor (audio_fd 0), with metadata that matches its bytes. It runs
-        synchronously on the control connection. No worker, microphone,
+        descriptor (audio_fd 0), with metadata that matches its bytes. It is
+        answered on the control connection, from a thread of its own on a
+        daemon that serves (ING-02; see _Deferred). No turn, microphone,
         arbiter claim, consent gate or model is involved, since nothing is
         captured or recognised, and the read is bounded in bytes and time.
         A refusal is not a job; its reply is its only outcome.
