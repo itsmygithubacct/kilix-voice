@@ -202,6 +202,27 @@ class UninstallRemovesOnlyItsOwnFilesTests(unittest.TestCase):
         self.addCleanup(self._temp.cleanup)
         self.prefix = pathlib.Path(self._temp.name) / "prefix"
 
+    def test_a_modified_voicelib_module_is_refused_and_nothing_removed(self):
+        self.assertEqual(make(ROOT, "install", f"PREFIX={self.prefix}").returncode, 0)
+        module = self.prefix / "lib" / "kilix-voice" / "voicelib" / "util.py"
+        with open(module, "a", encoding="utf-8") as handle:
+            handle.write(EDIT)
+        before = snapshot(self.prefix)
+        result = make(ROOT, "uninstall", f"PREFIX={self.prefix}")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(snapshot(self.prefix), before)
+        self.assertIn(f"modified or foreign file: {module}", result.stderr)
+
+    def test_a_version_from_another_release_is_refused_and_nothing_removed(self):
+        self.assertEqual(make(ROOT, "install", f"PREFIX={self.prefix}").returncode, 0)
+        version = self.prefix / "lib" / "kilix-voice" / "VERSION"
+        version.write_text("0.0.0\n", encoding="utf-8")
+        before = snapshot(self.prefix)
+        result = make(ROOT, "uninstall", f"PREFIX={self.prefix}")
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(snapshot(self.prefix), before)
+        self.assertIn(f"modified or foreign file: {version}", result.stderr)
+
     def test_bytecode_is_removed_only_for_installed_modules(self):
         self.assertEqual(make(ROOT, "install", f"PREFIX={self.prefix}").returncode, 0)
         cache = self.prefix / "lib" / "kilix-voice" / "voicelib" / "__pycache__"
@@ -223,6 +244,19 @@ class UninstallRemovesOnlyItsOwnFilesTests(unittest.TestCase):
             ["bin", "lib", "lib/kilix-voice", "lib/kilix-voice/voicelib",
              "lib/kilix-voice/voicelib/__pycache__",
              "lib/kilix-voice/voicelib/__pycache__/operator-notes.txt"])
+
+    def test_a_linked_bytecode_directory_is_left_alone(self):
+        self.assertEqual(make(ROOT, "install", f"PREFIX={self.prefix}").returncode, 0)
+        elsewhere = pathlib.Path(self._temp.name) / "shared-cache"
+        elsewhere.mkdir()
+        cached = elsewhere / f"util.{sys.implementation.cache_tag}.pyc"
+        cached.write_bytes(b"another program's bytecode")
+        cache = self.prefix / "lib" / "kilix-voice" / "voicelib" / "__pycache__"
+        cache.symlink_to(elsewhere)
+        result = make(ROOT, "uninstall", f"PREFIX={self.prefix}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(cached.read_bytes(), b"another program's bytecode")
+        self.assertTrue(cache.is_symlink())
 
 
 class UninstallAtTheDefaultPrefixTests(unittest.TestCase):
@@ -253,6 +287,7 @@ class UninstallAtTheDefaultPrefixTests(unittest.TestCase):
         self.bin.mkdir(parents=True)
         store = self.home / ".local" / "gpu_terminal" / "kilix" / "data" / "voice"
         generation = store / "runtime" / "generations" / "kilix-voice-gen1"
+        self.generation = generation
         subprocess.run(["make", "-s", "install", f"PREFIX={generation}"],
                        cwd=ROOT, env=self.env, check=True, capture_output=True)
         (store / "runtime" / "current").symlink_to("generations/kilix-voice-gen1")
@@ -274,6 +309,17 @@ class UninstallAtTheDefaultPrefixTests(unittest.TestCase):
         self.assertEqual(snapshot(self.home), before)
         for tool in ("kilix-tts", "kilix-stt", "kilix-voiced"):
             self.assertIn(f"leaving {self.bin / tool}: a symlink", result.stderr)
+
+    def test_entrypoints_of_another_release_neither_block_nor_go(self):
+        # kilix may manage another release than this checkout. Its commands
+        # then differ from ours, and are still not ours to judge or remove.
+        with open(self.generation / "bin" / "kilix-stt", "a",
+                  encoding="utf-8") as handle:
+            handle.write("# another release\n")
+        before = snapshot(self.home)
+        result = make(ROOT, "uninstall", env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(snapshot(self.home), before)
 
     def test_a_make_install_beside_them_is_removed_and_they_stay(self):
         # An earlier make install left its package under ~/.local/lib; kilix

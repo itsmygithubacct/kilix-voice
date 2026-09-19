@@ -8,8 +8,10 @@ DaemonError.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -209,11 +211,37 @@ class IdleTimeoutTests(unittest.TestCase):
         self.assertIn("daemon.idle_seconds", proc.stderr)
         self.assertEqual(len(proc.stderr.strip().splitlines()), 1, proc.stderr)
 
+    def test_the_idle_seconds_option_is_validated_like_the_config(self) -> None:
+        # The option reaches _idle_timeout through main() as a float that
+        # argparse already accepted, so "nan" and "-5" parse; startup must
+        # still refuse them. The "=" form keeps "-inf" from reading as a
+        # flag. run() is replaced so an accepted value returns at once
+        # instead of serving until idle.
+        for value, refused in (("nan", True), ("inf", True), ("-5", True),
+                               ("-inf", True), ("0", False), ("2.5", False)):
+            stderr = io.StringIO()
+            with self.subTest(value=value), \
+                    mock.patch.object(tool.Daemon, "run",
+                                      return_value=0) as run, \
+                    contextlib.redirect_stderr(stderr):
+                status = tool.main([f"--idle-seconds={value}"])
+                if refused:
+                    self.assertEqual(status, 1, stderr.getvalue())
+                    run.assert_not_called()
+                    self.assertIn("daemon.idle_seconds", stderr.getvalue())
+                    self.assertEqual(
+                        len(stderr.getvalue().strip().splitlines()), 1,
+                        stderr.getvalue())
+                else:
+                    self.assertEqual(status, 0, stderr.getvalue())
+                    run.assert_called_once_with()
+
 
 _HUGE_IDLE = '{"daemon": {"idle_seconds": 1%s}}' % ("0" * 400)
 
 
-def _run_tool(tmp: str, name: str, *args: str) -> subprocess.CompletedProcess:
+def _run_tool(tmp: str, name: str, *args: str,
+              extra_env: dict | None = None) -> subprocess.CompletedProcess:
     """Run one command of this checkout with a store and settings under tmp."""
     env = {"PATH": "/usr/bin:/bin", "HOME": tmp, "LANG": "C.UTF-8",
            "PYTHONDONTWRITEBYTECODE": "1",
@@ -221,11 +249,101 @@ def _run_tool(tmp: str, name: str, *args: str) -> subprocess.CompletedProcess:
            "KILIX_DATA_HOME": os.path.join(tmp, "data"),
            "KILIX_STORAGE_HOME": os.path.join(tmp, "storage"),
            "KILIX_SESSION_HOME": os.path.join(tmp, "session"),
-           "XDG_RUNTIME_DIR": os.path.join(tmp, "runtime")}
+           "XDG_RUNTIME_DIR": os.path.join(tmp, "runtime"),
+           **(extra_env or {})}
     return subprocess.run(
         [sys.executable, "-B", str(ROOT / name), *args],
         env=env, capture_output=True, text=True, timeout=60,
         stdin=subprocess.DEVNULL)
+
+
+class DocumentedBoundsTests(unittest.TestCase):
+    """The bounds as literals, not read back from the module under test.
+
+    The tests above size their fixtures from MAX_CONFIG_BYTES and
+    MAX_CONFIG_DEPTH, so they would still pass with either bound loosened:
+    a 2 MiB size bound, or a depth bound of 128 that accepts the 100-deep
+    config this change exists to refuse.
+    """
+
+    MEBIBYTE = 1024 * 1024
+
+    def load(self, data: bytes) -> dict:
+        with tempfile.TemporaryDirectory() as root:
+            path = pathlib.Path(root) / "voiced.json"
+            path.write_bytes(data)
+            return daemon_config.load_overrides(str(path))
+
+    def test_one_mebibyte_is_accepted_and_one_byte_more_is_refused(self) -> None:
+        self.assertIn("pad", self.load(_document_of_size(self.MEBIBYTE)))
+        for size in (self.MEBIBYTE + 1, self.MEBIBYTE * 3 // 2):
+            with self.subTest(size=size), \
+                    self.assertRaisesRegex(daemon_config.ConfigError,
+                                           "larger than 1048576 bytes"):
+                self.load(_document_of_size(size))
+
+    def test_thirty_two_levels_are_accepted_and_thirty_three_refused(self) -> None:
+        self.assertIn("daemon", self.load(_nested(32).encode()))
+        with self.assertRaisesRegex(daemon_config.ConfigError,
+                                    "nested more than 32 levels"):
+            self.load(_nested(33).encode())
+
+    def test_a_hundred_deep_config_is_refused(self) -> None:
+        dicts = '{"a":' * 99 + "{}" + "}" * 99
+        for name, text in (("lists", _nested(100)), ("dicts", dicts)):
+            with self.subTest(shape=name), \
+                    self.assertRaisesRegex(daemon_config.ConfigError,
+                                           "nested more than 32 levels"):
+                self.load(text.encode())
+
+
+class MalformedConfigTests(unittest.TestCase):
+    """Plain invalid JSON is a config error: one line, never a traceback."""
+
+    MALFORMED = (
+        ("truncated", b'{"daemon": '),
+        ("empty", b""),
+        ("blank", b"  \n"),
+        ("trailing text", b'{"daemon": {}} extra'),
+        ("single quotes", b"{'daemon': {}}"),
+        ("trailing comma", b'{"daemon": {"idle_seconds": 5,}}'),
+    )
+
+    def test_malformed_json_is_a_config_error(self) -> None:
+        for name, data in self.MALFORMED:
+            with self.subTest(case=name), \
+                    tempfile.TemporaryDirectory() as root:
+                path = pathlib.Path(root) / "voiced.json"
+                path.write_bytes(data)
+                with self.assertRaisesRegex(daemon_config.ConfigError,
+                                            "not valid JSON"):
+                    daemon_config.load_overrides(str(path))
+
+    def test_the_daemon_reports_malformed_json_as_a_daemon_error(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            path = pathlib.Path(root) / "voiced.json"
+            path.write_bytes(b'{"daemon": ')
+            with self.assertRaisesRegex(tool.DaemonError, "not valid JSON"):
+                tool.Daemon(config_path=str(path))
+
+    def test_both_commands_report_malformed_json_in_one_line(self) -> None:
+        # kilix-voiced takes --config; kilix-stt --grant-consent reads the
+        # same file from KILIX_VOICE_CONFIG.
+        for name in ("kilix-voiced", "kilix-stt"):
+            with self.subTest(command=name), \
+                    tempfile.TemporaryDirectory() as tmp:
+                config = str(pathlib.Path(tmp) / "voiced.json")
+                pathlib.Path(config).write_bytes(b'{"daemon": ')
+                if name == "kilix-voiced":
+                    proc = _run_tool(tmp, name, "--config", config)
+                else:
+                    proc = _run_tool(tmp, name, "--grant-consent",
+                                     extra_env={"KILIX_VOICE_CONFIG": config})
+                self.assertEqual(proc.returncode, 1, proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertIn("not valid JSON", proc.stderr)
+                self.assertEqual(len(proc.stderr.strip().splitlines()), 1,
+                                 proc.stderr)
 
 
 if __name__ == "__main__":
