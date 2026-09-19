@@ -24,6 +24,12 @@ ENV_CONFIG = "KILIX_VOICE_CONFIG"
 # process -- or an audio device -- reserved.
 IDLE_SECONDS = 300.0
 
+# Overrides are a small operator-authored document. Bound the read before JSON
+# parsing so a mistaken or hostile path cannot make startup, or kilix-stt
+# --grant-consent, consume the size of an arbitrary file.
+MAX_CONFIG_BYTES = 1 << 20
+MAX_CONFIG_DEPTH = 32
+
 
 class ConfigError(RuntimeError):
     """The layered config file cannot be used; the message says what to do."""
@@ -32,16 +38,21 @@ class ConfigError(RuntimeError):
 def load_overrides(path: str) -> dict:
     """Return the JSON config layered over the shared settings."""
     try:
-        with open(path, encoding="utf-8") as handle:
-            raw = handle.read()
+        with open(path, "rb") as handle:
+            raw = handle.read(MAX_CONFIG_BYTES + 1)
     except OSError as error:
         raise ConfigError(
             f"cannot read the daemon config {path}: {error}. Point --config "
             f"(or {ENV_CONFIG}) at a readable JSON file, or drop it to use the "
             "shared Kilix settings alone.") from error
+    if len(raw) > MAX_CONFIG_BYTES:
+        raise ConfigError(
+            f"the daemon config {path} is larger than {MAX_CONFIG_BYTES} "
+            "bytes. Keep overrides small or point --config at the intended "
+            "JSON file.")
     try:
-        data = json.loads(raw)
-    except ValueError as error:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError, RecursionError) as error:
         raise ConfigError(
             f"{path} is not valid JSON: {error}. It must hold a single "
             'object, for example {"audio": {"play_cmd": ["cat"]}}.') from error
@@ -49,6 +60,19 @@ def load_overrides(path: str) -> dict:
         raise ConfigError(
             f"{path} must contain a JSON object, got {type(data).__name__}. "
             'Wrap the settings, for example {"daemon": {"idle_seconds": 30}}.')
+    pending = [(data, 1)]
+    while pending:
+        value, depth = pending.pop()
+        if depth > MAX_CONFIG_DEPTH:
+            raise ConfigError(
+                f"the daemon config {path} is nested more than "
+                f"{MAX_CONFIG_DEPTH} levels. Flatten the override document.")
+        if isinstance(value, dict):
+            pending.extend((child, depth + 1) for child in value.values()
+                           if isinstance(child, (dict, list)))
+        elif isinstance(value, list):
+            pending.extend((child, depth + 1) for child in value
+                           if isinstance(child, (dict, list)))
     return data
 
 

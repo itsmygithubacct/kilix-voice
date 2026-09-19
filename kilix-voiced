@@ -54,6 +54,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import select
@@ -714,6 +715,20 @@ class _DictationTurn(_JobTurn):
         return self.stop.expired()
 
 
+def _idle_timeout(raw: object) -> float:
+    """Return a finite non-negative idle timeout, or a stable config error."""
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError) as error:
+        raise DaemonError(
+            f"daemon.idle_seconds must be a number, got {raw!r}.") from error
+    if not math.isfinite(seconds) or seconds < 0:
+        raise DaemonError(
+            "daemon.idle_seconds must be finite and at least zero, got "
+            f"{raw!r}. Use 0 to keep the daemon running.")
+    return seconds
+
+
 def _connect_dictation(path: str) -> socket.socket:
     """Connect to the dictation socket the kitty fork created for a pane."""
     try:
@@ -780,9 +795,9 @@ class Daemon:
         self._cfg: dict = {}
         self._refresh_config()
         if idle_seconds is None:
-            idle_seconds = float(
-                util.cfg_get(self._cfg, "daemon.idle_seconds", IDLE_SECONDS))
-        self._idle_seconds = idle_seconds
+            idle_seconds = util.cfg_get(
+                self._cfg, "daemon.idle_seconds", IDLE_SECONDS)
+        self._idle_seconds = _idle_timeout(idle_seconds)
         self._session_dir = paths.session_dir()
         self._socket_path = paths.control_socket()
         # Lock ordering: this lock is always taken before the arbiter's and
