@@ -33,14 +33,34 @@ install:
 	install -m 0644 VERSION $(PREFIX)/lib/kilix-voice/VERSION
 	install -m 0644 voicelib/*.py $(PREFIX)/lib/kilix-voice/voicelib/
 
+# Nothing is removed unless every present target has this checkout's bytes.
+# It refuses when an install directory is this checkout or lies inside it, or
+# a target is the source file itself, so it cannot delete the files it
+# compares against.
 uninstall:
 	@set -eu; \
+	here=$$(pwd -P); \
+	lib="$(PREFIX)/lib/kilix-voice"; \
+	for dir in "$(PREFIX)/bin" "$$lib" "$$lib/voicelib" \
+			"$$lib/voicelib/__pycache__"; do \
+		[ -d "$$dir" ] || continue; \
+		resolved=$$(CDPATH= cd -P -- "$$dir" && pwd -P); \
+		case "$$resolved/" in \
+			"$$here"/*) \
+				echo "refusing to uninstall: $$dir is this checkout or lies inside it ($$resolved)" >&2; \
+				exit 1 ;; \
+		esac; \
+	done; \
 	for source in kilix-tts kilix-stt kilix-voiced VERSION voicelib/*.py; do \
 		case "$$source" in \
 			kilix-*) target="$(PREFIX)/bin/$$source" ;; \
 			VERSION) target="$(PREFIX)/lib/kilix-voice/VERSION" ;; \
 			*) target="$(PREFIX)/lib/kilix-voice/$$source" ;; \
 		esac; \
+		if [ -e "$$target" ] && [ "$$source" -ef "$$target" ]; then \
+			echo "refusing to uninstall: $$target is this checkout's own $$source" >&2; \
+			exit 1; \
+		fi; \
 		if [ -e "$$target" ] && ! cmp -s "$$source" "$$target"; then \
 			echo "refusing to remove modified or foreign file: $$target" >&2; \
 			exit 1; \
