@@ -5,6 +5,7 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -187,6 +188,113 @@ class UninstallKeepsTheCheckoutTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("is this checkout's own voicelib/util.py", result.stderr)
         self.assertEqual((snapshot(self.prefix), snapshot(checkout)), before)
+
+
+class UninstallRemovesOnlyItsOwnFilesTests(unittest.TestCase):
+    """make uninstall removes what install copied, and its bytecode.
+
+    Beside the install, an operator's own files survive, including one left
+    in voicelib/__pycache__, which uninstall used to remove whole.
+    """
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory(prefix="kilix-voice-uninstall-")
+        self.addCleanup(self._temp.cleanup)
+        self.prefix = pathlib.Path(self._temp.name) / "prefix"
+
+    def test_bytecode_is_removed_only_for_installed_modules(self):
+        self.assertEqual(make(ROOT, "install", f"PREFIX={self.prefix}").returncode, 0)
+        cache = self.prefix / "lib" / "kilix-voice" / "voicelib" / "__pycache__"
+        cache.mkdir()
+        tag = sys.implementation.cache_tag
+        ours = [cache / f"util.{tag}.pyc", cache / f"__init__.{tag}.opt-1.pyc"]
+        for path in ours:
+            path.write_bytes(b"bytecode")
+        planted = cache / "operator-notes.txt"
+        planted.write_text("keep me\n", encoding="utf-8")
+        result = make(ROOT, "uninstall", f"PREFIX={self.prefix}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path in ours:
+            self.assertFalse(path.exists(), path)
+        self.assertEqual(planted.read_text(encoding="utf-8"), "keep me\n")
+        self.assertEqual(
+            sorted(str(p.relative_to(self.prefix))
+                   for p in self.prefix.rglob("*")),
+            ["bin", "lib", "lib/kilix-voice", "lib/kilix-voice/voicelib",
+             "lib/kilix-voice/voicelib/__pycache__",
+             "lib/kilix-voice/voicelib/__pycache__/operator-notes.txt"])
+
+
+class UninstallAtTheDefaultPrefixTests(unittest.TestCase):
+    """At PREFIX=$HOME/.local, kilix's managed entrypoints are not ours.
+
+    kilix's install-kilix-voice.sh runs make install into a generation in
+    its store and points ~/.local/bin/kilix-{tts,stt,voiced} at it with
+    symlinks. Those bytes match a checkout of the same release, so a
+    comparison alone removed them. install never creates a symlink.
+    """
+
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory(prefix="kilix-voice-home-")
+        self.addCleanup(self._temp.cleanup)
+        self.home = pathlib.Path(self._temp.name) / "home"
+        self.home.mkdir()
+        self.env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "HOME": str(self.home), "LANG": "C.UTF-8"}
+        # Before anything is removed: the default prefix is this scratch
+        # HOME's, never the invoking user's.
+        shown = subprocess.run(
+            ["make", "-s", "--no-print-directory",
+             "--eval", "show-prefix: ; @echo $(PREFIX)", "show-prefix"],
+            cwd=ROOT, env=self.env, check=True, capture_output=True,
+            text=True).stdout.strip()
+        self.assertEqual(shown, f"{self.home}/.local")
+        self.bin = self.home / ".local" / "bin"
+        self.bin.mkdir(parents=True)
+        store = self.home / ".local" / "gpu_terminal" / "kilix" / "data" / "voice"
+        generation = store / "runtime" / "generations" / "kilix-voice-gen1"
+        subprocess.run(["make", "-s", "install", f"PREFIX={generation}"],
+                       cwd=ROOT, env=self.env, check=True, capture_output=True)
+        (store / "runtime" / "current").symlink_to("generations/kilix-voice-gen1")
+        model = store / "models" / "vosk-model-small-en-us-0.15-test"
+        (model / "conf").mkdir(parents=True)
+        (model / "conf" / "model.conf").write_text("model\n", encoding="utf-8")
+        (store / "consent.json").write_text("{}\n", encoding="utf-8")
+        (store / "consent.lock").write_bytes(b"")
+        for tool in ("kilix-tts", "kilix-stt", "kilix-voiced"):
+            (self.bin / tool).symlink_to(store / "runtime" / "current" / "bin" / tool)
+        # Other components' commands beside them.
+        (self.bin / "kilix").symlink_to(self.home / "elsewhere" / "kilix")
+        (self.bin / "other-tool").write_text("#!/bin/sh\n", encoding="utf-8")
+
+    def test_managed_entrypoints_and_the_store_are_left_alone(self):
+        before = snapshot(self.home)
+        result = make(ROOT, "uninstall", env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(snapshot(self.home), before)
+        for tool in ("kilix-tts", "kilix-stt", "kilix-voiced"):
+            self.assertIn(f"leaving {self.bin / tool}: a symlink", result.stderr)
+
+    def test_a_make_install_beside_them_is_removed_and_they_stay(self):
+        # An earlier make install left its package under ~/.local/lib; kilix
+        # has since replaced the commands with its symlinks.
+        lib = self.home / ".local" / "lib" / "kilix-voice"
+        self.assertEqual(
+            make(ROOT, "install", f"PREFIX={self.home / 'staging'}",
+                 env=self.env).returncode, 0)
+        shutil.move(self.home / "staging" / "lib" / "kilix-voice", lib)
+        shutil.rmtree(self.home / "staging")
+        before = snapshot(self.home)
+        result = make(ROOT, "uninstall", env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = snapshot(self.home)
+        removed = sorted(set(before) - set(after))
+        self.assertTrue(removed)
+        self.assertTrue(all(name.startswith(".local/lib/kilix-voice")
+                            for name in removed), removed)
+        self.assertFalse(lib.exists())
+        self.assertEqual(after, {name: value for name, value in before.items()
+                                 if name not in removed})
 
 
 if __name__ == "__main__":

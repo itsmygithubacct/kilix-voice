@@ -33,14 +33,24 @@ install:
 	install -m 0644 VERSION $(PREFIX)/lib/kilix-voice/VERSION
 	install -m 0644 voicelib/*.py $(PREFIX)/lib/kilix-voice/voicelib/
 
-# Nothing is removed unless every present target has this checkout's bytes.
-# It refuses when an install directory is this checkout or lies inside it, or
-# a target is the source file itself, so it cannot delete the files it
-# compares against.
+# Remove exactly what install copied: the three commands, VERSION and the
+# voicelib modules this checkout has, plus those modules' bytecode. Nothing is
+# removed unless every present target is a regular file with this checkout's
+# bytes. It refuses when an install directory is this checkout or lies inside
+# it, or a target is the source file itself, so it cannot delete the files it
+# compares against. install never creates symlinks, so a symlink at a target
+# (kilix's managed ~/.local/bin entrypoints are symlinks into its store) is
+# not ours and is left in place.
 uninstall:
 	@set -eu; \
 	here=$$(pwd -P); \
 	lib="$(PREFIX)/lib/kilix-voice"; \
+	target_for() { \
+		case "$$1" in \
+			kilix-*) target="$(PREFIX)/bin/$$1" ;; \
+			*) target="$$lib/$$1" ;; \
+		esac; \
+	}; \
 	for dir in "$(PREFIX)/bin" "$$lib" "$$lib/voicelib" \
 			"$$lib/voicelib/__pycache__"; do \
 		[ -d "$$dir" ] || continue; \
@@ -52,29 +62,33 @@ uninstall:
 		esac; \
 	done; \
 	for source in kilix-tts kilix-stt kilix-voiced VERSION voicelib/*.py; do \
-		case "$$source" in \
-			kilix-*) target="$(PREFIX)/bin/$$source" ;; \
-			VERSION) target="$(PREFIX)/lib/kilix-voice/VERSION" ;; \
-			*) target="$(PREFIX)/lib/kilix-voice/$$source" ;; \
-		esac; \
-		if [ -e "$$target" ] && [ "$$source" -ef "$$target" ]; then \
+		target_for "$$source"; \
+		if [ -L "$$target" ]; then \
+			echo "leaving $$target: a symlink, which make install never creates" >&2; \
+		elif [ -e "$$target" ] && [ "$$source" -ef "$$target" ]; then \
 			echo "refusing to uninstall: $$target is this checkout's own $$source" >&2; \
 			exit 1; \
-		fi; \
-		if [ -e "$$target" ] && ! cmp -s "$$source" "$$target"; then \
+		elif [ -e "$$target" ] && { [ ! -f "$$target" ] || \
+				! cmp -s "$$source" "$$target"; }; then \
 			echo "refusing to remove modified or foreign file: $$target" >&2; \
 			exit 1; \
 		fi; \
 	done; \
-	rm -f "$(PREFIX)/bin/kilix-tts" "$(PREFIX)/bin/kilix-stt" \
-		"$(PREFIX)/bin/kilix-voiced" \
-		"$(PREFIX)/lib/kilix-voice/VERSION"; \
-	for source in voicelib/*.py; do \
-		rm -f "$(PREFIX)/lib/kilix-voice/$$source"; \
+	for source in kilix-tts kilix-stt kilix-voiced VERSION voicelib/*.py; do \
+		target_for "$$source"; \
+		if [ -f "$$target" ] && [ ! -L "$$target" ]; then \
+			rm -f "$$target"; \
+		fi; \
 	done; \
-	rm -rf "$(PREFIX)/lib/kilix-voice/voicelib/__pycache__"; \
-	rmdir "$(PREFIX)/lib/kilix-voice/voicelib" \
-		"$(PREFIX)/lib/kilix-voice" 2>/dev/null || true
+	if [ ! -L "$$lib/voicelib/__pycache__" ]; then \
+		for source in voicelib/*.py; do \
+			stem=$${source#voicelib/}; \
+			stem=$${stem%.py}; \
+			rm -f "$$lib/voicelib/__pycache__/$$stem".*.pyc; \
+		done; \
+	fi; \
+	rmdir "$$lib/voicelib/__pycache__" "$$lib/voicelib" "$$lib" \
+		2>/dev/null || true
 
 clean:
 	find . -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
