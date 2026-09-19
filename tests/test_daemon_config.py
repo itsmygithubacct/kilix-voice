@@ -183,6 +183,50 @@ class IdleTimeoutTests(unittest.TestCase):
                                             "daemon.idle_seconds"):
                     tool.Daemon(config_path=str(path))
 
+    def test_an_integer_too_large_for_a_float_is_a_daemon_error(self) -> None:
+        # float() raises OverflowError, not ValueError, for such an integer,
+        # and json.loads hands one over for 400 digits.
+        for raw in (10 ** 400, -(10 ** 400)):
+            with self.subTest(sign=raw > 0), \
+                    self.assertRaisesRegex(tool.DaemonError, "finite"):
+                tool._idle_timeout(raw)
+
+    def test_a_huge_integer_idle_timeout_in_the_config_stops_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            path = pathlib.Path(root) / "voiced.json"
+            path.write_text(_HUGE_IDLE, encoding="utf-8")
+            with self.assertRaisesRegex(tool.DaemonError,
+                                        "daemon.idle_seconds"):
+                tool.Daemon(config_path=str(path))
+
+    def test_kilix_voiced_reports_a_huge_integer_idle_timeout_in_one_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = pathlib.Path(tmp) / "voiced.json"
+            config.write_text(_HUGE_IDLE, encoding="utf-8")
+            proc = _run_tool(tmp, "kilix-voiced", "--config", str(config))
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        self.assertIn("daemon.idle_seconds", proc.stderr)
+        self.assertEqual(len(proc.stderr.strip().splitlines()), 1, proc.stderr)
+
+
+_HUGE_IDLE = '{"daemon": {"idle_seconds": 1%s}}' % ("0" * 400)
+
+
+def _run_tool(tmp: str, name: str, *args: str) -> subprocess.CompletedProcess:
+    """Run one command of this checkout with a store and settings under tmp."""
+    env = {"PATH": "/usr/bin:/bin", "HOME": tmp, "LANG": "C.UTF-8",
+           "PYTHONDONTWRITEBYTECODE": "1",
+           "GPU_TERMINAL_SETTINGS_FILE": os.path.join(tmp, "settings.conf"),
+           "KILIX_DATA_HOME": os.path.join(tmp, "data"),
+           "KILIX_STORAGE_HOME": os.path.join(tmp, "storage"),
+           "KILIX_SESSION_HOME": os.path.join(tmp, "session"),
+           "XDG_RUNTIME_DIR": os.path.join(tmp, "runtime")}
+    return subprocess.run(
+        [sys.executable, "-B", str(ROOT / name), *args],
+        env=env, capture_output=True, text=True, timeout=60,
+        stdin=subprocess.DEVNULL)
+
 
 if __name__ == "__main__":
     unittest.main()

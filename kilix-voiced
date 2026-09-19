@@ -719,6 +719,11 @@ def _idle_timeout(raw: object) -> float:
     """Return a finite non-negative idle timeout, or a stable config error."""
     try:
         seconds = float(raw)
+    except OverflowError:
+        # A JSON integer too large for a float: past any finite timeout, so
+        # it is refused below like Infinity rather than escaping as a
+        # traceback.
+        seconds = math.inf
     except (TypeError, ValueError) as error:
         raise DaemonError(
             f"daemon.idle_seconds must be a number, got {raw!r}.") from error
