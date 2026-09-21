@@ -283,7 +283,13 @@ class TtsToolTests(unittest.TestCase):
         completed = self.tool.subprocess.CompletedProcess(
             ["provider"], 0, "Installed Kristin\n", "")
         output = io.StringIO()
+        # This test is about which provider the install is delegated to. The
+        # licence receipt that has to cover the weights first (V-ACC) is stood
+        # in for here; tests/test_weight_licence.py is where the gate itself is
+        # proved, against the real authority and a spy installer.
         with mock.patch.object(
+                self.tool.licensing, "require_covering_receipt"), \
+                mock.patch.object(
                 self.tool.tts_lib, "piper_binary",
                 return_value="/fixed/kilix-piper-tts"), \
                 mock.patch.object(

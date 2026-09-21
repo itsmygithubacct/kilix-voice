@@ -48,8 +48,8 @@ for _package_root in (_INSTALLED_LIB, _HERE):
         sys.path.insert(0, _package_root)
 
 from voicelib import (  # noqa: E402  (the import follows the path bootstrap)
-    __version__, audio, models, paths, protocol, settings, tts as tts_lib,
-    tui_shell, util)
+    __version__, audio, licensing, models, paths, protocol, settings,
+    tts as tts_lib, tui_shell, util)
 
 # A reply is a status payload at most, and the daemon answers a read as soon as
 # it is queued rather than when it finishes speaking, so neither of these has to
@@ -1163,7 +1163,15 @@ def _print_models() -> None:
 
 
 def _install_model(catalog_id: str) -> str:
-    """Run the fixed provider's explicit, checksum-pinned install action."""
+    """Run the fixed provider's explicit, checksum-pinned install action.
+
+    The Piper voice is model weights, so a covering licence receipt is the
+    precondition (OS-V-VERIFY F2, OD-S, OD-BB). It is checked before the
+    provider is located, so a refusal starts no process and fetches nothing.
+    The eSpeak and MBROLA families are operating-system packages, not weights
+    this tree fetches; they are refused above for a different reason and never
+    reach the gate. Raises licensing.LicenseRefused when no receipt covers it.
+    """
     try:
         spec = models.TTS_MODEL_BY_ID[catalog_id]
     except KeyError as error:
@@ -1176,6 +1184,7 @@ def _install_model(catalog_id: str) -> str:
             f"{catalog_id} is supplied by the operating system, not a "
             "downloadable Kilix model. Install its distribution package."
         )
+    licensing.require_covering_receipt(catalog_id)
     binary = tts_lib.piper_binary()
     if binary is None:
         raise VoiceToolError(
@@ -1295,6 +1304,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.install:
         try:
             print(_install_model(args.install))
+        except licensing.LicenseRefused as error:
+            # Its own status: an unattended caller has to be able to tell "a
+            # human must accept a licence" from "the installer broke" (exit 1).
+            parser.exit(licensing.LICENCE_REFUSED_EXIT, f"kilix-tts: {error}\n")
         except VoiceToolError as error:
             parser.exit(1, f"kilix-tts: {error}\n")
         return 0

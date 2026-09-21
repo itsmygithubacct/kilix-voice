@@ -60,8 +60,9 @@ for _package_root in (_INSTALLED_LIB, _HERE):
 
 from voicelib import (
     consent as model_consent,  # noqa: E402  (the import follows the path bootstrap)
-    __version__, audio, daemon_config, events, models as model_catalog, paths,
-    protocol, settings, stt as stt_lib, tui_shell)
+    __version__, audio, daemon_config, events, licensing,
+    models as model_catalog, paths, protocol, settings, stt as stt_lib,
+    tui_shell)
 from voicelib.vad import Vad  # noqa: E402
 
 
@@ -451,7 +452,14 @@ def install_command(spec: ModelSpec) -> str:
 
 
 def install_model(spec: ModelSpec, screen=None) -> int:
-    """Run one explicit install, optionally lending it the curses terminal."""
+    """Run one explicit install, optionally lending it the curses terminal.
+
+    A covering licence receipt is the precondition (OS-V-VERIFY F2, OD-S,
+    OD-BB). It is checked before the launcher is even located, so a refusal
+    starts no process, fetches nothing, and writes nothing under the model
+    store. Raises licensing.LicenseRefused when no receipt covers the model.
+    """
+    licensing.require_covering_receipt(spec.catalog_id)
     argv = model_install_argv(spec)
     if screen is not None:
         curses.def_prog_mode()
@@ -1350,7 +1358,7 @@ class Ui:
         spec = MODELS[self._selected[SECTION_MODELS]]
         try:
             status = install_model(spec, self._screen)
-        except ModelInstallError as error:
+        except (licensing.LicenseRefused, ModelInstallError) as error:
             self._message = str(error)
             return
         self._rescan()
@@ -1563,6 +1571,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.models:
             _print_models_json() if args.json else _print_models()
+    except licensing.LicenseRefused as error:
+        # Its own status: an unattended caller has to be able to tell "a human
+        # must accept a licence" from "the installer broke", which is exit 1.
+        parser.exit(licensing.LICENCE_REFUSED_EXIT, f"kilix-stt: {error}\n")
     except (ModelInstallError, settings.SettingsError, paths.PathError,
             daemon_config.ConfigError, stt_lib.SttError, OSError) as error:
         parser.exit(1, f"kilix-stt: {error}\n")

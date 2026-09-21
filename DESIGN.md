@@ -88,6 +88,14 @@ Booleans are false for `"" 0 no false off disabled` (case-insensitive).
 6. **A speak request selects only registered synthesis.** A caller may name a
    catalogued model family, validated voice token, and preset rate. It can
    never supply an executable, model path, URL, or download action.
+7. **No weight fetch without a covering licence receipt** (OD-S, OD-BB;
+   OS-V-VERIFY F2). Every route that can cause model weights to be fetched
+   calls `licensing.require_covering_receipt()` first. With no covering
+   receipt it refuses before the installer is even located: no process is
+   started, nothing is written under the model store, and the exit status is
+   `licensing.LICENCE_REFUSED_EXIT` (3), distinct from an installer fault (1).
+   An absent authority refuses as well; it never falls through to a fetch.
+   The Vosk library is Apache-2.0 code, not weights, and is not gated.
 
 ## Files & ownership
 
@@ -101,6 +109,7 @@ Booleans are false for `"" 0 no false off disabled` (case-insensitive).
 | `voicelib/audio.py` | `build_capture_cmd`, `MicCapture`, `build_play_cmd`, `Player`, `AudioError` |
 | `voicelib/vad.py` | `Vad` |
 | `voicelib/models.py` | separate canonical STT artifact and request-selectable TTS model catalogs |
+| `voicelib/licensing.py` | the weights gate: `require_covering_receipt`, `LicenseRefused`, `LICENCE_REFUSED_EXIT` |
 | `voicelib/stt.py` | `SttError`, `NullStt`, `VoskStt` (ctypes), `make_stt` |
 | `voicelib/tts.py` | `TtsError`, engines, conditioning/chunking, `make_tts`, complete in-memory rendering |
 | `voicelib/arbiter.py` | half-duplex policy, single-owner session lock |
@@ -427,3 +436,18 @@ Half-duplex policy: opening the mic **cancels any in-flight speech first**
 with no `libvosk.so`, no model, no `espeak-ng`, no audio server and no network.
 Build a **stub `.so`** in a fixture (compile a few lines of C with `cc` at test
 time, skip the test if no compiler) to exercise the ctypes binding.
+
+Two sibling sources are on the suite's import path, neither of them copied
+here: `LEASE_SRC` (kilix-system-monitor's kilix-device-lease) and
+`LICENSE_SRC` (kilix-license). Tests that need them **fail naming the
+variable** rather than skipping, because an accelerator engine without a lease,
+and a weight fetch without a licence receipt, are exactly what they exist to
+rule out. `$(abspath)` resolves both against the checkout, so a linked
+worktree passes them explicitly.
+
+`tests/test_weight_licence.py` proves the weights gate against a **spy
+installer** — a stand-in `kilix` that records its argv and writes under the
+model store as a real fetch would. "Fetches nothing" is observed there, never
+read off the source, and two controls keep it honest: a covering receipt must
+make the spy run, and a planted copy of each command with the gate line removed
+must make every "fetches nothing" assertion fail.

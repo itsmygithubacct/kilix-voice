@@ -41,6 +41,40 @@ These are not preferences; they are enforced by the code and covered by tests.
   sequence introducers are stripped; the destination is a PTY.
 - Sockets are private to your user (mode 0600 inside a 0700 directory) and the
   daemon checks peer credentials on every connection.
+- **Model weights are fetched only after their licence is accepted.** Every
+  install action in this tree asks the `kilix-license` authority for a receipt
+  covering that model first. With no covering receipt it refuses, starts no
+  installer, writes nothing under the model store, exits **3**, and names the
+  command that shows the licence. A machine with no authority installed refuses
+  too, because a machine that cannot check a licence must not fetch weights.
+
+## Model licences
+
+`kilix-license` is the single licence authority. This tree copies none of its
+records and mints no receipts of its own: it asks, and refuses when the answer
+is no or when there is nobody to ask.
+
+```sh
+kilix stt --install small-en-us      # refuses without a covering receipt, exit 3
+kilix license accept small-en-us     # shows the licence and records the receipt
+```
+
+Receipts are read from `$GPU_TERMINAL_HOME/license-receipts`, or from
+`$KILIX_VOICE_LICENSE_RECEIPTS` when that is set.
+
+**The library is not weights.** `libvosk.so` is Apache-2.0 code. Loading it,
+probing for it, reporting on it and installing it need no receipt, and none of
+those paths touch the gate: `--print`, `--models`, `--models --json` and the
+whole read-aloud side keep working with no receipt and no authority. Only the
+three actions that cause weights to be fetched are gated — `kilix-stt
+--install` for the Vosk models and for the shared VibeVoice weights, and
+`kilix-tts --install` for the Piper voice.
+
+One coupling is outside this repository: at the pinned ref,
+`kilix/scripts/install-kilix-voice.sh` fetches the Vosk wheel and the model in
+one block, and its `--without-dictation` flag skips both. So refusing the
+weights on that leg also withholds the library. Keeping the library installable
+on its own needs a library-only leg in that installer; nothing here can do it.
 
 ## Requirements
 

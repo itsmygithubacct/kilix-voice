@@ -9,18 +9,25 @@ PREFIX ?= $(HOME)/.local
 # tests need that source on the import path; tests/test_accelerator.py fails,
 # naming this variable, when it is not.
 LEASE_SRC ?= ../../kilix-system-monitor/components/kilix-device-lease/src
+# V-ACC: the licence authority has one home too, kilix-license. kilix-voice
+# asks it whether a receipt covers a model before any weight fetch, and copies
+# none of its records, so its tests need that source on the import path;
+# tests/test_weight_licence.py fails, naming this variable, when it is not.
+LICENSE_SRC ?= ../../kilix-modules/kilix-license/src
+
+SUITE_PYTHONPATH = $(abspath $(LEASE_SRC)):$(abspath $(LICENSE_SRC))
 
 .PHONY: all test test-clean lint install uninstall clean
 
 all: test
 
 test:
-	PYTHONPATH="$(abspath $(LEASE_SRC))" $(PYTHON) -m unittest discover -s tests -t . -v
+	PYTHONPATH="$(SUITE_PYTHONPATH)" $(PYTHON) -m unittest discover -s tests -t . -v
 
 # Same suite, no inherited environment: no KILIX_* or GPU_TERMINAL_* variable,
 # a temporary HOME and XDG tree. Both targets must report no failures.
 test-clean:
-	./tests/cleanenv.sh /usr/bin/env PYTHONPATH="$(abspath $(LEASE_SRC))" \
+	./tests/cleanenv.sh /usr/bin/env PYTHONPATH="$(SUITE_PYTHONPATH)" \
 	  $(CLEAN_PYTHON) -m unittest discover -s tests -t .
 
 lint:
