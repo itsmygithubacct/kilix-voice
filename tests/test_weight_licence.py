@@ -235,9 +235,27 @@ class NoReceiptTests(_WeightsFixture):
             "a refused install still wrote the shared settings document")
 
     def test_the_refusal_names_the_command_that_obtains_consent(self) -> None:
+        """And it names kilix-content's asset id, not this catalog's id.
+
+        kilix-content files the Vosk weights under their upstream ids, so a
+        refusal that echoed this catalog's id would send the user to an asset
+        that does not exist.
+        """
         result = self.run_tool("kilix-stt", "--install", VOSK_MODEL)
-        self.assertIn(f"kilix license accept {VOSK_MODEL}", result.stderr)
+        self.assertIn("Run: kilix models install vosk-model-small-en-us-0.15",
+                      result.stderr)
         self.assertIn("shown and accepted", result.stderr)
+
+    def test_each_model_names_its_own_content_asset(self) -> None:
+        for tool, catalog_id, asset_id in (
+                ("kilix-stt", "small-en-us", "vosk-model-small-en-us-0.15"),
+                ("kilix-stt", "lgraph-en-us", "vosk-model-en-us-0.22-lgraph"),
+                ("kilix-stt", "vibevoice-asr-bitnet", "vibevoice-asr-bitnet"),
+                ("kilix-tts", PIPER_MODEL, PIPER_MODEL)):
+            with self.subTest(model=catalog_id):
+                result = self.run_tool(tool, "--install", catalog_id)
+                self.assertIn(f"Run: kilix models install {asset_id}",
+                              result.stderr)
 
     def test_every_catalog_model_refuses(self) -> None:
         for catalog_id in models.MODEL_IDS:
@@ -410,6 +428,55 @@ class LibraryIsNotWeightsTests(_WeightsFixture):
         self.assertIn(f"choose from {PIPER_MODEL}", result.stderr)
 
 
+class CheckLicenceProbeTests(_WeightsFixture):
+    """`kilix-stt --check-licence MODEL`: the answer, with no fetch either way.
+
+    A fetcher outside this tree cannot import voicelib, but it can run one
+    command and stop on its status. Kilix's own install-kilix-voice.sh, which
+    pleb reaches as `kilix voice install`, is that fetcher.
+    """
+
+    def test_no_receipt_answers_three_and_fetches_nothing(self) -> None:
+        before = self.store_snapshot()
+        result = self.run_tool("kilix-stt", "--check-licence", VOSK_MODEL)
+        self.assert_refusal(result, "kilix-stt", VOSK_MODEL)
+        self.assert_installer_never_ran(before)
+
+    def test_a_covering_receipt_answers_zero_and_still_fetches_nothing(self) -> None:
+        self.mint_receipt(VOSK_MODEL)
+        before = self.store_snapshot()
+        result = self.run_tool("kilix-stt", "--check-licence", VOSK_MODEL)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(VOSK_MODEL, result.stdout)
+        self.assertIn(licensing.RECEIPTS_LEAF, result.stdout)
+        # Answering is not installing: the probe is safe before every fetch.
+        self.assert_installer_never_ran(before)
+
+    def test_an_absent_authority_answers_three(self) -> None:
+        before = self.store_snapshot()
+        result = self.run_tool("kilix-stt", "--check-licence", VOSK_MODEL,
+                               authority=False)
+        self.assert_refusal(result, "kilix-stt", VOSK_MODEL)
+        self.assert_installer_never_ran(before)
+
+    def test_it_answers_for_every_catalog_model(self) -> None:
+        for catalog_id in models.MODEL_IDS:
+            with self.subTest(model=catalog_id):
+                result = self.run_tool("kilix-stt", "--check-licence",
+                                       catalog_id)
+                self.assertEqual(result.returncode,
+                                 licensing.LICENCE_REFUSED_EXIT, result.stderr)
+                self.mint_receipt(catalog_id)
+                result = self.run_tool("kilix-stt", "--check-licence",
+                                       catalog_id)
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_unknown_model_is_rejected_by_the_parser(self) -> None:
+        result = self.run_tool("kilix-stt", "--check-licence", "not-a-model")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("invalid choice", result.stderr)
+
+
 class PlantedRegressionTests(_WeightsFixture):
     """Restoring the unconditional fetch must fail the assertions above."""
 
@@ -476,10 +543,22 @@ class GateUnitTests(unittest.TestCase):
     def test_the_refusal_names_the_model_and_the_command(self) -> None:
         error = licensing.LicenseRefused(VOSK_MODEL, "no licence receipt")
         self.assertIn(VOSK_MODEL, str(error))
-        self.assertIn(f"kilix license accept {VOSK_MODEL}", str(error))
+        self.assertIn("kilix models install vosk-model-small-en-us-0.15",
+                      str(error))
         self.assertEqual(error.catalog_id, VOSK_MODEL)
         self.assertIsInstance(licensing.AuthorityUnavailable(VOSK_MODEL, "x"),
                               licensing.LicenseRefused)
+
+    def test_every_catalog_model_maps_to_a_content_asset(self) -> None:
+        """No model may fall back to echoing this catalog's id by accident."""
+        for catalog_id in models.MODEL_IDS + (PIPER_MODEL,):
+            with self.subTest(model=catalog_id):
+                self.assertIn(catalog_id, licensing.CONTENT_ASSET_ID)
+                self.assertTrue(licensing.content_asset_id(catalog_id))
+
+    def test_an_unmapped_id_falls_back_to_itself(self) -> None:
+        self.assertEqual(licensing.content_asset_id("something-new"),
+                         "something-new")
 
 
 def _restore(name: str, value: str | None) -> None:

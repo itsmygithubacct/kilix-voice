@@ -62,9 +62,37 @@ RECEIPTS_LEAF = "license-receipts"
 LICENCE_REFUSED_EXIT = 3
 
 
+# The one acceptance route in the stack is kilix-content's first-use flow
+# (`kilix_content.first_use.install_with_agreement`): it renders the licence
+# screen, captures the agreement, writes the receipt and only then fetches.
+# It is reached as `kilix models install <asset id>`.
+ACCEPT_COMMAND = "kilix models install"
+
+# kilix-content files an asset under its UPSTREAM id, which is not this
+# catalog's id for the two Vosk models. Naming this catalog's id would send the
+# user to an asset that does not exist, so the refusal names the content id.
+#
+# The two sides are bound together by the licence record, not by either id: at
+# kilix-content 7543aa30 each asset below names exactly the record digest this
+# authority resolves for the catalog id beside it, so a receipt written by that
+# flow is the receipt this gate finds. Verified digests are in V-ACC-IMPL.md.
+# If an upstream id moves, this table moves with it; the digests are the check.
+CONTENT_ASSET_ID = {
+    "small-en-us": "vosk-model-small-en-us-0.15",
+    "lgraph-en-us": "vosk-model-en-us-0.22-lgraph",
+    "piper-en-us-kristin-medium": "piper-en-us-kristin-medium",
+    "vibevoice-asr-bitnet": "vibevoice-asr-bitnet",
+}
+
+
+def content_asset_id(catalog_id: str) -> str:
+    """Return the id kilix-content files this model's weights under."""
+    return CONTENT_ASSET_ID.get(catalog_id, catalog_id)
+
+
 def accept_command(catalog_id: str) -> str:
     """Return the first-use command that shows the licence and records consent."""
-    return f"kilix license accept {catalog_id}"
+    return f"{ACCEPT_COMMAND} {content_asset_id(catalog_id)}"
 
 
 class LicenseRefused(RuntimeError):

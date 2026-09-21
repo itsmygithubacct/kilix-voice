@@ -451,6 +451,22 @@ def install_command(spec: ModelSpec) -> str:
     return f"kilix stt --install {spec.catalog_id}"
 
 
+def _check_licence(catalog_id: str) -> None:
+    """Answer whether a receipt covers one model's weights, and fetch nothing.
+
+    A fetcher that does not go through this tree -- Kilix's own
+    scripts/install-kilix-voice.sh, which pleb reaches as `kilix voice install`
+    -- cannot import this private package, but it can run one command and stop
+    on its status. That is what this is: exit 0 when a receipt covers the
+    model, exit 3 (LICENCE_REFUSED_EXIT) with the same refusal on stderr when
+    none does. It starts no installer and writes nothing under the model store
+    in either case, so it is safe to call before every fetch.
+    """
+    licensing.require_covering_receipt(catalog_id)
+    print(f"{catalog_id}: a licence receipt in "
+          f"{tilde(licensing.receipt_store_root())} covers these weights.")
+
+
 def install_model(spec: ModelSpec, screen=None) -> int:
     """Run one explicit install, optionally lending it the curses terminal.
 
@@ -1533,6 +1549,12 @@ def main(argv: list[str] | None = None) -> int:
                         metavar="MODEL",
                         help="install one model through Kilix's verified lazy "
                              "installer")
+    parser.add_argument("--check-licence", choices=tuple(MODEL_BY_ID),
+                        dest="check_licence", metavar="MODEL",
+                        help="exit 0 if a licence receipt covers one model's "
+                             "weights, 3 if none does; fetches nothing either "
+                             "way, so a fetcher outside this tree can gate "
+                             "itself on it")
     parser.add_argument("--default", choices=tuple(MODEL_BY_ID),
                         dest="default_model", metavar="MODEL",
                         help="make one model and its matching engine the default")
@@ -1552,6 +1574,9 @@ def main(argv: list[str] | None = None) -> int:
 
     changes = dict(args.changes)
     try:
+        if args.check_licence:
+            _check_licence(args.check_licence)
+            return 0
         if args.install:
             status = install_model(MODEL_BY_ID[args.install])
             if status != 0:
@@ -1579,7 +1604,7 @@ def main(argv: list[str] | None = None) -> int:
             daemon_config.ConfigError, stt_lib.SttError, OSError) as error:
         parser.exit(1, f"kilix-stt: {error}\n")
     if (changes or args.install or args.show or args.models
-            or args.grant_consent or args.revoke_consent):
+            or args.grant_consent or args.revoke_consent or args.check_licence):
         return 0
 
     if not sys.stdin.isatty() or not sys.stdout.isatty():

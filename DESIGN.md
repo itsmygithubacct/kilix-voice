@@ -96,6 +96,11 @@ Booleans are false for `"" 0 no false off disabled` (case-insensitive).
    `licensing.LICENCE_REFUSED_EXIT` (3), distinct from an installer fault (1).
    An absent authority refuses as well; it never falls through to a fetch.
    The Vosk library is Apache-2.0 code, not weights, and is not gated.
+   The refusal names kilix-content's first-use flow, by that flow's own asset
+   id (`licensing.CONTENT_ASSET_ID`), because it is the one place in the stack
+   that shows a licence screen and writes a receipt. `kilix-stt
+   --check-licence MODEL` answers the same question with the same status for a
+   fetcher that cannot import this package, and fetches nothing either way.
 
 ## Files & ownership
 

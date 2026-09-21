@@ -54,13 +54,37 @@ These are not preferences; they are enforced by the code and covered by tests.
 records and mints no receipts of its own: it asks, and refuses when the answer
 is no or when there is nobody to ask.
 
+Acceptance happens in kilix-content's first-use flow, which renders the screen,
+captures the agreement and writes the receipt before it fetches. kilix-content
+files the Vosk weights under their **upstream** ids, so the refusal names those
+rather than this catalog's:
+
 ```sh
-kilix stt --install small-en-us      # refuses without a covering receipt, exit 3
-kilix license accept small-en-us     # shows the licence and records the receipt
+kilix stt --install small-en-us                    # exit 3 without a receipt
+kilix models install vosk-model-small-en-us-0.15   # shows the licence, records it
+kilix stt --install small-en-us                    # now installs
 ```
+
+| this catalog | kilix-content asset |
+|---|---|
+| `small-en-us` | `vosk-model-small-en-us-0.15` |
+| `lgraph-en-us` | `vosk-model-en-us-0.22-lgraph` |
+| `piper-en-us-kristin-medium` | `piper-en-us-kristin-medium` |
+| `vibevoice-asr-bitnet` | `vibevoice-asr-bitnet` |
+
+The two sides are bound by the licence record, not by either id: each asset
+names exactly the record digest this authority resolves for the catalog id
+beside it.
 
 Receipts are read from `$GPU_TERMINAL_HOME/license-receipts`, or from
 `$KILIX_VOICE_LICENSE_RECEIPTS` when that is set.
+
+A fetcher that does not go through this tree cannot import `voicelib`, so it
+gets a command instead:
+
+```sh
+kilix-stt --check-licence small-en-us   # exit 0 covered, 3 refused; fetches nothing
+```
 
 **The library is not weights.** `libvosk.so` is Apache-2.0 code. Loading it,
 probing for it, reporting on it and installing it need no receipt, and none of
