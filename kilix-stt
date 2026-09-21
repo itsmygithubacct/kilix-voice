@@ -471,9 +471,12 @@ def install_model(spec: ModelSpec, screen=None) -> int:
     """Run one explicit install, optionally lending it the curses terminal.
 
     A covering licence receipt is the precondition (OS-V-VERIFY F2, OD-S,
-    OD-BB). It is checked before the launcher is even located, so a refusal
-    starts no process, fetches nothing, and writes nothing under the model
-    store. Raises licensing.LicenseRefused when no receipt covers the model.
+    OD-BB). It is the first statement, checked before the launcher is even
+    located, so a refusal starts no process, fetches nothing, and writes
+    nothing under the model store. That ordering is observable and is pinned
+    by ``LicenceOrderingTests``: with no launcher anywhere and no receipt the
+    status is 3 (a human must accept a licence), not 1 (the installer broke).
+    Raises licensing.LicenseRefused when no receipt covers the model.
     """
     licensing.require_covering_receipt(spec.catalog_id)
     argv = model_install_argv(spec)

@@ -91,16 +91,36 @@ Booleans are false for `"" 0 no false off disabled` (case-insensitive).
 7. **No weight fetch without a covering licence receipt** (OD-S, OD-BB;
    OS-V-VERIFY F2). Every route that can cause model weights to be fetched
    calls `licensing.require_covering_receipt()` first. With no covering
-   receipt it refuses before the installer is even located: no process is
-   started, nothing is written under the model store, and the exit status is
-   `licensing.LICENCE_REFUSED_EXIT` (3), distinct from an installer fault (1).
-   An absent authority refuses as well; it never falls through to a fetch.
-   The Vosk library is Apache-2.0 code, not weights, and is not gated.
-   The refusal names kilix-content's first-use flow, by that flow's own asset
-   id (`licensing.CONTENT_ASSET_ID`), because it is the one place in the stack
-   that shows a licence screen and writes a receipt. `kilix-stt
-   --check-licence MODEL` answers the same question with the same status for a
-   fetcher that cannot import this package, and fetches nothing either way.
+   receipt it refuses before the installer is even located — that ordering is
+   observable (exit 3 "a human must accept a licence" rather than exit 1 "the
+   installer broke" on a machine with no fetcher) and is pinned for all three
+   hand-offs by `tests/test_weight_licence.py::LicenceOrderingTests`. No
+   process is started, nothing is written under the model store, and the exit
+   status is `licensing.LICENCE_REFUSED_EXIT` (3), distinct from an installer
+   fault (1). **The gate never writes.** It reads a receipt store that already
+   exists and never creates one or changes its mode, on either path; an
+   authority that is absent, that raises while importing, or that cannot read
+   its own records refuses with the same status rather than escaping as a
+   traceback. The Vosk library is Apache-2.0 code, not weights, and is not
+   gated. The refusal names kilix-content's first-use flow, by that flow's own
+   asset id (`licensing.CONTENT_ASSET_ID`), because it is the one place in the
+   stack that shows a licence screen and writes a receipt; a second line names
+   `kilix-stt --check-licence MODEL` (or `kilix-tts --check-licence MODEL` for
+   the Piper voice), which answers the same question with the same status for
+   a fetcher that cannot import this package, and fetches nothing either way.
+8. **A receipt is never shipped, vendored, provisioned or built.** The only
+   producer of a `kilix.license.receipt/v1` is an acceptance the user made on
+   that user's own machine. The schema binds no subject, no timestamp and no
+   signature, so any well-formed receipt covers forever for everyone: an image
+   carrying one would pass rule 7 on every machine with nobody having seen a
+   licence, which is OS-V-VERIFY F2 wearing a compliance badge and contradicts
+   OD-S. Shipping a receipt is **not** an acceptable remedy for an image that
+   cannot install weights unattended; the acceptable outcomes are that the user
+   accepts at first use, or that the weights are not installed. A build-time
+   attestation, if one is ever needed, must be a distinct schema (OQ-C4).
+   Making a receipt bind the person and the moment belongs to kilix-license,
+   the single licence authority (OD-AJ), and is tracked there, not here: this
+   gate can only verify what the authority defines.
 
 ## Files & ownership
 
@@ -455,4 +475,11 @@ installer** — a stand-in `kilix` that records its argv and writes under the
 model store as a real fetch would. "Fetches nothing" is observed there, never
 read off the source, and two controls keep it honest: a covering receipt must
 make the spy run, and a planted copy of each command with the gate line removed
-must make every "fetches nothing" assertion fail.
+must make every "fetches nothing" assertion fail. The same file pins the parts
+of the gate that prose alone used to carry: the receipt's `decision` class in
+both directions (with an untampered control), the gate's position ahead of the
+fetcher lookup on all three hand-offs (with the planted-gate copy as the
+control that the two orderings differ), that the TUI's `i` key is gated as
+well as the CLI flag (with a covering-receipt control through the same
+keypress), that importing the module creates nothing and imports no authority,
+and that every command the refusal names is one these tools accept.

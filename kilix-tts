@@ -1162,15 +1162,35 @@ def _print_models() -> None:
         print(f"  {spec.summary}; {detail}")
 
 
+def _check_licence(catalog_id: str) -> None:
+    """Answer whether a receipt covers this voice's weights, and fetch nothing.
+
+    The same probe kilix-stt offers for the dictation models, for the one
+    downloadable model this command owns. It exists so the refusal's second
+    line names a command that actually runs for every gated id: a fetcher
+    outside this tree cannot import voicelib, but it can run this and stop on
+    its status. Exit 0 when a receipt covers the voice, exit 3
+    (LICENCE_REFUSED_EXIT) with the same refusal on stderr when none does. It
+    starts no provider and writes nothing under the model store either way.
+    """
+    licensing.require_covering_receipt(catalog_id)
+    print(f"{catalog_id}: a licence receipt in "
+          f"{licensing.receipt_store_root()} covers these weights.")
+
+
 def _install_model(catalog_id: str) -> str:
     """Run the fixed provider's explicit, checksum-pinned install action.
 
     The Piper voice is model weights, so a covering licence receipt is the
-    precondition (OS-V-VERIFY F2, OD-S, OD-BB). It is checked before the
-    provider is located, so a refusal starts no process and fetches nothing.
-    The eSpeak and MBROLA families are operating-system packages, not weights
-    this tree fetches; they are refused above for a different reason and never
-    reach the gate. Raises licensing.LicenseRefused when no receipt covers it.
+    precondition (OS-V-VERIFY F2, OD-S, OD-BB). Two statements precede the
+    gate, and neither can fetch: the catalog lookup that turns the id into a
+    spec, and the check that refuses an operating-system synthesis family
+    (eSpeak, MBROLA are distribution packages, not weights this tree fetches,
+    so they are refused for a different reason and never reach the gate).
+    Everything that could start a process is after it -- the provider is
+    located below, so a refusal starts no process and fetches nothing, which
+    ``LicenceOrderingTests`` pins by running with no provider installed.
+    Raises licensing.LicenseRefused when no receipt covers it.
     """
     try:
         spec = models.TTS_MODEL_BY_ID[catalog_id]
@@ -1244,6 +1264,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--install", choices=(models.PIPER_KRISTIN_MODEL,), metavar="MODEL",
         help="explicitly install a checksum-pinned neural TTS model")
+    parser.add_argument(
+        "--check-licence", choices=(models.PIPER_KRISTIN_MODEL,),
+        dest="check_licence", metavar="MODEL",
+        help="exit 0 if a licence receipt covers this voice's weights, 3 if "
+             "none does; fetches nothing either way, so a fetcher outside "
+             "this tree can gate itself on it")
     parser.add_argument("--speak", metavar="TEXT",
                         help="speak arbitrary text; use - to read UTF-8 stdin")
     parser.add_argument(
@@ -1275,15 +1301,21 @@ def main(argv: list[str] | None = None) -> int:
             "--model, --voice, --rate and --output require --speak TEXT")
     if args.speak is not None and (changes or args.show or args.status
                                    or args.models or args.install
+                                   or args.check_licence
                                    or args.section is not None):
         parser.error("--speak is a standalone action; do not combine it with "
-                     "--set, --print, --status, --models, --install or --section")
+                     "--set, --print, --status, --models, --install, "
+                     "--check-licence or --section")
     if args.models and (changes or args.show or args.status
-                        or args.install or args.section is not None):
+                        or args.install or args.check_licence
+                        or args.section is not None):
         parser.error("--models is a standalone action")
     if args.install and (changes or args.show or args.status
-                         or args.section is not None):
+                         or args.check_licence or args.section is not None):
         parser.error("--install is a standalone action")
+    if args.check_licence and (changes or args.show or args.status
+                               or args.section is not None):
+        parser.error("--check-licence is a standalone action")
 
     if args.speak is not None:
         try:
@@ -1300,6 +1332,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.models:
         _print_models()
+        return 0
+    if args.check_licence:
+        try:
+            _check_licence(args.check_licence)
+        except licensing.LicenseRefused as error:
+            parser.exit(licensing.LICENCE_REFUSED_EXIT, f"kilix-tts: {error}\n")
         return 0
     if args.install:
         try:

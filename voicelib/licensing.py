@@ -25,6 +25,29 @@ not copy any of that: it asks the authority, through the authority's own public
 API, and refuses when the authority is not there to ask. Copying the records
 here would make kilix-voice a second authority that drifts from the first.
 
+**A receipt is never shipped.** The only thing that may produce a receipt is an
+acceptance the user performed on that user's own machine, in kilix-content's
+first-use flow. A receipt must never be vendored into a repository, baked into
+an image, provisioned onto a machine, or written by a build. Doing so would
+satisfy this gate on every machine at once while nobody had seen a licence --
+the OS-V-VERIFY F2 hole restored in a form that reads as compliant, and a
+direct contradiction of OD-S ("the user ... gives an explicit acceptance before
+download"). Shipping a receipt is not an acceptable remedy for a machine that
+cannot install weights; the acceptable outcomes are that the user accepts at
+first use, or that the weights are not installed. If a build ever needs a
+build-time attestation, OQ-C4 already rules that it must be a distinct schema
+and never a ``kilix.license.receipt/v1``.
+
+That rule is necessary because of what the receipt schema does **not** bind: it
+carries no subject, no timestamp and no signature, so any well-formed receipt
+in the store covers forever, for any user, on any machine. Making a receipt
+bind the person and the moment is kilix-license's to do -- it owns the schema
+(OD-AJ) -- and is tracked there, not here. This gate verifies what the
+authority defines; it cannot bind more than the authority binds.
+
+This module never writes to the receipt store, on any path. It only reads one
+that already exists: see :func:`_opened_store`.
+
 Importing this module performs no filesystem, subprocess, network or authority
 work. Everything happens inside the call.
 """
@@ -32,8 +55,9 @@ work. Everything happens inside the call.
 from __future__ import annotations
 
 import os
+import pathlib
 
-from . import paths
+from . import models, paths
 
 # The authority's Python distribution. Resolved by ordinary import, so the
 # deployment that installs kilix-license decides where it lives; this module
@@ -85,6 +109,18 @@ CONTENT_ASSET_ID = {
 }
 
 
+# The refusal's second line: the probe that re-checks the same question and
+# fetches nothing in either branch. It is an addition to the acceptance route
+# above, never a replacement for it -- a probe reports, it does not obtain
+# consent -- and it is useful in the window before `kilix models install`
+# reaches the first-use flow. Each command answers for its own catalog, so the
+# line must name the command that actually accepts this id: the Piper voice is
+# kilix-tts's only downloadable model, every other gated id is kilix-stt's.
+CHECK_FLAG = "--check-licence"
+CHECK_TOOL_BY_MODEL = {models.PIPER_KRISTIN_MODEL: "kilix-tts"}
+DEFAULT_CHECK_TOOL = "kilix-stt"
+
+
 def content_asset_id(catalog_id: str) -> str:
     """Return the id kilix-content files this model's weights under."""
     return CONTENT_ASSET_ID.get(catalog_id, catalog_id)
@@ -93,6 +129,12 @@ def content_asset_id(catalog_id: str) -> str:
 def accept_command(catalog_id: str) -> str:
     """Return the first-use command that shows the licence and records consent."""
     return f"{ACCEPT_COMMAND} {content_asset_id(catalog_id)}"
+
+
+def check_command(catalog_id: str) -> str:
+    """Return the probe that re-checks this model, naming the tool that owns it."""
+    tool = CHECK_TOOL_BY_MODEL.get(catalog_id, DEFAULT_CHECK_TOOL)
+    return f"{tool} {CHECK_FLAG} {catalog_id}"
 
 
 class LicenseRefused(RuntimeError):
@@ -104,7 +146,8 @@ class LicenseRefused(RuntimeError):
         super().__init__(
             f"refusing to fetch the {catalog_id} model weights: {reason}. "
             "Model weights are fetched only after their licence has been "
-            f"shown and accepted. Run: {accept_command(catalog_id)}")
+            f"shown and accepted.\nRun: {accept_command(catalog_id)}\n"
+            f"Re-check with: {check_command(catalog_id)}")
 
 
 class AuthorityUnavailable(LicenseRefused):
@@ -134,6 +177,19 @@ def authority(catalog_id: str):
             catalog_id,
             f"the {AUTHORITY_DISTRIBUTION} authority is not installed, so no "
             "licence receipt can be verified") from error
+    except Exception as error:
+        # An authority that raises anything else while importing -- a broken
+        # install, a syntax error, a module that raises on purpose -- must
+        # refuse the same way, with the licence status and a message. Letting
+        # it out would exit 1 with a traceback, which says "the installer
+        # broke" when the truth is "no licence could be checked", and inside
+        # the curses screen it would take the terminal down instead of
+        # printing. It already failed closed; this makes it refuse cleanly.
+        raise AuthorityUnavailable(
+            catalog_id,
+            f"the {AUTHORITY_DISTRIBUTION} authority could not be loaded "
+            f"({_detail(error)}), so no licence receipt can be verified"
+        ) from error
     missing = [name for name in AUTHORITY_API if not hasattr(kilix_license, name)]
     if missing:
         raise AuthorityUnavailable(
@@ -143,12 +199,47 @@ def authority(catalog_id: str):
     return kilix_license
 
 
+def _opened_store(kilix_license, root: str):
+    """Return the authority's receipt store, opened without creating it.
+
+    ``ReceiptStore.__init__`` is a *writer's* constructor: it does
+    ``mkdir(parents=True, exist_ok=True)`` and then ``chmod(root, 0o700)``, so
+    merely constructing it to ask a question changes the filesystem. A refusal
+    would leave a store it had re-moded (``0755`` -> ``0700``), and a store at
+    ``0000`` would be repaired to ``0700`` and the install would then proceed
+    on the strength of a repair this command performed. kilix-voice verifies
+    receipts and never produces them, so it must not do either.
+
+    This subclass keeps every reading method the authority defines -- the glob,
+    the name-for-digest rule, the regular-file/size discipline, the parse --
+    and replaces only the constructor's store-creation. The reading logic is
+    still the authority's, so there is no second implementation to drift
+    (OD-AJ). Removing the creation from ``ReceiptStore`` itself would be the
+    tidier fix, but that class is kilix-license's and this repository is not
+    its owner; what this repository can do is not trigger it, and that is what
+    this does.
+
+    Every caller wraps the reads below in ``except Exception -> refuse``, so an
+    authority whose future ``__init__`` sets state this bypasses fails closed.
+    """
+
+    class _OpenedReceiptStore(kilix_license.ReceiptStore):
+        """The authority's store, opened read-only: never created, never re-moded."""
+
+        def __init__(self, root: str) -> None:  # noqa: D107 - see the parent
+            self.root = pathlib.Path(root)
+
+    return _OpenedReceiptStore(root)
+
+
 def require_covering_receipt(catalog_id: str, *, manifest_digest: str | None = None):
     """Return the receipt that covers ``catalog_id``, or raise LicenseRefused.
 
-    Nothing is written anywhere on the refusing path: the receipt store is read
-    only if it already exists, and no directory under the model store is
-    created, opened for writing, or touched at all.
+    Nothing is written anywhere, on the refusing path or on the covered one.
+    No directory under the model store is created, opened for writing, or
+    touched at all; the receipt store is only read, and only if it already
+    exists -- it is never created, and its mode is never changed (see
+    :func:`_opened_store`).
 
     ``manifest_digest`` is the OD-AI binding to the exact payload. kilix-voice
     does not fetch the payload and does not know its manifest -- the pinned
@@ -161,7 +252,16 @@ def require_covering_receipt(catalog_id: str, *, manifest_digest: str | None = N
     ``require()``. See V-ACC-IMPL.md for what that difference leaves open.
     """
     kilix_license = authority(catalog_id)
-    records = kilix_license.RecordIndex(kilix_license.load_determined_records())
+    try:
+        records = kilix_license.RecordIndex(
+            kilix_license.load_determined_records())
+    except Exception as error:
+        # Same reasoning as the import above: an authority that cannot produce
+        # its records refuses with the licence status, not a traceback.
+        raise AuthorityUnavailable(
+            catalog_id,
+            f"the {AUTHORITY_DISTRIBUTION} authority could not read its "
+            f"licence records ({_detail(error)})") from error
     try:
         record = records.by_id(catalog_id)
     except KeyError as error:
@@ -176,7 +276,7 @@ def require_covering_receipt(catalog_id: str, *, manifest_digest: str | None = N
             catalog_id,
             f"no licence receipt for {catalog_id}: there is no receipt store "
             f"at {root}")
-    store = kilix_license.ReceiptStore(root)
+    store = _opened_store(kilix_license, root)
 
     if manifest_digest is not None:
         try:

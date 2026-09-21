@@ -44,9 +44,11 @@ These are not preferences; they are enforced by the code and covered by tests.
 - **Model weights are fetched only after their licence is accepted.** Every
   install action in this tree asks the `kilix-license` authority for a receipt
   covering that model first. With no covering receipt it refuses, starts no
-  installer, writes nothing under the model store, exits **3**, and names the
-  command that shows the licence. A machine with no authority installed refuses
-  too, because a machine that cannot check a licence must not fetch weights.
+  installer, writes nothing anywhere, exits **3**, and names the command that
+  shows the licence. A machine with no authority installed refuses too — as
+  does one whose authority is broken enough to raise — because a machine that
+  cannot check a licence must not fetch weights. **A receipt is never
+  shipped**: see "A receipt is never shipped" below.
 
 ## Model licences
 
@@ -77,14 +79,51 @@ names exactly the record digest this authority resolves for the catalog id
 beside it.
 
 Receipts are read from `$GPU_TERMINAL_HOME/license-receipts`, or from
-`$KILIX_VOICE_LICENSE_RECEIPTS` when that is set.
+`$KILIX_VOICE_LICENSE_RECEIPTS` when that is set. This tree only ever **reads**
+that store: it is never created, and its mode is never changed, on the refusing
+path or on the covered one.
 
 A fetcher that does not go through this tree cannot import `voicelib`, so it
-gets a command instead:
+gets a command instead — one per catalog, so every gated model has a probe that
+runs:
 
 ```sh
-kilix-stt --check-licence small-en-us   # exit 0 covered, 3 refused; fetches nothing
+kilix-stt --check-licence small-en-us               # dictation models
+kilix-tts --check-licence piper-en-us-kristin-medium # the Piper voice
+# exit 0 covered, 3 refused; fetches nothing either way
 ```
+
+The refusal names both: the acceptance route first, because that is the cure,
+and the probe second, because it re-checks without fetching.
+
+### A receipt is never shipped
+
+**The only thing that may produce a receipt is an acceptance the user performed
+on that user's own machine.** A receipt must never be vendored into a
+repository, baked into an image, provisioned onto a machine, or written by a
+build.
+
+This has to be said out loud because the gate cannot tell the difference. A
+`kilix.license.receipt/v1` binds the licence record, the licence text digest,
+the licensor, the binding conditions and the decision class — it carries **no
+subject, no timestamp and no signature**. Any well-formed receipt in the store
+therefore covers forever, for every user, on every machine. An image that
+shipped one would pass this gate on every unit sold while nobody had ever seen
+a licence, and the audit surface would read "gated": the hole OS-V-VERIFY F2
+reported, restored in a form that looks compliant. OD-S is explicit that the
+user "gives an explicit acceptance before download".
+
+So shipping a receipt is **not** an acceptable remedy for an image that cannot
+install weights unattended. The acceptable outcomes are exactly two: the user
+accepts at first use, or the weights are not installed. If a build ever needs a
+build-time attestation of its own, OQ-C4 already rules that it must be a
+distinct schema and never a `kilix.license.receipt/v1`.
+
+Making a receipt bind the person and the moment is the deeper fix, and it is
+**not this repository's to make**: kilix-license owns the receipt schema as the
+single licence authority (OD-AJ), and that work is tracked there. This gate
+verifies what the authority defines and cannot bind more than the authority
+binds.
 
 **The library is not weights.** `libvosk.so` is Apache-2.0 code. Loading it,
 probing for it, reporting on it and installing it need no receipt, and none of
