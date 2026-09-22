@@ -75,8 +75,17 @@ AUTHORITY_API = (
 
 # Receipts are per user and shared by every consumer of the authority, so they
 # live beside the rest of the stack's writable state rather than under this
-# one component. The environment override exists so a deployment can put the
-# store somewhere else; it cannot make an absent receipt cover anything.
+# one component. Where exactly is the authority's to say (OD-AJ, V-ACC-VERIFY
+# F7): kilix-license names the root in `kilix_license.receipt_store_root()`,
+# with one override, `$KILIX_LICENSE_RECEIPTS`, and the writer -- kilix-content's
+# first-use flow reached as `kilix models install` -- files there. This gate
+# reads the root from the same function, so the two cannot part company.
+AUTHORITY_ENV_RECEIPTS = "KILIX_LICENSE_RECEIPTS"
+# kilix-voice's own override, from before the authority named a root. Kept as
+# a legacy alias so a deployment that set it keeps reading where it pointed,
+# but it moves only this reader: the writer never reads it. When the
+# authority's own variable is set as well, the authority's answer wins, so
+# this gate reads where receipts are filed rather than where the alias points.
 ENV_RECEIPTS = "KILIX_VOICE_LICENSE_RECEIPTS"
 RECEIPTS_LEAF = "license-receipts"
 
@@ -155,11 +164,33 @@ class AuthorityUnavailable(LicenseRefused):
 
 
 def receipt_store_root() -> str:
-    """Return the directory the licence authority publishes receipts into."""
-    override = os.environ.get(ENV_RECEIPTS)
-    if override:
-        return os.path.abspath(os.path.expanduser(override))
-    return os.path.join(paths.gpu_terminal_home(), RECEIPTS_LEAF)
+    """Return the directory the licence authority publishes receipts into.
+
+    The authority's own answer, ``kilix_license.receipt_store_root()``: the
+    root its writers file acceptances in. Composing it here instead is what
+    V-ACC-VERIFY F7 found -- a writer honouring ``$KILIX_LICENSE_RECEIPTS``
+    and a reader that did not, so an acceptance the user gave was filed where
+    this gate never looked. ``$KILIX_VOICE_LICENSE_RECEIPTS`` is still read,
+    as a legacy alias (see :data:`ENV_RECEIPTS`), only while the authority's
+    variable is unset. An authority too old to name a root leaves the
+    composition this module always used, ``$GPU_TERMINAL_HOME/license-receipts``
+    -- which is what such an authority's writers were given too.
+
+    It may import the authority, and so is called only inside a call, never at
+    import time. Any error the authority raises (a relative root, for one)
+    propagates; :func:`require_covering_receipt` turns it into a refusal.
+    """
+    legacy = os.environ.get(ENV_RECEIPTS)
+    if legacy and not os.environ.get(AUTHORITY_ENV_RECEIPTS):
+        return os.path.abspath(os.path.expanduser(legacy))
+    try:
+        import kilix_license
+        named = kilix_license.receipt_store_root
+    except Exception:
+        named = None
+    if named is None:
+        return os.path.join(paths.gpu_terminal_home(), RECEIPTS_LEAF)
+    return str(named())
 
 
 def authority(catalog_id: str):
@@ -270,7 +301,13 @@ def require_covering_receipt(catalog_id: str, *, manifest_digest: str | None = N
             f"the {AUTHORITY_DISTRIBUTION} authority holds no licence record "
             f"for {catalog_id}") from error
 
-    root = receipt_store_root()
+    try:
+        root = receipt_store_root()
+    except Exception as error:
+        raise LicenseRefused(
+            catalog_id,
+            f"the licence receipt store could not be located "
+            f"({_detail(error)})") from error
     if not os.path.isdir(root):
         raise LicenseRefused(
             catalog_id,
