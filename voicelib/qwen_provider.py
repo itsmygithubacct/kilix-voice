@@ -1,49 +1,47 @@
-"""Explicit Qwen named-voice adapter for the local, receipt-backed provider."""
+"""Explicit Qwen named voices through the separate local provider executable.
+
+The inference environment is pinned to Python 3.12 while Voice runs under the
+system Python. A bounded subprocess client keeps those environments separate;
+the provider owns the authenticated socket, model snapshot, and job teardown.
+"""
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import re
+import selectors
+import subprocess
 import threading
 import time
-import uuid
 
 from . import models, protocol, util
 from .tts import (SynthesisProvenance, TtsDeadlineExceeded, TtsError,
-                  TtsUnsupported, _as_text, _bounded)
+                  TtsUnsupported, _as_text, _bounded, _budget_cut)
+
+SAMPLE_RATE = 24000
+MAX_DURATION_MS = 60000
+MAX_WAV_BYTES = 44 + MAX_DURATION_MS * 48
+PROBE_TIMEOUT_S = 5.0
+SYNTH_TIMEOUT_S = 300.0
+REFUSAL = re.compile(rb"KILIX_QWEN_TTS_REFUSAL \[([A-Z_]+)\] speech request failed\s*")
 
 
 class QwenBusy(TtsError):
     code = protocol.ERR_BUSY
 
 
-def _provider():
-    try:
-        from kilix_qwen_tts.protocol import ProtocolError
-        from kilix_qwen_tts.service import client_request, request_value, runtime_directory
-    except ImportError as error:
-        raise TtsError(
-            "kilix-qwen-tts client is not installed in the Voice runtime. "
-            "Install the pinned Qwen provider and start its receipt-backed "
-            "CPU service before choosing this model.") from error
-    return ProtocolError, client_request, request_value, runtime_directory
-
-
-def _translate(error: Exception) -> TtsError:
-    code = getattr(error, "code", "")
-    if code == "DEADLINE_EXCEEDED":
-        return TtsDeadlineExceeded("Qwen provider exceeded the request deadline")
-    if code == "BUSY":
-        return QwenBusy("Qwen provider is busy with another synthesis")
-    if code == "UNSUPPORTED_CAPABILITY":
-        return TtsUnsupported("Qwen provider does not support this model or voice")
-    return TtsError(f"Qwen provider unavailable ({code or type(error).__name__}): {error}")
+def provider_binary() -> str | None:
+    return util.which(os.environ.get("KILIX_QWEN_TTS", "kilix-qwen-tts"))
 
 
 class QwenProviderTts:
-    """Use only the 0.6B CustomVoice model, never an implicit provider fallback."""
+    """Use only the 0.6B CustomVoice model, never an implicit fallback."""
 
     name = models.TTS_ENGINE_QWEN
     model = models.QWEN_CUSTOMVOICE_MODEL
-    rate = 0  # No words-per-minute control in the candidate provider contract.
+    rate = 0  # The provider has no words-per-minute control.
     last_provenance: SynthesisProvenance | None = None
 
     def __init__(self, *, voice: str | None = None, rate: int | None = None):
@@ -55,62 +53,143 @@ class QwenProviderTts:
                     char.isalnum() or char in "._:+-" for char in self.voice)):
             raise TtsUnsupported("Qwen voice must be a bounded provider voice ID")
         self._cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self._process: subprocess.Popen[bytes] | None = None
+
+    def _run(self, arguments: list[str], payload: bytes, *, cap: float,
+             budget: float | None, maximum: int) -> tuple[bytes, bytes, int]:
+        timeout = _bounded(cap, budget)
+        binary = provider_binary()
+        if binary is None:
+            raise TtsError("kilix-qwen-tts is not installed. Install its pinned "
+                           "client and start a receipt-backed provider service.")
+        if self._cancelled.is_set():
+            return b"", b"", -9
+        deadline = time.monotonic() + timeout
+        try:
+            process = subprocess.Popen([binary, *arguments], stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except OSError as error:
+            raise TtsError(f"cannot start kilix-qwen-tts: {error}") from error
+        with self._lock:
+            self._process = process
+            if self._cancelled.is_set():
+                process.kill()
+        buffers = (bytearray(), bytearray())
+        try:
+            with selectors.DefaultSelector() as ready:
+                for channel in (process.stdin, process.stdout, process.stderr):
+                    os.set_blocking(channel.fileno(), False)
+                ready.register(process.stdout, selectors.EVENT_READ, 0)
+                ready.register(process.stderr, selectors.EVENT_READ, 1)
+                if payload:
+                    ready.register(process.stdin, selectors.EVENT_WRITE, 2)
+                else:
+                    process.stdin.close()
+                pending = memoryview(payload)
+                while ready.get_map():
+                    if self._cancelled.is_set():
+                        return b"", b"", -9
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        failure = TtsDeadlineExceeded if _budget_cut(cap, budget) else TtsError
+                        raise failure("Qwen client exceeded the speech deadline")
+                    for key, _ in ready.select(min(0.05, remaining)):
+                        channel, index = key.fileobj, key.data
+                        try:
+                            if index == 2:
+                                pending = pending[os.write(channel.fileno(), pending[:4096]):]
+                                if not pending:
+                                    ready.unregister(channel)
+                                    channel.close()
+                                continue
+                            block = os.read(channel.fileno(), 65536)
+                        except BlockingIOError:
+                            continue
+                        except BrokenPipeError:
+                            ready.unregister(channel)
+                            channel.close()
+                            continue
+                        if not block:
+                            ready.unregister(channel)
+                            continue
+                        buffers[index].extend(block)
+                        if len(buffers[index]) > (maximum if index == 0 else 65536):
+                            raise TtsError("Qwen client returned more data than permitted")
+            try:
+                process.wait(timeout=max(0.001, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired as error:
+                failure = TtsDeadlineExceeded if _budget_cut(cap, budget) else TtsError
+                raise failure("Qwen client exceeded the speech deadline") from error
+            return bytes(buffers[0]), bytes(buffers[1]), process.returncode
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            for channel in (process.stdin, process.stdout, process.stderr):
+                channel.close()
+            with self._lock:
+                if self._process is process:
+                    self._process = None
 
     def check_available(self, *, budget: float | None = None) -> None:
-        timeout = _bounded(5.0, budget)
-        ProtocolError, client_request, request_value, runtime_directory = _provider()
+        out, _err, code = self._run(["models"], b"", cap=PROBE_TIMEOUT_S,
+                                    budget=budget, maximum=65536)
+        if code:
+            raise TtsError("Qwen provider is unavailable; start its local service")
         try:
-            response = client_request(runtime_directory(),
-                                      request_value("models", timeout=timeout))
-        except (ProtocolError, OSError) as error:
-            raise _translate(error) from error
-        rows = response.get("models") if isinstance(response, dict) else None
-        selected = next((row for row in rows if isinstance(row, dict)
-                         and row.get("id") == self.model), None) if isinstance(rows, list) else None
-        if selected is None:
-            raise TtsError(f"Qwen model {self.model} is not served by the local provider")
-        if (selected.get("asset_authority") != "kilix-content"
-                or selected.get("installed") is not True
-                or selected.get("capabilities") != ["named_voice"]):
-            raise TtsError("Qwen model is not a receipt-backed named-voice installation")
+            records = json.loads(out).get("models")
+            selected = [row for row in records if isinstance(row, dict)
+                        and row.get("id") == self.model] if isinstance(records, list) else []
+        except (ValueError, UnicodeError, AttributeError):
+            selected = []
+        if (len(selected) != 1 or selected[0].get("installed") is not True
+                or selected[0].get("asset_authority") != "kilix-content"
+                or selected[0].get("capabilities") != ["named_voice"]):
+            raise TtsError(f"Qwen model {self.model} is not a receipt-backed "
+                           "named-voice installation")
 
     def synth(self, text: str, *, budget: float | None = None) -> tuple[bytes, int]:
         clean = _as_text(text).strip()
-        if not clean:
-            return b"", 24000
-        timeout = _bounded(300.0, budget)
-        started = time.monotonic()
+        if not clean or self._cancelled.is_set():
+            return b"", SAMPLE_RATE
+        try:
+            encoded = clean.encode("utf-8", "strict")
+        except UnicodeError as error:
+            raise TtsUnsupported("Qwen speech text must be valid UTF-8") from error
+        if len(encoded) > 16384:
+            raise TtsUnsupported("Qwen accepts at most 16384 UTF-8 bytes per clip")
+        timeout = _bounded(SYNTH_TIMEOUT_S, budget)
+        out, err, code = self._run([
+            "synthesize", "--wav-stdout", "--require-installed-asset",
+            "--model-id", self.model, "--voice-id", self.voice,
+            "--language", "en", "--seed", "0", "--timeout", str(timeout),
+            "--max-duration-ms", str(MAX_DURATION_MS),
+        ], encoded, cap=SYNTH_TIMEOUT_S, budget=budget, maximum=MAX_WAV_BYTES)
         if self._cancelled.is_set():
-            return b"", 24000
-        # Recheck at each chunk: a stale acknowledgement cannot authorize a
-        # later clip after the provider's installed asset has been removed.
-        self.check_available(budget=timeout)
-        remaining = _bounded(timeout, timeout - (time.monotonic() - started))
-        ProtocolError, client_request, request_value, runtime_directory = _provider()
-        args = {"task": "synthesize", "text": clean, "model_id": self.model,
-                "language": "en", "seed": 0, "max_duration_ms": 60000,
-                "mode": "named_voice", "voice_id": self.voice,
-                "output": {"sample_format": "s16le", "sample_rate_hz": 24000,
-                           "channels": 1}}
+            return b"", SAMPLE_RATE
+        if code:
+            match = REFUSAL.fullmatch(err)
+            refusal = match[1].decode() if match else "PROVIDER_UNAVAILABLE"
+            if refusal == "DEADLINE_EXCEEDED" and _budget_cut(SYNTH_TIMEOUT_S, budget):
+                raise TtsDeadlineExceeded("Qwen speech deadline elapsed")
+            if refusal == "BUSY":
+                raise QwenBusy("Qwen provider is busy with another synthesis")
+            if refusal == "UNSUPPORTED_CAPABILITY":
+                raise TtsUnsupported("Qwen provider does not support this model or voice")
+            raise TtsError(f"Qwen provider refused synthesis ({refusal})")
         try:
-            result, wav = client_request(
-                runtime_directory(), request_value("submit", job_id=uuid.uuid4().hex,
-                                                   args=args, timeout=remaining),
-                cancelled=self._cancelled.is_set)
-        except ProtocolError as error:
-            if error.code == "CANCELED" and self._cancelled.is_set():
-                return b"", 24000
-            raise _translate(error) from error
-        except OSError as error:
-            raise _translate(error) from error
-        if result.get("model_id") != self.model or result.get("seed") != 0:
-            raise TtsError("Qwen provider returned the wrong model or seed")
-        try:
-            pcm, sample_rate = util.parse_wav_bytes(wav, strict=True)
-        except ValueError as error:
-            raise TtsError(f"Qwen provider returned invalid WAV audio: {error}") from error
-        if sample_rate != 24000:
-            raise TtsError("Qwen provider returned audio at an unexpected sample rate")
+            metadata = json.loads(err)
+            if (not isinstance(metadata, dict) or metadata.get("model_id") != self.model
+                    or type(metadata.get("seed")) is not int or metadata["seed"] != 0
+                    or metadata.get("audio") != {"byte_length": len(out),
+                                                "sha256": hashlib.sha256(out).hexdigest()}):
+                raise ValueError("result does not match the selected model or audio")
+            pcm, sample_rate = util.parse_wav_bytes(out, strict=True)
+            if not pcm or sample_rate != SAMPLE_RATE:
+                raise ValueError("expected nonempty 24 kHz mono PCM16")
+        except (ValueError, UnicodeError) as error:
+            raise TtsError(f"Qwen provider returned invalid speech: {error}") from error
         self.last_provenance = SynthesisProvenance(
             self.model, self.voice, seed=0, seed_consumed=True,
             reproducible=False, rate_wpm=0)
@@ -118,5 +197,12 @@ class QwenProviderTts:
 
     def cancel(self) -> None:
         self._cancelled.set()
+        with self._lock:
+            process = self._process
+        if process is not None and process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
 
     close = cancel
