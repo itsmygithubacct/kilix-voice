@@ -124,7 +124,7 @@ def print_report(result: dict, as_json=False) -> None:
     if as_json:
         print(json.dumps(result, indent=2))
         return
-    print("TTS audition tiers — explicit choice, no downloads or settings changes.")
+    print("TTS audition tiers — explicit choice, no model downloads or settings changes.")
     for row in result["candidates"]:
         resources = (row.get("inference") or {}).get("resources", {})
         amounts = ", ".join(f"{name.upper()} {resources[name]['required_bytes'] / 1024**2:.0f} MiB"
