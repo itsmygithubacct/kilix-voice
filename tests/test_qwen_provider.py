@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -25,6 +27,8 @@ for required in ('--wav-stdout','--require-installed-asset','--model-id','--voic
 assert args[args.index('--model-id')+1]=='qwen3-tts-0.6b-customvoice'
 assert args[args.index('--voice-id')+1]=='Vivian'
 assert sys.stdin.buffer.read()==b'Hello'
+if os.getenv('FAKE_SLEEP'):
+    time.sleep(60)
 failure=os.getenv('FAKE_REFUSAL')
 if failure:
     print(f'KILIX_QWEN_TTS_REFUSAL [{failure}] speech request failed',file=sys.stderr)
@@ -34,7 +38,8 @@ wav=struct.pack('<4sI4s4sIHHIIHH4sI',b'RIFF',len(pcm)+36,b'WAVE',b'fmt ',
     16,1,1,24000,48000,2,16,b'data',len(pcm))+pcm
 sys.stdout.buffer.write(wav)
 print(json.dumps({'model_id':'qwen3-tts-0.6b-customvoice','seed':0,
-    'audio':{'byte_length':len(wav),'sha256':hashlib.sha256(wav).hexdigest()}}),file=sys.stderr)
+    'audio':{'byte_length':len(wav),'sha256':
+        '0'*64 if os.getenv('FAKE_BAD_DIGEST') else hashlib.sha256(wav).hexdigest()}}),file=sys.stderr)
 '''
 
 
@@ -81,6 +86,27 @@ class QwenAdapterTests(unittest.TestCase):
         engine = QwenProviderTts()
         engine.cancel()
         self.assertEqual(engine.synth("Hello"), (b"", 24000))
+
+    def test_cancel_kills_an_active_client_without_delivering_audio(self):
+        engine = QwenProviderTts()
+        result = []
+        with patch.dict(os.environ, {"FAKE_SLEEP": "1"}):
+            worker = threading.Thread(target=lambda: result.append(engine.synth("Hello")))
+            worker.start()
+            deadline = time.monotonic() + 2
+            while engine._process is None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertIsNotNone(engine._process)
+            engine.cancel()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, [(b"", 24000)])
+
+    def test_rejects_result_whose_audio_digest_does_not_match(self):
+        with patch.dict(os.environ, {"FAKE_BAD_DIGEST": "1"}):
+            with self.assertRaises(tts.TtsError) as caught:
+                QwenProviderTts().synth("Hello")
+        self.assertIn("invalid speech", str(caught.exception))
 
 
 if __name__ == "__main__":
