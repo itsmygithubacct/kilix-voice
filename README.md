@@ -236,6 +236,20 @@ removes that exact runtime and refuses to remove files changed since install.
 
 ## Release history
 
+For foreground prompt/play/replay sessions, offline resident Qwen auditions,
+and first-use Qwen downloads, see [Interactive TTS](docs/interactive-tts.md).
+`kilix-tts --tiers` lists hardware-aware choices. In an interactive terminal,
+`kilix-tts --interactive --tier neural` starts Piper Kristin and installs its
+weights on first selection after showing the licence and waiting for a keypress.
+On a fresh Kilix installation, `kilix tts --interactive --tier neural` also
+installs the pinned Piper runtime on demand. Neither listing nor selecting a
+different tier starts a Piper download.
+`python3 bench/tts_reply.py --output new-result.json` measures cold and warm
+Piper prompt-to-playable-audio reply time through the Kilix provider path.
+The new first-use tests also require a 0.2.2 `kilix-content` source tree; pass
+`CONTENT_SRC=/path/to/kilix-content/src` alongside `LICENSE_SRC` when testing
+separate release worktrees.
+
 - **0.1.6** — add the isolated persistent Piper provider contract, explicit
   pinned Kristin installation, cancellable neural speech, and WAV/MP3 export
   through the existing arbitrary-text CLI.

@@ -21,7 +21,7 @@ import threading
 import time
 from typing import NamedTuple
 
-from . import models, protocol, settings, util
+from . import models, paths, protocol, settings, util
 
 # espeak-ng writes 22.05 kHz mono at --stdout. The real rate always comes from
 # the WAV header; this is only what an empty clip is labelled with.
@@ -804,6 +804,12 @@ class EspeakTts:
         try:
             out, err = process.communicate(
                 text.encode("utf-8", "replace"), timeout=timeout)
+        except KeyboardInterrupt:
+            # Foreground auditions can be interrupted while communicate is
+            # waiting. Reap the child before returning to the next prompt.
+            process.kill()
+            process.communicate()
+            raise
         except subprocess.TimeoutExpired as error:
             process.kill()
             process.communicate()
@@ -848,7 +854,12 @@ class EspeakTts:
 
 def piper_binary() -> str | None:
     """Return the fixed provider command selected by the trusted environment."""
-    return util.which(os.environ.get(PIPER_ENV_COMMAND, "kilix-piper-tts"))
+    override = os.environ.get(PIPER_ENV_COMMAND)
+    if override:
+        return util.which(override)
+    managed = os.path.join(paths.data_dir(), "piper", "current", "bin",
+                           "kilix-piper-tts")
+    return util.which(managed) or util.which("kilix-piper-tts")
 
 
 def piper_probe(*, budget: float | None = None) -> tuple[bool, str]:
@@ -1014,6 +1025,10 @@ class PiperTts:
         try:
             out, err = process.communicate(
                 clean.encode("utf-8", "replace"), timeout=timeout)
+        except KeyboardInterrupt:
+            process.kill()
+            process.communicate()
+            raise
         except subprocess.TimeoutExpired as error:
             process.kill()
             process.communicate()

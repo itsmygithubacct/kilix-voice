@@ -8,9 +8,9 @@ disagree about what "read this" means, and a test phrase travels the same
 route — daemon, arbiter, engine, sink — that a real read takes, so a test that
 sounds right proves the real path rather than a private shortcut.
 
-The screen and audible tests leave synthesis and playback to the daemon.  A
-file export is the deliberate exception: it runs the selected local
-synthesiser synchronously but never opens an audio device.  A machine with no
+The screen and ordinary audible tests leave synthesis and playback to the
+daemon. File exports and explicit --interactive sessions run a local
+synthesiser directly; only the latter opens an audio device. A machine with no
 daemon running and no ``espeak-ng`` installed still opens the screen, still
 saves settings, and says in the status block what is missing and what to install
 rather than failing to start.
@@ -23,6 +23,7 @@ As a CLI, for scripts and for terminals that cannot run curses:
     kilix-tts --speak "Hello from Kilix"
     printf '%s' "Longer text" | kilix-tts --speak - --model espeak
     kilix-tts --speak "Save this" --output speech.wav
+    kilix-tts --interactive --model espeak
 """
 
 from __future__ import annotations
@@ -1264,6 +1265,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--install", choices=(models.PIPER_KRISTIN_MODEL,), metavar="MODEL",
         help="explicitly install a checksum-pinned neural TTS model")
+    from voicelib import qwen_setup
+    parser.add_argument("--download-qwen", choices=(*qwen_setup.MODEL_IDS, "all"),
+                        metavar="MODEL", help="first-use download of a catalogued Qwen model; "
+                        "combine with --interactive for one Base/CustomVoice model; "
+                        "all downloads the three catalogued models only")
     parser.add_argument(
         "--check-licence", choices=(models.PIPER_KRISTIN_MODEL,),
         dest="check_licence", metavar="MODEL",
@@ -1272,6 +1278,25 @@ def main(argv: list[str] | None = None) -> int:
              "this tree can gate itself on it")
     parser.add_argument("--speak", metavar="TEXT",
                         help="speak arbitrary text; use - to read UTF-8 stdin")
+    parser.add_argument("--interactive", action="store_true",
+                        help="foreground prompt/play/replay/save session; --speak is an optional first line")
+    from voicelib import tts_tiers
+    parser.add_argument("--tiers", action="store_true",
+                        help="show hardware-aware TTS audition tiers without loading weights")
+    parser.add_argument("--json", action="store_true", help="machine-readable --tiers report")
+    parser.add_argument("--tier", choices=tts_tiers.TIER_IDS,
+                        help="interactive only: select an installed, estimated-fit audition tier")
+    parser.add_argument("--qwen-model-dir", metavar="DIR",
+                        help="interactive only: audition existing local Qwen weights offline")
+    parser.add_argument("--device", choices=("cpu", "cuda:0"), default="cpu",
+                        help="resident Qwen device (default: cpu; never auto-selects GPU)")
+    parser.add_argument("--attention", choices=("sdpa", "flash_attention_2"), default="sdpa",
+                        help="Qwen attention backend; FlashAttention 2 requires CUDA and flash-attn")
+    parser.add_argument("--threads", type=int, default=4, help="Qwen CPU threads (1–32)")
+    parser.add_argument("--seed", type=int, default=0, help="Qwen sampling seed")
+    parser.add_argument("--language", help="interactive Qwen language (default: English)")
+    parser.add_argument("--synthetic-reference", action="store_true",
+                        help="audition a Qwen Base model using a generated eSpeak reference")
     parser.add_argument(
         "--output", "--save", dest="output", metavar="FILE",
         help="save --speak text to a new .wav or .mp3 file instead of playing")
@@ -1292,6 +1317,111 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version",
                         version=f"kilix-tts {__version__}")
     args = parser.parse_args(argv)
+
+    if args.json and not args.tiers:
+        parser.error("--json requires --tiers")
+    if args.tiers:
+        if any(value != parser.get_default(key) for key, value in vars(args).items()
+               if key not in {"tiers", "json"}):
+            parser.error("--tiers is standalone; optionally add --json")
+        try:
+            tts_tiers.print_report(tts_tiers.report(), args.json)
+        except tts_tiers.sizing.SizerError as error:
+            parser.exit(1, f"kilix-tts: {error}\n")
+        return 0
+    if args.tier:
+        if (not args.interactive or args.model or args.qwen_model_dir or args.download_qwen
+                or args.synthetic_reference or args.device != "cpu" or args.attention != "sdpa"
+                or args.set or args.show or args.status or args.models or args.install
+                or args.check_licence or args.section is not None or args.output):
+            parser.error("--tier requires standalone --interactive; do not combine engine/device selectors")
+        try:
+            tier_report = tts_tiers.report()
+            tts_tiers.select(args, tier_report)
+        except tts_tiers.sizing.SizerError as error:
+            parser.exit(1, f"kilix-tts: {error}\n")
+        if args.tier == "neural" and next(row for row in tier_report["candidates"]
+                                          if row["tier"] == "neural")["installable"]:
+            if not sys.stdin.isatty() or not sys.stdout.isatty():
+                parser.error("Piper first-use installation requires a terminal")
+            try:
+                qwen_setup.install(qwen_setup.PIPER_ID)
+                print(_install_model(qwen_setup.PIPER_ID), flush=True)
+                tts_tiers.select(args, tts_tiers.report())
+            except qwen_setup.Declined as error:
+                print(error)
+                return 0
+            except licensing.LicenseRefused as error:
+                parser.exit(licensing.LICENCE_REFUSED_EXIT, f"kilix-tts: {error}\n")
+            except (VoiceToolError, OSError, RuntimeError, ValueError) as error:
+                parser.exit(1, f"kilix-tts: {error}\n")
+
+    if args.download_qwen and not args.interactive:
+        if (args.qwen_model_dir or args.synthetic_reference
+                or args.speak is not None or args.model or args.voice or args.rate
+                or args.output or args.set or args.show or args.status or args.models
+                or args.install or args.check_licence or args.section is not None
+                or args.language or args.device != "cpu" or args.attention != "sdpa"
+                or args.threads != 4 or args.seed != 0):
+            parser.error("speech options with --download-qwen require --interactive")
+        selected = qwen_setup.MODEL_IDS if args.download_qwen == "all" else (args.download_qwen,)
+        try:
+            for model_id in selected:
+                print(f"Installed {model_id}: {qwen_setup.install(model_id)}", flush=True)
+        except qwen_setup.Declined as error:
+            print(error)
+            return 0
+        except Exception as error:
+            # Content and License define their own domain exception families.
+            # Keep first-use failures concise without importing either optional
+            # dependency into every ordinary CLI invocation.
+            parser.exit(1, f"kilix-tts: {error}\n")
+        except (KeyboardInterrupt, EOFError):
+            return 130
+        return 0
+
+    qwen_options = (args.qwen_model_dir or args.synthetic_reference or args.language
+                    or args.device != "cpu" or args.attention != "sdpa"
+                    or args.threads != 4 or args.seed != 0)
+    if qwen_options and not (args.interactive and (args.qwen_model_dir or args.download_qwen)):
+        parser.error("Qwen session options require --interactive with --qwen-model-dir or --download-qwen")
+    if args.interactive:
+        if (args.set or args.show or args.status or args.models or args.install
+                or args.check_licence or args.section is not None or args.output):
+            parser.error("--interactive is standalone; use /save FILE.wav in the session")
+        if (args.qwen_model_dir or args.download_qwen) and (args.model or args.rate):
+            parser.error("resident Qwen cannot be combined with --model or --rate")
+        if args.attention == "flash_attention_2" and args.device == "cpu":
+            parser.error("--attention flash_attention_2 requires --device cuda:0")
+        if args.download_qwen:
+            if args.qwen_model_dir:
+                parser.error("choose --download-qwen or --qwen-model-dir, not both")
+            if args.download_qwen not in qwen_setup.MODEL_IDS[:2]:
+                parser.error("--interactive --download-qwen requires one Base or CustomVoice model")
+            base = args.download_qwen.endswith("-base")
+            if base != args.synthetic_reference or (base and args.voice):
+                parser.error("Base requires --synthetic-reference and no --voice; CustomVoice does not")
+        if not 1 <= args.threads <= 32 or not 0 <= args.seed <= 2**32 - 1:
+            parser.error("--threads must be 1–32 and --seed must be 0–4294967295")
+        if args.speak == "-":
+            parser.error("--interactive reads prompts itself; --speak must be literal text")
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            parser.error("--interactive needs a terminal")
+        from voicelib import interactive
+        try:
+            if args.download_qwen:
+                print("Qwen setup — the session starts here after the download completes.", flush=True)
+                args.qwen_model_dir = qwen_setup.install(args.download_qwen)
+            return interactive.run(args)
+        except qwen_setup.Declined as error:
+            print(error)
+            return 0
+        except KeyboardInterrupt:
+            return 130
+        except EOFError:
+            return 0
+        except Exception as error:
+            parser.exit(1, f"kilix-tts: {error}\n")
 
     changes = dict(args.set)
     speech_overrides = (args.model, args.voice, args.rate, args.output)

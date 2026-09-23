@@ -14,8 +14,9 @@ LEASE_SRC ?= ../../kilix-system-monitor/components/kilix-device-lease/src
 # none of its records, so its tests need that source on the import path;
 # tests/test_weight_licence.py fails, naming this variable, when it is not.
 LICENSE_SRC ?= ../../kilix-modules/kilix-license/src
+CONTENT_SRC ?= ../../kilix-modules/kilix-content/src
 
-SUITE_PYTHONPATH = $(abspath $(LEASE_SRC)):$(abspath $(LICENSE_SRC))
+SUITE_PYTHONPATH = $(abspath $(LEASE_SRC)):$(abspath $(LICENSE_SRC)):$(abspath $(CONTENT_SRC))
 
 .PHONY: all test test-clean lint install uninstall clean
 
