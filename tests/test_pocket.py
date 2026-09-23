@@ -5,6 +5,7 @@ import io
 from pathlib import Path
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -116,9 +117,104 @@ class PocketTests(unittest.TestCase):
         engine.np, engine.torch, engine.seed = np, torch, 0
         engine.model = mock.Mock(sample_rate=24000, generate_audio=generate_audio)
         engine.state = object()
+        engine._install_stop_hooks()
         pcm, rate = engine.synth("hi")
         self.assertEqual(rate, 24000)
         self.assertEqual(len(pcm), 480)
+
+    @unittest.skipUnless(importlib.util.find_spec("numpy"), "NumPy not installed")
+    def test_interrupt_stops_every_worker_before_returning(self):
+        import numpy as np
+        import queue
+
+        class ThreadedModel:
+            """Upstream's topology: per text chunk, a daemon decoder thread and a
+            daemon generator thread that only stops on error or completion."""
+            sample_rate = 24000
+
+            def __init__(self):
+                self.steps = 0
+                self.first_chunk_done = threading.Event()
+                self.threads = []
+
+            def _run_flow_lm_and_increment_step(self):
+                self.steps += 1
+                time.sleep(0.05)
+
+            def _autoregressive_generation(self, latents):
+                for _ in range(100000):
+                    self._run_flow_lm_and_increment_step()
+                    latents.put(1)
+
+            def _decode_audio_worker(self, latents, results):
+                while latents.get() is not None:
+                    time.sleep(0.05)  # decoding a latent takes real time upstream
+                results.put(("done", None))
+
+            def _chunk(self):
+                latents, results = queue.Queue(), queue.Queue()
+                decoder = threading.Thread(target=self._decode_audio_worker, args=(latents, results), daemon=True)
+                self.threads.append(decoder)
+                decoder.start()
+                def run_generation():
+                    try:
+                        self._autoregressive_generation(latents)
+                    except Exception as error:
+                        results.put(("error", error))
+                    latents.put(None)
+                generator = threading.Thread(target=run_generation, daemon=True)
+                self.threads.append(generator)
+                generator.start()
+                return results.get()
+
+            def generate_audio(self, _state, _text):
+                with mock.patch.object(self, "_autoregressive_generation",
+                                  lambda latents: [latents.put(1) for _ in range(3)]):
+                    self._chunk()  # a finished first chunk, as long text produces
+                self.first_chunk_done.set()
+                kind, value = self._chunk()
+                raise value if kind == "error" else AssertionError("second chunk ran to completion")
+
+        engine = object.__new__(pocket.ResidentPocket)
+        engine.np, engine.torch, engine.seed, engine.state = np, mock.Mock(), 0, object()
+        engine.model = ThreadedModel()
+        engine._install_stop_hooks()
+        baseline = threading.active_count()
+        interrupted = []
+
+        def call():
+            try:
+                engine.synth("hi")
+            except KeyboardInterrupt:
+                interrupted.append(True)
+
+        # Deliver the interrupt as the caller's own exception once the second
+        # chunk's workers are busy.
+        real_generate = engine.model.generate_audio
+        with mock.patch.object(engine.model, "generate_audio") as generate:
+            def interrupting(state, text):
+                worker = threading.Thread(target=real_generate, args=(state, text), daemon=True)
+                worker.start()
+                engine.model.first_chunk_done.wait(5)
+                deadline = time.monotonic() + 5
+                while engine.model.steps < 3 and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                raise KeyboardInterrupt
+            generate.side_effect = interrupting
+            call()
+        still_running = [thread for thread in engine.model.threads if thread.is_alive()]
+        self.assertEqual(interrupted, [True])
+        self.assertEqual(still_running, [], "synth returned while Pocket workers were still running")
+        self.assertEqual(len(engine.model.threads), 4)
+        steps = engine.model.steps
+        time.sleep(0.2)
+        self.assertEqual(engine.model.steps, steps, "a worker kept generating after synth returned")
+        self.assertEqual(engine._live, 0)
+        self.assertFalse(engine._stuck)
+        deadline = time.monotonic() + 2
+        while threading.active_count() > baseline and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertLessEqual(threading.active_count(), baseline)
 
     def test_cli_requires_interactive_and_exclusive_engine(self):
         tool = load_tool()
