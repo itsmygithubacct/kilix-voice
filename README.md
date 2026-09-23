@@ -253,6 +253,9 @@ on x86_64 Debian, then offers the catalogued 0.6B model after its first-use
 licence notice. On eligible hardware, `kilix tts --interactive --tier qwen-gpu`
 also lazily installs a locked CUDA/FlashAttention runtime; neither tier is an
 automatic install or fallback.
+`kilix tts --interactive --tier qwen-base-gpu` shares that GPU runtime but
+uses separately catalogued 0.6B Base weights and a fixed synthetic eSpeak
+reference; it never clones a person's voice.
 `python3 bench/tts_reply.py --output new-result.json` measures cold and warm
 Piper prompt-to-playable-audio reply time through the Kilix provider path.
 The new first-use tests also require a 0.2.2 `kilix-content` source tree; pass

@@ -121,6 +121,10 @@ existing verified environment can instead be selected by setting
 and runtime availability before offering missing weights. The tier also requires
 physical GPU 0 without CUDA device remapping; it refuses a budget for another
 GPU. Explicit `--qwen-model-dir` remains an expert path outside tier gating.
+`qwen-base-gpu` shares that runtime but uses the separately measured 0.6B Base
+GPU profile and a fixed synthetic eSpeak reference. It has no CPU tier until a
+CPU Base resource profile is measured; the CustomVoice CPU estimate is not
+silently reused for a different model.
 
 Install the shared `plebian-model-sizer` with the dated audition profiles, or
 set `PLEBIAN_MODEL_SIZER` to its executable. Kilix Voice delegates fit math

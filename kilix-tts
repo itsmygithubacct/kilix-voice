@@ -1350,8 +1350,10 @@ def main(argv: list[str] | None = None) -> int:
                     qwen_setup.install(qwen_setup.PIPER_ID)
                     print(_install_model(qwen_setup.PIPER_ID), flush=True)
                 else:
-                    print(f"Installed {tts_tiers.QWEN_ID}: "
-                          f"{qwen_setup.install(tts_tiers.QWEN_ID)}", flush=True)
+                    qwen_id = (tts_tiers.QWEN_BASE_ID if args.tier == "qwen-base-gpu"
+                               else tts_tiers.QWEN_ID)
+                    print(f"Installed {qwen_id}: "
+                          f"{qwen_setup.install(qwen_id)}", flush=True)
                 tts_tiers.select(args, tts_tiers.report())
             except qwen_setup.Declined as error:
                 print(error)

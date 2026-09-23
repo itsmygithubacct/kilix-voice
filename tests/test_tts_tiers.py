@@ -26,7 +26,7 @@ class TierTests(unittest.TestCase):
                 patch.object(tiers.sizing, "recommend_request", side_effect=run):
             return tiers.report()
 
-    def test_all_five_tiers_are_explicitly_selectable(self):
+    def test_all_six_tiers_are_explicitly_selectable(self):
         result = self.report()
         self.assertEqual([row["tier"] for row in result["candidates"]], list(tiers.TIER_IDS))
         for row in result["candidates"]:
@@ -35,6 +35,11 @@ class TierTests(unittest.TestCase):
             self.assertTrue(row["selectable"])
             if args.tier == "qwen-gpu":
                 self.assertEqual((args.device, args.attention), ("cuda:0", "flash_attention_2"))
+            elif args.tier == "qwen-base-gpu":
+                self.assertEqual((args.device, args.attention, args.synthetic_reference),
+                                 ("cuda:0", "flash_attention_2", True))
+                self.assertEqual(args.qwen_model_dir,
+                                 str(tiers.qwen_directory(tiers.QWEN_BASE_ID)))
             elif args.tier == "qwen-cpu":
                 self.assertEqual((args.device, args.attention), ("cpu", "sdpa"))
             elif args.tier == "small":
@@ -76,6 +81,19 @@ class TierTests(unittest.TestCase):
         row = next(row for row in result["candidates"] if row["tier"] == "qwen-gpu")
         self.assertEqual(row["verdict"], "estimated-fit")
         self.assertFalse(row["selectable"] or row["installable"])
+
+    def test_base_uses_measured_profile_and_requires_synthetic_reference(self):
+        def inspect_request(request, task):
+            base = next(row for row in request["models"]
+                        if row["id"] == tiers.QWEN_BASE_ID + "-cuda")
+            self.assertEqual((base["backend"], base["runtime_supported"]),
+                             ("cuda", True))
+            return provider(request, task)
+        result = self.report(run=inspect_request)
+        row = next(row for row in result["candidates"] if row["tier"] == "qwen-base-gpu")
+        self.assertEqual(row["verdict"], "estimated-fit")
+        with self.assertRaises(tiers.sizing.SizerError):
+            tiers.select(SimpleNamespace(tier="qwen-base-gpu", voice="Ryan"), result)
 
     def test_missing_piper_model_can_be_selected_for_first_use(self):
         available = self.availability()
@@ -149,13 +167,24 @@ class TierTests(unittest.TestCase):
             (root / "config.json").write_text("[]")
             self.assertFalse(tiers.qwen_installed())
 
+    def test_base_weights_require_base_config(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(tiers, "qwen_directory", return_value=Path(temp)):
+            root = Path(temp)
+            (root / "config.json").write_text(json.dumps({"tts_model_type": "base"}))
+            (root / "model.safetensors").touch()
+            (root / "speech_tokenizer").mkdir()
+            (root / "speech_tokenizer/model.safetensors").touch()
+            self.assertTrue(tiers.qwen_installed(tiers.QWEN_BASE_ID))
+            self.assertFalse(tiers.qwen_installed())
+
     def test_list_does_not_start_session_or_change_settings(self):
         tool = load_tool()
         with patch.object(tiers, "report", return_value=self.report()), \
                 patch.object(tool.settings, "update") as save, \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(tool.main(["--tiers", "--json"]), 0)
-            self.assertEqual(len(json.loads(output.getvalue())["candidates"]), 5)
+            self.assertEqual(len(json.loads(output.getvalue())["candidates"]), 6)
             save.assert_not_called()
 
     def test_conflicting_cli_flags_refused_before_probing(self):
@@ -215,6 +244,24 @@ class TierTests(unittest.TestCase):
         first_use.assert_called_once_with(tiers.QWEN_ID)
         provider_install.assert_not_called()
         self.assertEqual(session.call_args.args[0].device, "cpu")
+
+    def test_cli_installs_base_weights_after_fit_and_selects_synthetic_reference(self):
+        from voicelib import interactive, qwen_setup
+        tool = load_tool()
+        before_availability = self.availability()
+        before_availability["qwen-base-gpu"] = (False, True, "weights missing")
+        before = self.report(before_availability)
+        after = self.report()
+        with patch.object(tiers, "report", side_effect=[before, after]), \
+                patch.object(qwen_setup, "install", return_value="/content/model") as first_use, \
+                patch.object(tool.sys.stdin, "isatty", return_value=True), \
+                patch.object(tool.sys.stdout, "isatty", return_value=True), \
+                patch.object(interactive, "run", return_value=0) as session:
+            self.assertEqual(tool.main(["--interactive", "--tier", "qwen-base-gpu"]), 0)
+        first_use.assert_called_once_with(tiers.QWEN_BASE_ID)
+        args = session.call_args.args[0]
+        self.assertTrue(args.synthetic_reference)
+        self.assertEqual(args.qwen_model_dir, str(tiers.qwen_directory(tiers.QWEN_BASE_ID)))
 
     def test_insufficient_memory_refuses_before_piper_install(self):
         from voicelib import qwen_setup

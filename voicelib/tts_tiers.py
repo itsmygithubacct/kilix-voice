@@ -14,27 +14,32 @@ import sys
 from . import paths, sizing, tts, util
 
 QWEN_ID = "qwen3-tts-0.6b-customvoice"
+QWEN_BASE_ID = "qwen3-tts-0.6b-base"
 TIERS = (
     ("minimal", "eSpeak", "espeak", "cpu"),
     ("small", "MBROLA us1", "mbrola", "cpu"),
     ("neural", "Piper Kristin medium", "piper-en-us-kristin-medium", "cpu"),
     ("qwen-cpu", "Qwen 0.6B CustomVoice", QWEN_ID + "-cpu", "cpu"),
     ("qwen-gpu", "Qwen 0.6B CustomVoice / FlashAttention 2", QWEN_ID + "-cuda", "cuda"),
+    ("qwen-base-gpu", "Qwen 0.6B Base / synthetic reference", QWEN_BASE_ID + "-cuda", "cuda"),
 )
 TIER_IDS = tuple(row[0] for row in TIERS)
 
 
-def qwen_directory() -> Path:
-    return Path(paths.gpu_terminal_home()) / "tts-auditions/content/assets" / QWEN_ID / "model"
+def qwen_directory(model_id: str = QWEN_ID) -> Path:
+    if model_id not in (QWEN_ID, QWEN_BASE_ID):
+        raise ValueError("unknown Qwen audition model")
+    return Path(paths.gpu_terminal_home()) / "tts-auditions/content/assets" / model_id / "model"
 
 
-def qwen_installed() -> bool:
-    root = qwen_directory()
+def qwen_installed(model_id: str = QWEN_ID) -> bool:
+    root = qwen_directory() if model_id == QWEN_ID else qwen_directory(model_id)
     try:
         if (root / "config.json").stat().st_size > 1024 * 1024:
             return False
         config = json.loads((root / "config.json").read_text())
-        return (isinstance(config, dict) and config.get("tts_model_type") == "custom_voice"
+        kind = "base" if model_id == QWEN_BASE_ID else "custom_voice"
+        return (isinstance(config, dict) and config.get("tts_model_type") == kind
                 and (root / "model.safetensors").is_file()
                 and (root / "speech_tokenizer/model.safetensors").is_file())
     except (OSError, ValueError):
@@ -71,34 +76,38 @@ def availability() -> dict:
     piper, detail = tts.piper_status(budget=3)
     qwen, gpu = qwen_runtime()
     weights = qwen_installed()
+    base_weights = qwen_installed(QWEN_BASE_ID)
     return {
         "minimal": (espeak, espeak, "install espeak-ng"),
         "small": (mbrola, mbrola, "install espeak-ng, mbrola and the us1 voice"),
         "neural": (piper, bool(tts.piper_binary()), detail),
         "qwen-cpu": (weights, qwen, "needs installed 0.6B CustomVoice weights and this Python's qwen-tts runtime"),
         "qwen-gpu": (weights, gpu, "needs installed weights, CUDA PyTorch, working FlashAttention 2 and an unmasked Ampere+ GPU 0"),
+        "qwen-base-gpu": (base_weights, gpu and espeak,
+                          "needs installed 0.6B Base weights, eSpeak, CUDA PyTorch, FlashAttention 2 and an unmasked Ampere+ GPU 0"),
     }
 
 
 def report() -> dict:
     available = availability()
     request = {"schema": sizing.REQUEST_SCHEMA, "models": [
-        {"id": "audition-" + model, "task": "tts", "backend": backend,
+        {"id": model if tier == "qwen-base-gpu" else "audition-" + model,
+         "task": "tts", "backend": backend,
          "installed": available[tier][0],
          # Qwen runtimes can be installed after a hardware-only fit check.
          # The installed dependency probes below still gate selection and
          # first-use weight acquisition; the GPU installer also checks Ampere+.
-         "runtime_supported": True if tier in ("qwen-cpu", "qwen-gpu")
+         "runtime_supported": True if tier in ("qwen-cpu", "qwen-gpu", "qwen-base-gpu")
          else available[tier][1]}
         for tier, _, model, backend in TIERS]}
     result = sizing.recommend_request(request, "tts")
     candidates = {row["id"]: row for row in result["candidates"]}
     for tier, label, model, backend in TIERS:
-        row = candidates["audition-" + model]
+        row = candidates[model if tier == "qwen-base-gpu" else "audition-" + model]
         installed, runtime, detail = available[tier]
         correct_gpu = backend != "cuda" or row.get("budget", {}).get("gpu_index") == 0
         selectable = installed and runtime and correct_gpu and row["verdict"] == "estimated-fit"
-        installable = tier in ("neural", "qwen-cpu", "qwen-gpu") \
+        installable = tier in ("neural", "qwen-cpu", "qwen-gpu", "qwen-base-gpu") \
             and not installed and runtime and correct_gpu and row["verdict"] == "estimated-fit"
         reason = ("ready (reference-workload estimate)" if selectable else detail if not installed or not runtime
                   else "sizer assessed a different GPU; only physical GPU 0 is supported" if not correct_gpu
@@ -117,9 +126,14 @@ def select(args, result: dict) -> None:
         raise sizing.SizerError(f"Tier {args.tier} unavailable: {row['availability_detail']}")
     _, _, model, backend = next(tier for tier in TIERS if tier[0] == args.tier)
     if args.tier.startswith("qwen-"):
-        args.qwen_model_dir = str(qwen_directory())
+        if args.tier == "qwen-base-gpu" and args.voice is not None:
+            raise sizing.SizerError("Qwen Base uses a fixed synthetic reference; omit --voice")
+        args.qwen_model_dir = str(qwen_directory(QWEN_BASE_ID) if args.tier == "qwen-base-gpu"
+                                 else qwen_directory())
         args.device = "cpu" if backend == "cpu" else "cuda:0"
         args.attention = "sdpa" if backend == "cpu" else "flash_attention_2"
+        if args.tier == "qwen-base-gpu":
+            args.synthetic_reference = True
     else:
         args.model = model
         if args.tier == "small" and args.voice is None:
