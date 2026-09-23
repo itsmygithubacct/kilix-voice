@@ -83,8 +83,9 @@ class ResidentPocket:
         if not text.strip() or len(text.encode("utf-8")) > 16384:
             raise tts.TtsError("enter between 1 and 16384 UTF-8 bytes of text")
         self.torch.manual_seed(self.seed)
-        with self.torch.inference_mode():
-            wave = self.model.generate_audio(self.state, text)
+        # Pocket applies no_grad itself and hands mutable state to worker threads.
+        # Inference mode is thread-local; its tensors cannot be updated there.
+        wave = self.model.generate_audio(self.state, text)
         samples = wave.detach().cpu().numpy()
         if samples.ndim == 2 and samples.shape[0] == 1:
             samples = samples[0]

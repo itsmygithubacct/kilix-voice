@@ -4,6 +4,7 @@ import importlib.util
 import io
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -69,6 +70,38 @@ class PocketTests(unittest.TestCase):
             model.get_state_for_audio_prompt.assert_called_once_with(
                 root / "embeddings/alba.safetensors")
             self.assertEqual(engine.voices(), ["Alba"])
+
+    @unittest.skipUnless(importlib.util.find_spec("torch"), "PyTorch runtime not installed")
+    def test_generation_state_can_be_updated_by_pocket_worker_thread(self):
+        import numpy as np
+        import torch
+
+        def generate_audio(_state, _text):
+            # Pocket creates state on the caller thread, then updates it from
+            # an autoregressive worker. Inference-mode tensors reject that.
+            state = torch.zeros(1)
+            errors = []
+
+            def update_state():
+                try:
+                    state.add_(1)
+                except RuntimeError as error:
+                    errors.append(error)
+
+            worker = threading.Thread(target=update_state)
+            worker.start()
+            worker.join()
+            if errors:
+                raise errors[0]
+            return state.repeat(240)
+
+        engine = object.__new__(pocket.ResidentPocket)
+        engine.np, engine.torch, engine.seed = np, torch, 0
+        engine.model = mock.Mock(sample_rate=24000, generate_audio=generate_audio)
+        engine.state = object()
+        pcm, rate = engine.synth("hi")
+        self.assertEqual(rate, 24000)
+        self.assertEqual(len(pcm), 480)
 
     def test_cli_requires_interactive_and_exclusive_engine(self):
         tool = load_tool()
