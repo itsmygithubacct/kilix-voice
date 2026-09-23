@@ -46,6 +46,23 @@ class PocketTests(unittest.TestCase):
         with self.assertRaisesRegex(tts.TtsError, "only the licensed Alba"):
             pocket.ResidentPocket("/missing", voice="other")
 
+    def test_interactive_recovers_from_pocket_generation_failure(self):
+        engine = mock.Mock(name="pocket-engine")
+        engine.name, engine.voice = "Pocket", "Alba"
+        engine.synth.side_effect = [RuntimeError("worker failed"), (b"\x00\x00" * 240, 24000)]
+        player = mock.Mock(error=None)
+        player.wait.return_value = True
+        messages = []
+        self.assertEqual(interactive.run(options(pocket_model_dir="/fixture"),
+                                         read=mock.Mock(side_effect=["first", "second", "/quit"]),
+                                         emit=messages.append,
+                                         engine_factory=mock.Mock(return_value=engine),
+                                         player_factory=lambda _: player), 0)
+        self.assertIn("Error: worker failed", messages)
+        engine.synth.assert_has_calls([mock.call("first"), mock.call("second")])
+        player.play.assert_called_once()
+        engine.close.assert_called_once()
+
     @unittest.skipUnless(importlib.util.find_spec("pocket_tts"), "Pocket runtime not installed")
     def test_local_config_and_python_api(self):
         import yaml

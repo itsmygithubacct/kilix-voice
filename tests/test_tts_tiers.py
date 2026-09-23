@@ -26,7 +26,7 @@ class TierTests(unittest.TestCase):
                 patch.object(tiers.sizing, "recommend_request", side_effect=run):
             return tiers.report()
 
-    def test_all_six_tiers_are_explicitly_selectable(self):
+    def test_all_seven_tiers_are_explicitly_selectable(self):
         result = self.report()
         self.assertEqual([row["tier"] for row in result["candidates"]], list(tiers.TIER_IDS))
         for row in result["candidates"]:
@@ -42,6 +42,9 @@ class TierTests(unittest.TestCase):
                                  str(tiers.qwen_directory(tiers.QWEN_BASE_ID)))
             elif args.tier == "qwen-cpu":
                 self.assertEqual((args.device, args.attention), ("cpu", "sdpa"))
+            elif args.tier == "pocket-cpu":
+                self.assertEqual((args.pocket_model_dir, args.voice),
+                                 (str(tiers.pocket_directory()), "Alba"))
             elif args.tier == "small":
                 self.assertEqual((args.model, args.voice), ("mbrola", "us1"))
 
@@ -61,6 +64,40 @@ class TierTests(unittest.TestCase):
         for installed, runtime in ((False, True), (True, False), (False, False)):
             result = self.report({key: (installed, runtime, "missing") for key in tiers.TIER_IDS})
             self.assertTrue(all(not row["selectable"] for row in result["candidates"]))
+
+    def test_pocket_fit_visible_before_runtime_and_first_use_requires_it(self):
+        available = self.availability()
+        available["pocket-cpu"] = (False, False, "runtime missing")
+        def inspect(request, task):
+            pocket = next(row for row in request["models"]
+                          if row["id"] == "audition-pocket-tts-english-python-alba-cpu")
+            self.assertTrue(pocket["runtime_supported"])
+            return provider(request, task)
+        row = next(row for row in self.report(available, inspect)["candidates"]
+                   if row["tier"] == "pocket-cpu")
+        self.assertFalse(row["selectable"] or row["installable"])
+        available["pocket-cpu"] = (False, True, "weights missing")
+        row = next(row for row in self.report(available)["candidates"]
+                   if row["tier"] == "pocket-cpu")
+        self.assertTrue(row["installable"])
+
+    def test_pocket_tier_rejects_other_voice_before_install(self):
+        result = self.report()
+        for overrides in ({"voice": "Ryan"}, {"rate": 150}, {"language": "English"}):
+            args = SimpleNamespace(tier="pocket-cpu", voice=None, rate=None, language=None)
+            vars(args).update(overrides)
+            with self.assertRaises(tiers.sizing.SizerError):
+                tiers.select(args, result)
+
+    def test_pocket_weight_probe_checks_all_pinned_sizes_without_hashing(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(tiers, "pocket_directory", return_value=Path(temp)), \
+                patch.object(tiers.pocket, "PINNED", {"model.safetensors": (3, "digest")}):
+            self.assertFalse(tiers.pocket_installed())
+            (Path(temp) / "model.safetensors").write_bytes(b"abc")
+            self.assertTrue(tiers.pocket_installed())
+            (Path(temp) / "model.safetensors").write_bytes(b"ab")
+            self.assertFalse(tiers.pocket_installed())
 
     def test_cpu_fit_remains_visible_before_lazy_runtime_install(self):
         available = self.availability()
@@ -184,7 +221,7 @@ class TierTests(unittest.TestCase):
                 patch.object(tool.settings, "update") as save, \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(tool.main(["--tiers", "--json"]), 0)
-            self.assertEqual(len(json.loads(output.getvalue())["candidates"]), 6)
+            self.assertEqual(len(json.loads(output.getvalue())["candidates"]), 7)
             save.assert_not_called()
 
     def test_conflicting_cli_flags_refused_before_probing(self):
@@ -226,6 +263,35 @@ class TierTests(unittest.TestCase):
         first_use.assert_called_once_with(qwen_setup.PIPER_ID)
         provider_install.assert_called_once_with(qwen_setup.PIPER_ID)
         session.assert_called_once()
+
+    def test_cli_installs_pocket_only_after_fit_and_rechecks(self):
+        from voicelib import interactive, qwen_setup
+        tool = load_tool()
+        before_availability = self.availability()
+        before_availability["pocket-cpu"] = (False, True, "weights missing")
+        before = self.report(before_availability)
+        after = self.report()
+        with patch.object(tiers, "report", side_effect=[before, after]), \
+                patch.object(qwen_setup, "install", return_value="/content/model") as first_use, \
+                patch.object(tool.sys.stdin, "isatty", return_value=True), \
+                patch.object(tool.sys.stdout, "isatty", return_value=True), \
+                patch.object(interactive, "run", return_value=0) as session:
+            self.assertEqual(tool.main(["--interactive", "--tier", "pocket-cpu"]), 0)
+        first_use.assert_called_once_with(qwen_setup.POCKET_ID)
+        self.assertEqual(session.call_args.args[0].voice, "Alba")
+
+    def test_pocket_tier_decline_does_not_start_session(self):
+        from voicelib import interactive, qwen_setup
+        tool = load_tool()
+        available = self.availability()
+        available["pocket-cpu"] = (False, True, "weights missing")
+        with patch.object(tiers, "report", return_value=self.report(available)), \
+                patch.object(qwen_setup, "install", side_effect=qwen_setup.Declined("Quit")), \
+                patch.object(tool.sys.stdin, "isatty", return_value=True), \
+                patch.object(tool.sys.stdout, "isatty", return_value=True), \
+                patch.object(interactive, "run") as session:
+            self.assertEqual(tool.main(["--interactive", "--tier", "pocket-cpu"]), 0)
+        session.assert_not_called()
 
     def test_cli_installs_qwen_weights_only_after_fit_and_rechecks(self):
         from voicelib import interactive, qwen_setup

@@ -1353,6 +1353,9 @@ def main(argv: list[str] | None = None) -> int:
                 if args.tier == "neural":
                     qwen_setup.install(qwen_setup.PIPER_ID)
                     print(_install_model(qwen_setup.PIPER_ID), flush=True)
+                elif args.tier == "pocket-cpu":
+                    print(f"Installed {qwen_setup.POCKET_ID}: "
+                          f"{qwen_setup.install(qwen_setup.POCKET_ID)}", flush=True)
                 else:
                     qwen_id = (tts_tiers.QWEN_BASE_ID if args.tier == "qwen-base-gpu"
                                else tts_tiers.QWEN_ID)

@@ -50,6 +50,11 @@ conditioning in memory. This tests Base synthesis without cloning a person's
 voice; its timbre is not representative of CustomVoice presets. VoiceDesign
 is downloadable below but is not yet supported by the interactive session.
 
+For the 0.2.2 interactive scope, only the measured 0.6B CustomVoice and 0.6B
+Base paths are selectable. VoiceDesign remains download-only; 1.7B Base and
+CustomVoice have no admitted catalog asset or resource profile. None of these
+interactive Qwen paths is a qualified daemon provider or a read-aloud default.
+
 Add `--speak "Hello from Kilix."` to run one greeting before the prompt.
 `/save example.wav` writes the most recent completed clip and refuses an
 existing file or symlink. A cancelled generation keeps the previous good clip.
@@ -98,7 +103,8 @@ For `qwen3-tts-0.6b-base`, add `--synthetic-reference` instead of `--voice`.
 ## Hardware-aware audition tiers
 
 `kilix-tts --tiers` lists `minimal` (eSpeak), `small` (MBROLA us1),
-`neural` (Piper Kristin medium), `qwen-cpu` (0.6B CustomVoice float32/SDPA),
+`neural` (Piper Kristin medium), `pocket-cpu` (Pocket English / Alba),
+`qwen-cpu` (0.6B CustomVoice float32/SDPA),
 and `qwen-gpu` (0.6B CustomVoice bfloat16/FlashAttention 2).
 Add `--json` for evidence, memory budgets and availability reasons.
 
@@ -121,6 +127,10 @@ existing verified environment can instead be selected by setting
 and runtime availability before offering missing weights. The tier also requires
 physical GPU 0 without CUDA device remapping; it refuses a budget for another
 GPU. Explicit `--qwen-model-dir` remains an expert path outside tier gating.
+`kilix tts --interactive --tier pocket-cpu` checks the measured CPU/RAM fit
+before lazily installing its locked runtime. Missing Alba weights use the same
+first-use licence screen and pinned Content download. The selected tier opens
+the resident Pocket session without changing shared read-aloud settings.
 `qwen-base-gpu` shares that runtime but uses the separately measured 0.6B Base
 GPU profile and a fixed synthetic eSpeak reference. It has no CPU tier until a
 CPU Base resource profile is measured; the CustomVoice CPU estimate is not
