@@ -1288,6 +1288,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="interactive only: select an installed, estimated-fit audition tier")
     parser.add_argument("--qwen-model-dir", metavar="DIR",
                         help="interactive only: audition existing local Qwen weights offline")
+    parser.add_argument("--pocket-model-dir", metavar="DIR",
+                        help="interactive only: audition pinned local Pocket CPU weights and Alba preset offline")
     parser.add_argument("--device", choices=("cpu", "cuda:0"), default="cpu",
                         help="resident Qwen device (default: cpu; never auto-selects GPU)")
     parser.add_argument("--attention", choices=("sdpa", "flash_attention_2"), default="sdpa",
@@ -1330,7 +1332,7 @@ def main(argv: list[str] | None = None) -> int:
             parser.exit(1, f"kilix-tts: {error}\n")
         return 0
     if args.tier:
-        if (not args.interactive or args.model or args.qwen_model_dir or args.download_qwen
+        if (not args.interactive or args.model or args.qwen_model_dir or args.pocket_model_dir or args.download_qwen
                 or args.synthetic_reference or args.device != "cpu" or args.attention != "sdpa"
                 or args.set or args.show or args.status or args.models or args.install
                 or args.check_licence or args.section is not None or args.output):
@@ -1364,7 +1366,7 @@ def main(argv: list[str] | None = None) -> int:
                 parser.exit(1, f"kilix-tts: {error}\n")
 
     if args.download_qwen and not args.interactive:
-        if (args.qwen_model_dir or args.synthetic_reference
+        if (args.qwen_model_dir or args.pocket_model_dir or args.synthetic_reference
                 or args.speak is not None or args.model or args.voice or args.rate
                 or args.output or args.set or args.show or args.status or args.models
                 or args.install or args.check_licence or args.section is not None
@@ -1390,12 +1392,20 @@ def main(argv: list[str] | None = None) -> int:
     qwen_options = (args.qwen_model_dir or args.synthetic_reference or args.language
                     or args.device != "cpu" or args.attention != "sdpa"
                     or args.threads != 4 or args.seed != 0)
-    if qwen_options and not (args.interactive and (args.qwen_model_dir or args.download_qwen)):
+    if args.pocket_model_dir and not args.interactive:
+        parser.error("--pocket-model-dir requires --interactive")
+    if qwen_options and not (args.interactive and (args.qwen_model_dir or args.download_qwen
+                                                  or args.pocket_model_dir)):
         parser.error("Qwen session options require --interactive with --qwen-model-dir or --download-qwen")
     if args.interactive:
         if (args.set or args.show or args.status or args.models or args.install
                 or args.check_licence or args.section is not None or args.output):
             parser.error("--interactive is standalone; use /save FILE.wav in the session")
+        if args.pocket_model_dir:
+            if (args.qwen_model_dir or args.download_qwen or args.model or args.rate
+                    or args.synthetic_reference or args.language or args.device != "cpu"
+                    or args.attention != "sdpa"):
+                parser.error("Pocket CPU cannot be combined with another engine or Qwen options")
         if (args.qwen_model_dir or args.download_qwen) and (args.model or args.rate):
             parser.error("resident Qwen cannot be combined with --model or --rate")
         if args.attention == "flash_attention_2" and args.device == "cpu":

@@ -167,7 +167,13 @@ def run(args, *, read=input, emit=print, engine_factory=None, player_factory=Non
     last = None
     try:
         emit("Kilix TTS interactive — foreground playback; shared settings unchanged.")
-        if args.qwen_model_dir:
+        if getattr(args, "pocket_model_dir", None):
+            emit("Loading verified local Pocket TTS on CPU; first load may take a while…")
+            from .pocket import ResidentPocket
+            factory = engine_factory or ResidentPocket
+            engine = factory(args.pocket_model_dir, voice=args.voice,
+                             threads=args.threads, seed=args.seed)
+        elif args.qwen_model_dir:
             emit(f"Loading local Qwen on {args.device} with {args.attention}; first load may take a while…")
             if args.synthetic_reference:
                 emit("Base audition: synthetic eSpeak reference, not a human voice or a preset voice.")
@@ -202,7 +208,7 @@ def run(args, *, read=input, emit=print, engine_factory=None, player_factory=Non
                     continue
                 if line.startswith("/voice "):
                     value = line[7:].strip()
-                    if args.qwen_model_dir:
+                    if args.qwen_model_dir or getattr(args, "pocket_model_dir", None):
                         engine.set_voice(value)
                     else:
                         replacement = factory(model=args.model, voice=value, rate=args.rate)
