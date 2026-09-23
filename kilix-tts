@@ -1340,13 +1340,18 @@ def main(argv: list[str] | None = None) -> int:
             tts_tiers.select(args, tier_report)
         except tts_tiers.sizing.SizerError as error:
             parser.exit(1, f"kilix-tts: {error}\n")
-        if args.tier == "neural" and next(row for row in tier_report["candidates"]
-                                          if row["tier"] == "neural")["installable"]:
+        selected_row = next(row for row in tier_report["candidates"]
+                            if row["tier"] == args.tier)
+        if selected_row["installable"]:
             if not sys.stdin.isatty() or not sys.stdout.isatty():
-                parser.error("Piper first-use installation requires a terminal")
+                parser.error("TTS first-use installation requires a terminal")
             try:
-                qwen_setup.install(qwen_setup.PIPER_ID)
-                print(_install_model(qwen_setup.PIPER_ID), flush=True)
+                if args.tier == "neural":
+                    qwen_setup.install(qwen_setup.PIPER_ID)
+                    print(_install_model(qwen_setup.PIPER_ID), flush=True)
+                else:
+                    print(f"Installed {tts_tiers.QWEN_ID}: "
+                          f"{qwen_setup.install(tts_tiers.QWEN_ID)}", flush=True)
                 tts_tiers.select(args, tts_tiers.report())
             except qwen_setup.Declined as error:
                 print(error)

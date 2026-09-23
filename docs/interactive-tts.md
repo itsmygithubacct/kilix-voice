@@ -107,10 +107,17 @@ checks current headroom again. Listing loads no weights. If Piper's runtime is
 available but its model is missing, the selection shows the full licence and
 waits for a fresh keypress before the checksum-pinned installation. Press `q`
 to leave without installing. On the installed Kilix desktop, `kilix tts`
-installs the pinned Piper runtime only on first Piper selection. Unavailable
-tiers remain visible. Qwen tiers use the existing Content audition store and
-the **current Python interpreter's** Qwen dependencies; run this command with
-the Python from the isolated Qwen environment. The GPU tier currently requires
+installs the pinned Piper runtime only on first Piper selection. On x86_64
+Debian, `kilix tts --interactive --tier qwen-cpu` similarly installs the locked
+CPU runtime on first selection; if weights are missing, it then presents their
+licence and downloads them only after a keypress. This can use several GiB of
+disk and CPU synthesis may take about a minute for a short sentence. Unavailable
+tiers remain visible. Direct `kilix-tts` Qwen use still requires its **current
+Python interpreter** to contain the Qwen dependencies. The GPU tier requires
+an independently provisioned CUDA/FlashAttention runtime. For the installed
+Kilix command, set `KILIX_QWEN_GPU_PYTHON` to that environment's absolute
+Python path before selecting `qwen-gpu`; Kilix still verifies fit and runtime
+availability before offering missing weights. The tier also requires
 physical GPU 0 without CUDA device remapping; it refuses a budget for another
 GPU. Explicit `--qwen-model-dir` remains an expert path outside tier gating.
 
@@ -118,10 +125,9 @@ Install the shared `plebian-model-sizer` with the dated audition profiles, or
 set `PLEBIAN_MODEL_SIZER` to its executable. Kilix Voice delegates fit math
 to that provider: reference peak RAM/VRAM plus 20%, with 256 MiB kept free in
 each memory pool. Unknown headroom and unsupported hardware cannot become a
-selectable tier. Missing Qwen weights remain unavailable until a separate
-first-use download. Piper's missing weights are offered only when its runtime
-and memory fit. Disk acquisition costs remain unknown; installation still
-needs an explicit interactive Piper selection and licence acceptance.
+selectable tier. Missing Qwen or Piper weights are offered for first-use only
+when their runtime and memory fit. Disk acquisition costs remain unknown;
+installation still needs explicit interactive selection and licence acceptance.
 
 These development profiles measure one short sentence, not maximum prompt
 length or speech quality. Piper's measurement uses its direct engine API;

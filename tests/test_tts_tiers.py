@@ -57,6 +57,14 @@ class TierTests(unittest.TestCase):
             result = self.report({key: (installed, runtime, "missing") for key in tiers.TIER_IDS})
             self.assertTrue(all(not row["selectable"] for row in result["candidates"]))
 
+    def test_cpu_fit_remains_visible_before_lazy_runtime_install(self):
+        available = self.availability()
+        available["qwen-cpu"] = (False, False, "runtime missing")
+        result = self.report(available)
+        row = next(row for row in result["candidates"] if row["tier"] == "qwen-cpu")
+        self.assertEqual(row["verdict"], "estimated-fit")
+        self.assertFalse(row["selectable"] or row["installable"])
+
     def test_missing_piper_model_can_be_selected_for_first_use(self):
         available = self.availability()
         available["neural"] = (False, True, "model missing")
@@ -70,6 +78,20 @@ class TierTests(unittest.TestCase):
             available["neural"] = (*unavailable, "unavailable")
             self.assertFalse(next(row for row in self.report(available)["candidates"]
                                   if row["tier"] == "neural")["installable"])
+
+    def test_missing_qwen_weights_can_be_selected_only_with_ready_runtime(self):
+        available = self.availability()
+        available["qwen-cpu"] = (False, True, "weights missing")
+        result = self.report(available)
+        row = next(row for row in result["candidates"] if row["tier"] == "qwen-cpu")
+        self.assertTrue(row["installable"])
+        args = SimpleNamespace(tier="qwen-cpu", voice=None)
+        tiers.select(args, result)
+        self.assertEqual(args.qwen_model_dir, str(tiers.qwen_directory()))
+        available["qwen-cpu"] = (False, False, "runtime missing")
+        row = next(row for row in self.report(available)["candidates"]
+                   if row["tier"] == "qwen-cpu")
+        self.assertFalse(row["installable"])
 
     def test_other_gpu_budget_not_used_for_gpu_zero(self):
         def run(request, task):
@@ -163,6 +185,24 @@ class TierTests(unittest.TestCase):
         first_use.assert_called_once_with(qwen_setup.PIPER_ID)
         provider_install.assert_called_once_with(qwen_setup.PIPER_ID)
         session.assert_called_once()
+
+    def test_cli_installs_qwen_weights_only_after_fit_and_rechecks(self):
+        from voicelib import interactive, qwen_setup
+        tool = load_tool()
+        before_availability = self.availability()
+        before_availability["qwen-cpu"] = (False, True, "weights missing")
+        before = self.report(before_availability)
+        after = self.report()
+        with patch.object(tiers, "report", side_effect=[before, after]), \
+                patch.object(qwen_setup, "install", return_value="/content/model") as first_use, \
+                patch.object(tool, "_install_model") as provider_install, \
+                patch.object(tool.sys.stdin, "isatty", return_value=True), \
+                patch.object(tool.sys.stdout, "isatty", return_value=True), \
+                patch.object(interactive, "run", return_value=0) as session:
+            self.assertEqual(tool.main(["--interactive", "--tier", "qwen-cpu"]), 0)
+        first_use.assert_called_once_with(tiers.QWEN_ID)
+        provider_install.assert_not_called()
+        self.assertEqual(session.call_args.args[0].device, "cpu")
 
     def test_insufficient_memory_refuses_before_piper_install(self):
         from voicelib import qwen_setup

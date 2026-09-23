@@ -248,6 +248,10 @@ weights on first selection after showing the licence and waiting for a keypress.
 On a fresh Kilix installation, `kilix tts --interactive --tier neural` also
 installs the pinned Piper runtime on demand. Neither listing nor selecting a
 different tier starts a Piper download.
+`kilix tts --interactive --tier qwen-cpu` lazily installs a locked CPU runtime
+on x86_64 Debian, then offers the catalogued 0.6B model after its first-use
+licence notice. The GPU tier remains an explicit local CUDA/FlashAttention
+audition, not an automatic install or fallback.
 `python3 bench/tts_reply.py --output new-result.json` measures cold and warm
 Piper prompt-to-playable-audio reply time through the Kilix provider path.
 The new first-use tests also require a 0.2.2 `kilix-content` source tree; pass

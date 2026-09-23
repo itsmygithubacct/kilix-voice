@@ -84,7 +84,11 @@ def report() -> dict:
     available = availability()
     request = {"schema": sizing.REQUEST_SCHEMA, "models": [
         {"id": "audition-" + model, "task": "tts", "backend": backend,
-         "installed": available[tier][0], "runtime_supported": available[tier][1]}
+         "installed": available[tier][0],
+         # The CPU backend can be installed lazily on supported architectures.
+         # The sizer assesses hardware; installed dependency probes still gate
+         # selectability and first-use weight acquisition below.
+         "runtime_supported": True if tier == "qwen-cpu" else available[tier][1]}
         for tier, _, model, backend in TIERS]}
     result = sizing.recommend_request(request, "tts")
     candidates = {row["id"]: row for row in result["candidates"]}
@@ -93,7 +97,8 @@ def report() -> dict:
         installed, runtime, detail = available[tier]
         correct_gpu = backend != "cuda" or row.get("budget", {}).get("gpu_index") == 0
         selectable = installed and runtime and correct_gpu and row["verdict"] == "estimated-fit"
-        installable = tier == "neural" and not installed and runtime and row["verdict"] == "estimated-fit"
+        installable = tier in ("neural", "qwen-cpu", "qwen-gpu") \
+            and not installed and runtime and correct_gpu and row["verdict"] == "estimated-fit"
         reason = ("ready (reference-workload estimate)" if selectable else detail if not installed or not runtime
                   else "sizer assessed a different GPU; only physical GPU 0 is supported" if not correct_gpu
                   else "resource estimate: " + row["verdict"])
