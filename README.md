@@ -72,6 +72,7 @@ kilix stt --install small-en-us                    # now installs
 | `small-en-us` | `vosk-model-small-en-us-0.15` |
 | `lgraph-en-us` | `vosk-model-en-us-0.22-lgraph` |
 | `piper-en-us-kristin-medium` | `piper-en-us-kristin-medium` |
+| `qwen3-tts-0.6b-customvoice` | `qwen3-tts-0.6b-customvoice` |
 | `vibevoice-asr-bitnet` | `vibevoice-asr-bitnet` |
 
 The two sides are bound by the licence record, not by either id: each asset
@@ -193,8 +194,8 @@ printf '%s\n' "Text from an agent" | \
 
 `kilix-tts --speak` returns as soon as `kilix-voiced` accepts the turn; speech
 continues in the background and a new turn replaces it. `--model espeak`,
-`--model mbrola`, and `--model piper-en-us-kristin-medium` are the registered
-local model families. A request
+`--model mbrola`, `--model piper-en-us-kristin-medium`, and
+`--model qwen3-tts-0.6b-customvoice` are the registered local model families. A request
 may also override the voice and one of the shared WPM presets without changing
 the saved read-aloud settings. Model IDs are catalogued: callers cannot supply
 an executable, model path, URL, or download action. An explicit MBROLA request
@@ -205,6 +206,13 @@ inference. `--install piper-en-us-kristin-medium` is a separate explicit
 network action delegated to the checksum-pinned `kilix-piper-tts` catalog;
 listing models, opening the TUI, and speaking with other engines never
 download it.
+Qwen is an explicit candidate only: `--model qwen3-tts-0.6b-customvoice`
+requires the `kilix-qwen-tts` Python client in the daemon's interpreter and
+a running local provider with that model installed through `kilix-content`
+and its licence receipt. It does not fetch weights or start a provider.
+Its default named voice is `Vivian`; `--voice` selects a provider voice ID,
+and `--rate` is unsupported. It is not a saved default or a release-qualified
+runtime yet.
 When running from a source checkout, start `./kilix-voiced` first; the main
 `kilix speak` wrapper starts an installed daemon on demand.
 

@@ -25,7 +25,9 @@ ENGINE_CHOICES = (ENGINE_VOSK, ENGINE_VIBEVOICE, ENGINE_OFF)
 TTS_ENGINE_ESPEAK = "espeak"
 TTS_ENGINE_MBROLA = "mbrola"
 TTS_ENGINE_PIPER = "piper"
+TTS_ENGINE_QWEN = "qwen"
 PIPER_KRISTIN_MODEL = "piper-en-us-kristin-medium"
+QWEN_CUSTOMVOICE_MODEL = "qwen3-tts-0.6b-customvoice"
 
 
 class ModelSpec(NamedTuple):
@@ -116,6 +118,13 @@ TTS_MODELS = (
         "local neural US English speech through the isolated persistent "
         "Piper provider and its pinned Kristin medium voice",
     ),
+    TtsModelSpec(
+        QWEN_CUSTOMVOICE_MODEL,
+        TTS_ENGINE_QWEN,
+        True,
+        "explicit local Qwen named-voice synthesis through a receipt-backed "
+        "provider; candidate, not release qualified",
+    ),
 )
 
 TTS_MODEL_BY_ID = {spec.catalog_id: spec for spec in TTS_MODELS}
@@ -157,10 +166,12 @@ __all__ = [
     "TTS_ENGINE_ESPEAK",
     "TTS_ENGINE_MBROLA",
     "TTS_ENGINE_PIPER",
+    "TTS_ENGINE_QWEN",
     "TTS_MODELS",
     "TTS_MODEL_BY_ID",
     "TTS_MODEL_IDS",
     "PIPER_KRISTIN_MODEL",
+    "QWEN_CUSTOMVOICE_MODEL",
     "TtsModelSpec",
     "engine_for_model",
     "tts_engine_for_model",

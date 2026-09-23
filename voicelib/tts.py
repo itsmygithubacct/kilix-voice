@@ -19,9 +19,12 @@ import re
 import subprocess
 import threading
 import time
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from . import models, paths, protocol, settings, util
+
+if TYPE_CHECKING:
+    from .qwen_provider import QwenProviderTts
 
 # espeak-ng writes 22.05 kHz mono at --stdout. The real rate always comes from
 # the WAV header; this is only what an empty clip is labelled with.
@@ -1074,7 +1077,7 @@ class PiperTts:
 
 def make_tts(cfg: dict | None = None, *, model: str | None = None,
              voice: str | None = None,
-             rate: int | None = None) -> NullTts | EspeakTts | PiperTts:
+             rate: int | None = None) -> NullTts | EspeakTts | PiperTts | QwenProviderTts:
     """Return the selected engine, with optional request-scoped overrides.
 
     Construction deliberately does not probe for espeak-ng: a missing
@@ -1096,6 +1099,9 @@ def make_tts(cfg: dict | None = None, *, model: str | None = None,
         return NullTts()
     if engine == models.TTS_ENGINE_PIPER:
         return PiperTts(voice=voice, rate=rate)
+    if engine == models.TTS_ENGINE_QWEN:
+        from .qwen_provider import QwenProviderTts
+        return QwenProviderTts(voice=voice, rate=rate)
     # settings.tts_engine() validates against the vocabulary, so anything that
     # is not "off" is espeak, with or without the mbrola tier on top.
     return EspeakTts(

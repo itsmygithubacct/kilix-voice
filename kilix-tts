@@ -1154,8 +1154,16 @@ def _print_models() -> None:
             detail = ("MBROLA runtime found; each requested voice must also "
                       "be installed" if available else
                       "install espeak-ng, mbrola, and an MBROLA voice package")
-        else:
+        elif spec.engine == models.TTS_ENGINE_PIPER:
             available, detail = tts_lib.piper_status()
+        else:
+            from voicelib.qwen_provider import QwenProviderTts
+            try:
+                QwenProviderTts().check_available()
+            except tts_lib.TtsError as error:
+                available, detail = False, str(error)
+            else:
+                available, detail = True, "receipt-backed local provider ready"
         print(
             f"model={spec.catalog_id} engine={spec.engine} "
             f"available={'yes' if available else 'no'} "

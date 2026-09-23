@@ -1433,7 +1433,8 @@ class Daemon:
             # fail where only the daemon's stderr can see it.
             tts_lib.build_synth_cmd(self._cfg, voice=engine.voice,
                                     rate=engine.rate)
-        elif isinstance(engine, tts_lib.PiperTts):
+        elif (isinstance(engine, tts_lib.PiperTts)
+              or getattr(engine, "name", None) == models.TTS_ENGINE_QWEN):
             # The provider status contract loads no model and starts no
             # service, but confirms both the isolated runtime and pinned
             # Kristin artifacts before this request is acknowledged.
