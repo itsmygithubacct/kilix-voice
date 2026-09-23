@@ -207,8 +207,9 @@ network action delegated to the checksum-pinned `kilix-piper-tts` catalog;
 listing models, opening the TUI, and speaking with other engines never
 download it.
 Qwen is an explicit candidate only: `--model qwen3-tts-0.6b-customvoice`
-requires the `kilix-qwen-tts` client executable on the daemon's `PATH` (or
-`KILIX_QWEN_TTS` pointing to it) and a running local provider with that model
+requires the `kilix-qwen-tts` client executable from Kilix's managed
+`voice/qwen-client/current` generation, the daemon's `PATH`, or
+`KILIX_QWEN_TTS`, and a running local provider with that model
 installed through `kilix-content`
 and its licence receipt. It does not fetch weights or start a provider.
 Its default named voice is `Vivian`; `--voice` selects a provider voice ID,

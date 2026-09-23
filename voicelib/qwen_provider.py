@@ -16,7 +16,7 @@ import subprocess
 import threading
 import time
 
-from . import models, protocol, util
+from . import models, paths, protocol, util
 from .tts import (SynthesisProvenance, TtsDeadlineExceeded, TtsError,
                   TtsUnsupported, _as_text, _bounded, _budget_cut)
 
@@ -33,7 +33,12 @@ class QwenBusy(TtsError):
 
 
 def provider_binary() -> str | None:
-    return util.which(os.environ.get("KILIX_QWEN_TTS", "kilix-qwen-tts"))
+    override = os.environ.get("KILIX_QWEN_TTS")
+    if override:
+        return util.which(override)
+    installed = os.path.join(paths.data_dir(), "qwen-client", "current", "bin",
+                             "kilix-qwen-tts")
+    return util.which(installed) or util.which("kilix-qwen-tts")
 
 
 class QwenProviderTts:

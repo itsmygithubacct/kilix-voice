@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from voicelib import models, protocol, tts
-from voicelib.qwen_provider import QwenProviderTts
+from voicelib.qwen_provider import QwenProviderTts, provider_binary
 
 
 CLIENT = '''#!/usr/bin/env python3
@@ -66,6 +66,13 @@ class QwenAdapterTests(unittest.TestCase):
             with self.assertRaises(tts.TtsError) as caught:
                 QwenProviderTts().check_available()
         self.assertIn("receipt-backed", str(caught.exception))
+
+    def test_managed_client_is_discovered_without_daemon_restart(self):
+        with patch.dict(os.environ, {"KILIX_QWEN_TTS": ""}), \
+                patch("voicelib.qwen_provider.paths.data_dir", return_value="/data/voice"), \
+                patch("voicelib.qwen_provider.util.which", side_effect=lambda path: path):
+            self.assertEqual(provider_binary(),
+                             "/data/voice/qwen-client/current/bin/kilix-qwen-tts")
 
     def test_unsupported_rate_and_voice(self):
         with self.assertRaises(tts.TtsUnsupported):
