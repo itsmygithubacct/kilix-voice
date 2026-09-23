@@ -65,6 +65,18 @@ class TierTests(unittest.TestCase):
         self.assertEqual(row["verdict"], "estimated-fit")
         self.assertFalse(row["selectable"] or row["installable"])
 
+    def test_gpu_fit_remains_visible_before_lazy_runtime_install(self):
+        available = self.availability()
+        available["qwen-gpu"] = (False, False, "runtime missing")
+        def inspect_request(request, task):
+            gpu = next(row for row in request["models"] if row["backend"] == "cuda")
+            self.assertTrue(gpu["runtime_supported"])
+            return provider(request, task)
+        result = self.report(available, inspect_request)
+        row = next(row for row in result["candidates"] if row["tier"] == "qwen-gpu")
+        self.assertEqual(row["verdict"], "estimated-fit")
+        self.assertFalse(row["selectable"] or row["installable"])
+
     def test_missing_piper_model_can_be_selected_for_first_use(self):
         available = self.availability()
         available["neural"] = (False, True, "model missing")

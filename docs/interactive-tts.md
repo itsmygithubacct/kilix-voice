@@ -113,11 +113,12 @@ CPU runtime on first selection; if weights are missing, it then presents their
 licence and downloads them only after a keypress. This can use several GiB of
 disk and CPU synthesis may take about a minute for a short sentence. Unavailable
 tiers remain visible. Direct `kilix-tts` Qwen use still requires its **current
-Python interpreter** to contain the Qwen dependencies. The GPU tier requires
-an independently provisioned CUDA/FlashAttention runtime. For the installed
-Kilix command, set `KILIX_QWEN_GPU_PYTHON` to that environment's absolute
-Python path before selecting `qwen-gpu`; Kilix still verifies fit and runtime
-availability before offering missing weights. The tier also requires
+Python interpreter** to contain the Qwen dependencies. On eligible x86_64
+Debian systems, `kilix tts --interactive --tier qwen-gpu` first checks hardware
+fit, then lazily installs a separate locked CUDA/FlashAttention runtime. An
+existing verified environment can instead be selected by setting
+`KILIX_QWEN_GPU_PYTHON` to its absolute Python path. Kilix still verifies fit
+and runtime availability before offering missing weights. The tier also requires
 physical GPU 0 without CUDA device remapping; it refuses a budget for another
 GPU. Explicit `--qwen-model-dir` remains an expert path outside tier gating.
 

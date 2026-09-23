@@ -85,10 +85,11 @@ def report() -> dict:
     request = {"schema": sizing.REQUEST_SCHEMA, "models": [
         {"id": "audition-" + model, "task": "tts", "backend": backend,
          "installed": available[tier][0],
-         # The CPU backend can be installed lazily on supported architectures.
-         # The sizer assesses hardware; installed dependency probes still gate
-         # selectability and first-use weight acquisition below.
-         "runtime_supported": True if tier == "qwen-cpu" else available[tier][1]}
+         # Qwen runtimes can be installed after a hardware-only fit check.
+         # The installed dependency probes below still gate selection and
+         # first-use weight acquisition; the GPU installer also checks Ampere+.
+         "runtime_supported": True if tier in ("qwen-cpu", "qwen-gpu")
+         else available[tier][1]}
         for tier, _, model, backend in TIERS]}
     result = sizing.recommend_request(request, "tts")
     candidates = {row["id"]: row for row in result["candidates"]}
