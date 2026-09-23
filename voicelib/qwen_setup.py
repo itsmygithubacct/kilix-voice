@@ -1,8 +1,8 @@
-"""Explicit Qwen acquisition through Content's pinned, first-use flow.
+"""Explicit TTS acquisition through Content's pinned, first-use flow.
 
-Only the three Qwen models currently determined by the licence authority and
-published in Content's upstream catalog are offered. No receipts are shipped
-or manufactured here, and no caller can supply an agreement as a CLI flag.
+Only catalogued models determined by the licence authority are offered. No
+receipts are shipped or manufactured here, and no caller can supply an
+agreement as a CLI flag.
 """
 from pathlib import Path
 import os
@@ -14,6 +14,7 @@ import tty
 MODEL_IDS = ("qwen3-tts-0.6b-customvoice", "qwen3-tts-0.6b-base",
              "qwen3-tts-1.7b-voicedesign")
 PIPER_ID = "piper-en-us-kristin-medium"
+POCKET_ID = "pocket-tts-english-python-alba"
 
 
 class Declined(ValueError):
@@ -39,7 +40,7 @@ def read_continue_key(output):
 
 
 def install(model_id, *, read_key=None, output=None):
-    if model_id not in (*MODEL_IDS, PIPER_ID):
+    if model_id not in (*MODEL_IDS, PIPER_ID, POCKET_ID):
         raise ValueError("TTS model is not in the first-use catalog")
     output = output or sys.stdout
     if not sys.stdin.isatty() or not output.isatty():

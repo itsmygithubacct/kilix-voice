@@ -1,12 +1,13 @@
 """Pocket audition contract without fetching or loading model weights."""
 import hashlib
 import importlib.util
+import io
 from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
 
-from voicelib import interactive, pocket, tts
+from voicelib import interactive, pocket, qwen_setup, tts
 from tests.test_interactive import options
 from tests.test_tts_tool import load_tool
 
@@ -78,6 +79,58 @@ class PocketTests(unittest.TestCase):
                       "--device", "cuda:0"]):
             with self.subTest(args=args), self.assertRaises(SystemExit):
                 tool.main(args)
+
+    def test_first_use_download_starts_pocket_session_after_agreement(self):
+        tool = load_tool()
+        with mock.patch.object(tool.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(tool.sys.stdout, "isatty", return_value=True), \
+                mock.patch.object(qwen_setup, "install", return_value="/admitted/model") as install, \
+                mock.patch.object(interactive, "run", return_value=0) as session:
+            self.assertEqual(tool.main(["--interactive", "--download-pocket"]), 0)
+        install.assert_called_once_with(qwen_setup.POCKET_ID)
+        self.assertEqual(session.call_args.args[0].pocket_model_dir, "/admitted/model")
+
+    def test_declining_pocket_terms_never_starts_session(self):
+        tool = load_tool()
+        with mock.patch.object(tool.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(tool.sys.stdout, "isatty", return_value=True), \
+                mock.patch.object(qwen_setup, "install", side_effect=qwen_setup.Declined("Quit")), \
+                mock.patch.object(interactive, "run") as session:
+            self.assertEqual(tool.main(["--interactive", "--download-pocket"]), 0)
+        session.assert_not_called()
+
+    def test_real_content_first_use_decline_and_accept_in_isolated_store(self):
+        try:
+            from kilix_content import default_catalog
+            from kilix_content.install import Installer
+            from kilix_license import ReceiptStore
+            default_catalog().require_asset(qwen_setup.POCKET_ID)
+        except (ImportError, KeyError, ValueError):
+            self.skipTest("the Pocket CPU Content candidate is not installed")
+        for key, accepts in (("q", False), (" ", True)):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as scratch:
+                store = ReceiptStore(Path(scratch) / "receipts")
+                output = io.StringIO()
+                output.isatty = lambda: True
+                def fetch(*_args, **_kwargs):
+                    self.assertEqual(len(list(store.root.glob("*.json"))), 1)
+                    return ()
+                with mock.patch.object(qwen_setup.sys.stdin, "isatty", return_value=True), \
+                        mock.patch("voicelib.paths.gpu_terminal_home", return_value=scratch), \
+                        mock.patch.object(ReceiptStore, "shared", return_value=store), \
+                        mock.patch.object(Installer, "ensure_upstream_asset", side_effect=fetch) as acquire:
+                    if accepts:
+                        self.assertTrue(qwen_setup.install(qwen_setup.POCKET_ID,
+                            read_key=lambda _: key, output=output).endswith("/model"))
+                        acquire.assert_called_once()
+                    else:
+                        with self.assertRaises(qwen_setup.Declined):
+                            qwen_setup.install(qwen_setup.POCKET_ID,
+                                read_key=lambda _: key, output=output)
+                        acquire.assert_not_called()
+                        self.assertFalse(list(store.root.glob("*.json")))
+                self.assertIn("Alba MacKenna", output.getvalue())
+                self.assertIn("binding:pocket-prohibited-use", output.getvalue())
 
 
 if __name__ == "__main__":

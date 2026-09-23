@@ -10,7 +10,7 @@ is installed by browsing tiers. Run `kilix-tts` with the Python printed by
 that installer, with Voice's source directory on `PYTHONPATH` or the installed
 Voice package available in that interpreter.
 
-The model directory is an already admitted, local copy of the pinned
+The model directory is an admitted, local copy of the pinned
 `kyutai/pocket-tts-without-voice-cloning` revision
 `d29db7978e464fb90cb3359ee0c69a273b9142cc`. It must contain:
 
@@ -25,13 +25,16 @@ uses the package's `english_2026-04` architecture with only local paths, and
 sets Hugging Face offline mode. It supports only the Alba preset embedding;
 arbitrary prompt audio, voice cloning, URL paths, and other presets are not
 exposed. The `--pocket-model-dir` expert option does not grant a licence or
-fetch files. Model acquisition must run through Kilix Content's first-use
-licence receipt and explicit prohibited-use agreement before this path can be
-made a release-selectable tier. Do not use the old `pocket-tts-english-q8_0`
+fetch files. `kilix tts --interactive --download-pocket` uses Content's new
+`pocket-tts-english-python-alba` asset and a separate first-use receipt. The
+screen shows CC BY 4.0, Alba provenance, and the prohibited-use text; press
+`q` to decline or another key to accept and begin the download. Real-output
+and resource qualifications remain open, so this is not yet a selectable
+tier. Do not use the old `pocket-tts-english-q8_0`
 conversion asset here: it lacks the Alba embedding and invokes a separate
 native conversion tool.
 
-After that admission, the session form is:
+For an already admitted local copy, the expert session form is:
 
 ```
 PYTHONPATH=/path/to/voice /path/to/pocket-python /path/to/voice/kilix-tts \
