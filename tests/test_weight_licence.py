@@ -180,10 +180,13 @@ class _WeightsFixture(unittest.TestCase):
         return planted
 
     def run_script(self, script: str, *args: str,
+                   env_extra: dict[str, str] | None = None,
                    **kwargs) -> subprocess.CompletedProcess:
+        env = self._child_env(**kwargs)
+        env.update(env_extra or {})
         return subprocess.run(
             [sys.executable, script, *args],
-            env=self._child_env(**kwargs), stdin=subprocess.DEVNULL,
+            env=env, stdin=subprocess.DEVNULL,
             capture_output=True, text=True, timeout=120, check=False)
 
     # -- receipts --------------------------------------------------------
@@ -192,7 +195,8 @@ class _WeightsFixture(unittest.TestCase):
         records = LICENCE.RecordIndex(LICENCE.load_determined_records())
         return records.by_id(catalog_id)
 
-    def mint_receipt(self, catalog_id: str, *, manifest: str = FIXTURE_MANIFEST):
+    def mint_receipt(self, catalog_id: str, *, manifest: str = FIXTURE_MANIFEST,
+                     store=None):
         """Write the receipt the authority itself would write on acceptance."""
         record = self.record_for(catalog_id)
         typed = (LICENCE.typed_agreement_line(record)
@@ -201,7 +205,7 @@ class _WeightsFixture(unittest.TestCase):
         receipt = LICENCE.receipt_from_agreement(
             record, agreement, manifest_digest=manifest,
             release_digest=FIXTURE_RELEASE, catalogue_digest=FIXTURE_CATALOGUE)
-        LICENCE.ReceiptStore(self.receipts).write(receipt)
+        (store or LICENCE.ReceiptStore(self.receipts)).write(receipt)
         return receipt
 
     def tamper_receipt(self, catalog_id: str, field: str, value: str) -> str:
@@ -776,6 +780,104 @@ class CoveringReceiptTests(_WeightsFixture):
                          f"install {PIPER_MODEL}")
 
 
+class AgreedReceiptRootTests(_WeightsFixture):
+    """The gate reads receipts where the authority says they are filed.
+
+    V-ACC-VERIFY F7: an acceptance filed at one root and a gate reading
+    another looks, to the user, like a gate that refuses a licence they just
+    accepted. kilix-license now names the root once,
+    ``kilix_license.receipt_store_root()``, with one override,
+    ``$KILIX_LICENSE_RECEIPTS``, and its writers file through
+    ``ReceiptStore.shared()``. Each test here files through that writer API
+    and runs the real command with the same environment.
+    """
+
+    def shared_store(self, **values: str | None):
+        """``ReceiptStore.shared()`` as a writer sees it under ``values``."""
+        with _environment(GPU_TERMINAL_HOME=self.store, **values):
+            return LICENCE.ReceiptStore.shared()
+
+    def test_the_default_root_is_the_one_the_authority_names(self) -> None:
+        with _environment(GPU_TERMINAL_HOME=self.store,
+                          KILIX_LICENSE_RECEIPTS=None,
+                          KILIX_VOICE_LICENSE_RECEIPTS=None):
+            self.assertEqual(licensing.receipt_store_root(),
+                             str(LICENCE.receipt_store_root()))
+            self.assertEqual(licensing.receipt_store_root(), self.receipts)
+        self.mint_receipt(VOSK_MODEL, store=self.shared_store(
+            KILIX_LICENSE_RECEIPTS=None))
+        result = self.run_tool("kilix-stt", "--install", VOSK_MODEL)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_receipt_filed_at_the_authoritys_override_covers(self) -> None:
+        moved = os.path.join(self.root, "moved-receipts")
+        store = self.shared_store(KILIX_LICENSE_RECEIPTS=moved)
+        self.assertEqual(str(store.root), moved)
+        self.mint_receipt(VOSK_MODEL, store=store)
+        result = self.run_tool("kilix-stt", "--install", VOSK_MODEL,
+                               env_extra={"KILIX_LICENSE_RECEIPTS": moved})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._spy_log_text().strip(),
+                         f"voice install --model {VOSK_MODEL}")
+        # And the Piper voice, through the other command.
+        self.mint_receipt(PIPER_MODEL, store=store)
+        result = self.run_tool("kilix-tts", "--install", PIPER_MODEL,
+                               env_extra={"KILIX_LICENSE_RECEIPTS": moved})
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_authoritys_override_wins_over_the_legacy_alias(self) -> None:
+        """Both variables set: the gate reads where the writer filed."""
+        self.assertEqual(licensing.AUTHORITY_ENV_RECEIPTS,
+                         LICENCE.paths.RECEIPT_STORE_ENV)
+        moved = os.path.join(self.root, "moved-receipts")
+        legacy = os.path.join(self.root, "legacy-receipts")
+        os.makedirs(legacy)
+        self.mint_receipt(VOSK_MODEL, store=self.shared_store(
+            KILIX_LICENSE_RECEIPTS=moved))
+        result = self.run_tool("kilix-stt", "--install", VOSK_MODEL,
+                               env_extra={"KILIX_LICENSE_RECEIPTS": moved,
+                                          "KILIX_VOICE_LICENSE_RECEIPTS": legacy})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._spy_log_text().strip(),
+                         f"voice install --model {VOSK_MODEL}")
+
+    def test_with_both_set_a_receipt_only_at_the_alias_does_not_cover(self) -> None:
+        """The control: the alias really is ignored, not merely agreeing."""
+        moved = os.path.join(self.root, "moved-receipts")
+        legacy = os.path.join(self.root, "legacy-receipts")
+        os.makedirs(moved)
+        self.mint_receipt(VOSK_MODEL, store=LICENCE.ReceiptStore(legacy))
+        before = self.store_snapshot()
+        result = self.run_tool("kilix-stt", "--install", VOSK_MODEL,
+                               env_extra={"KILIX_LICENSE_RECEIPTS": moved,
+                                          "KILIX_VOICE_LICENSE_RECEIPTS": legacy})
+        self.assert_refusal(result, "kilix-stt", VOSK_MODEL)
+        self.assertIn(moved, result.stderr)
+        self.assert_installer_never_ran(before)
+
+    def test_a_root_the_authority_refuses_is_a_licence_refusal(self) -> None:
+        """A relative override is refused by the authority; here, cleanly."""
+        before = self.store_snapshot()
+        result = self.run_tool("kilix-stt", "--install", VOSK_MODEL,
+                               env_extra={"KILIX_LICENSE_RECEIPTS": "relative/receipts"})
+        self.assert_refusal(result, "kilix-stt", VOSK_MODEL)
+        self.assertIn("could not be located", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assert_installer_never_ran(before)
+
+    def test_an_authority_that_names_no_root_keeps_the_old_composition(self) -> None:
+        """An authority older than the agreed root: the stack-home default."""
+        import types
+        older = types.ModuleType("kilix_license")
+        saved = sys.modules.get("kilix_license")
+        sys.modules["kilix_license"] = older
+        self.addCleanup(_restore_module, "kilix_license", saved)
+        with _environment(GPU_TERMINAL_HOME=self.store,
+                          KILIX_LICENSE_RECEIPTS=os.path.join(self.root, "x"),
+                          KILIX_VOICE_LICENSE_RECEIPTS=None):
+            self.assertEqual(licensing.receipt_store_root(), self.receipts)
+
+
 class LibraryIsNotWeightsTests(_WeightsFixture):
     """The Vosk library is Apache-2.0 code. It is not gated."""
 
@@ -928,17 +1030,15 @@ class GateUnitTests(unittest.TestCase):
     def test_the_receipt_store_follows_the_stack_root(self) -> None:
         root = tempfile.mkdtemp(prefix="v-acc-root-")
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)
-        previous = os.environ.get("GPU_TERMINAL_HOME")
-        os.environ["GPU_TERMINAL_HOME"] = root
-        self.addCleanup(_restore, "GPU_TERMINAL_HOME", previous)
-        self.assertEqual(licensing.receipt_store_root(),
-                         os.path.join(root, licensing.RECEIPTS_LEAF))
+        with _environment(GPU_TERMINAL_HOME=root, KILIX_LICENSE_RECEIPTS=None,
+                          KILIX_VOICE_LICENSE_RECEIPTS=None):
+            self.assertEqual(licensing.receipt_store_root(),
+                             os.path.join(root, licensing.RECEIPTS_LEAF))
 
     def test_the_receipt_store_can_be_relocated(self) -> None:
-        previous = os.environ.get(licensing.ENV_RECEIPTS)
-        os.environ[licensing.ENV_RECEIPTS] = "/elsewhere/receipts"
-        self.addCleanup(_restore, licensing.ENV_RECEIPTS, previous)
-        self.assertEqual(licensing.receipt_store_root(), "/elsewhere/receipts")
+        with _environment(KILIX_VOICE_LICENSE_RECEIPTS="/elsewhere/receipts",
+                          KILIX_LICENSE_RECEIPTS=None):
+            self.assertEqual(licensing.receipt_store_root(), "/elsewhere/receipts")
 
     def test_the_refusal_names_the_model_and_the_command(self) -> None:
         error = licensing.LicenseRefused(VOSK_MODEL, "no licence receipt")
@@ -1156,6 +1256,34 @@ def _restore(name: str, value: str | None) -> None:
         os.environ.pop(name, None)
     else:
         os.environ[name] = value
+
+
+def _restore_module(name: str, module) -> None:
+    if module is None:
+        sys.modules.pop(name, None)
+    else:
+        sys.modules[name] = module
+
+
+class _environment:
+    """Set (or, for None, remove) variables for one block, then put them back."""
+
+    def __init__(self, **values: str | None) -> None:
+        self.values = values
+        self.saved: dict[str, str | None] = {}
+
+    def __enter__(self):
+        for name, value in self.values.items():
+            self.saved[name] = os.environ.get(name)
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        for name, value in self.saved.items():
+            _restore(name, value)
 
 
 if __name__ == "__main__":

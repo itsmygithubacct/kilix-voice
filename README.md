@@ -78,8 +78,12 @@ The two sides are bound by the licence record, not by either id: each asset
 names exactly the record digest this authority resolves for the catalog id
 beside it.
 
-Receipts are read from `$GPU_TERMINAL_HOME/license-receipts`, or from
-`$KILIX_VOICE_LICENSE_RECEIPTS` when that is set. This tree only ever **reads**
+Receipts are read from the root the licence authority names,
+`kilix_license.receipt_store_root()` — `$GPU_TERMINAL_HOME/license-receipts`,
+or `$KILIX_LICENSE_RECEIPTS` when that is set — which is where the first-use
+flow files them. `$KILIX_VOICE_LICENSE_RECEIPTS` is still read as a legacy
+alias, but it moves only this reader, never the writer, and it is ignored
+whenever `$KILIX_LICENSE_RECEIPTS` is set. This tree only ever **reads**
 that store: it is never created, and its mode is never changed, on the refusing
 path or on the covered one.
 
