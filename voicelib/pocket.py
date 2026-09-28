@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import tempfile
 import threading
+import time
 
 from . import tts
 
@@ -110,6 +111,7 @@ class ResidentPocket:
         self._stop = threading.Event()
         self._workers = threading.Condition()
         self._live = 0
+        self._worker_threads = set()
         self._stuck = False
         model = self.model
         hooks = ("_run_flow_lm_and_increment_step", "_decode_audio_worker", "_autoregressive_generation")
@@ -126,6 +128,7 @@ class ResidentPocket:
             def worker(*args, **kwargs):
                 with self._workers:
                     self._live += 1
+                    self._worker_threads.add(threading.current_thread())
                 try:
                     return function(*args, **kwargs)
                 finally:
@@ -140,8 +143,21 @@ class ResidentPocket:
         model._autoregressive_generation = counted(model._autoregressive_generation)
 
     def _wait_for_workers(self):
+        deadline = time.monotonic() + STOP_SECONDS
         with self._workers:
-            return self._workers.wait_for(lambda: self._live == 0, STOP_SECONDS)
+            if not self._workers.wait_for(lambda: self._live == 0, STOP_SECONDS):
+                return False
+            threads = tuple(self._worker_threads)
+        # The hook's finally block can finish just before its Thread does.
+        # Join outside the condition lock so cancellation really returns after
+        # the workers exit, rather than after only their live count reaches zero.
+        for thread in threads:
+            thread.join(max(0, deadline - time.monotonic()))
+            if thread.is_alive():
+                return False
+        with self._workers:
+            self._worker_threads.difference_update(threads)
+        return True
 
     def synth(self, text):
         if not text.strip() or len(text.encode("utf-8")) > 16384:
@@ -149,6 +165,8 @@ class ResidentPocket:
         if self._stuck:
             raise tts.TtsError("the interrupted Pocket reply did not stop; restart the session")
         self.torch.manual_seed(self.seed)
+        with self._workers:
+            self._worker_threads = {thread for thread in self._worker_threads if thread.is_alive()}
         self._stop.clear()
         # Pocket applies no_grad itself and hands mutable state to worker threads.
         # Inference mode is thread-local; its tensors cannot be updated there.

@@ -77,7 +77,9 @@ def install(model_id, *, read_key=None, output=None):
         payload = present_asset(spec, record, texts, receipts=store, records=records)
         output.write(payload.decode("utf-8"))
         output.flush()
-        output.write("\nContinuing accepts the licence shown above and starts the download.\n")
+        output.write("\nContinuing " + ("accepts the licence" if record.expected_decision == "accept"
+                                        else "records the notice")
+                     + " shown above and starts the download.\n")
         output.flush()
         answer = (read_key or read_continue_key)(output)
         if answer in ("", "q", "Q", "\x03", "\x04"):
@@ -87,7 +89,8 @@ def install(model_id, *, read_key=None, output=None):
         # event; we do not claim that the user typed the canonical sentence.
         install_with_agreement(spec, installer=installer, store=store,
                                records=records, texts=texts,
-                               typed_text=typed_agreement_line(record),
+                               typed_text=(typed_agreement_line(record)
+                                           if record.expected_decision == "accept" else None),
                                report=lambda message: print(message, file=output, flush=True),
                                deadline=deadline)
     else:

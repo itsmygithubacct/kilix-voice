@@ -172,6 +172,24 @@ make test        # offline: no microphone, no model, no audio, no network
 
 Both TUIs also work as plain CLIs:
 
+Through the Kilix launcher, these foreground sessions lazily install their
+runtime and model, present the model's first-use terms, and reuse verified
+weights on subsequent launches:
+
+```bash
+kilix tts --interactive --tier neural
+kilix tts --interactive --download-pocket
+kilix tts --interactive --download-qwen qwen3-tts-0.6b-customvoice
+kilix tts --interactive --download-qwen qwen3-tts-0.6b-base --synthetic-reference
+kilix tts --interactive --download-qwen qwen3-tts-1.7b-voicedesign --description 'A warm clear voice'
+```
+
+The Base session uses a generated eSpeak reference. VoiceDesign accepts
+`/description TEXT` to change the voice. All sessions support `/save FILE.wav`.
+Direct Qwen sessions default to CPU; `--device cuda:0` explicitly chooses the
+optional GPU runtime. These foreground sessions do not change daemon defaults.
+The native Pocket Q8 research variant is excluded.
+
 ```bash
 ./kilix-tts --print
 ./kilix-tts --set wpm=200

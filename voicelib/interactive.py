@@ -20,6 +20,7 @@ HELP = """Type a line and press Enter to generate and play it on this machine.
 /voices            list available voices
 /voice NAME        select a voice (CustomVoice or conventional engines)
 /language NAME     change Qwen language, e.g. English, Japanese, Auto
+/description TEXT  change the VoiceDesign voice description
 /repeat            replay the last completed clip
 /save FILE.wav     save the last clip; never overwrite a file
 /quit              exit and release the model
@@ -34,7 +35,7 @@ class ResidentQwen:
 
     def __init__(self, directory, *, voice=None, language="English",
                  device="cpu", threads=4, seed=0, synthetic_reference=False,
-                 attention="sdpa"):
+                 attention="sdpa", description=None):
         if attention not in {"sdpa", "flash_attention_2"}:
             raise tts.TtsError("unsupported attention backend")
         if attention == "flash_attention_2" and device == "cpu":
@@ -46,15 +47,23 @@ class ResidentQwen:
         if not isinstance(config, dict):
             raise tts.TtsError("Qwen config.json must contain an object")
         self.kind = config.get("tts_model_type")
-        if self.kind not in {"base", "custom_voice"}:
-            raise tts.TtsError("this session supports Qwen Base and CustomVoice models")
+        if self.kind not in {"base", "custom_voice", "voice_design"}:
+            raise tts.TtsError("this session supports Qwen Base, CustomVoice and VoiceDesign models")
+        self.description = None
+        if self.kind == "voice_design":
+            if voice:
+                raise tts.TtsError("VoiceDesign uses --description, not --voice")
+            self.set_description(description)
+        elif description is not None:
+            raise tts.TtsError("--description requires a VoiceDesign model")
         if self.kind == "base" and (not synthetic_reference or voice):
             raise tts.TtsError("Base requires --synthetic-reference and no --voice; "
                                "this audition does not clone people's voices")
         if self.kind != "base" and synthetic_reference:
             raise tts.TtsError("--synthetic-reference requires a Base model")
         self.language, self.seed = language, seed
-        self.voice = voice or ("synthetic-espeak" if self.kind == "base" else "Ryan")
+        self.voice = voice or ("synthetic-espeak" if self.kind == "base" else
+                              "designed voice" if self.kind == "voice_design" else "Ryan")
         self.name = root.name
         self.prompt = None
         # Both the model and its nested speech tokenizer must remain offline.
@@ -101,16 +110,24 @@ class ResidentQwen:
                 self.prompt = self.model.create_voice_clone_prompt(
                     ref_audio=(samples, rate), ref_text=REFERENCE_TEXT,
                     x_vector_only_mode=False)
-        else:
+        elif self.kind == "custom_voice":
             self.set_voice(self.voice)
 
     def voices(self):
         return (list(self.model.get_supported_speakers()) if self.kind == "custom_voice"
+                else ["designed voice: " + self.description] if self.kind == "voice_design"
                 else ["synthetic-espeak (fixed synthetic reference)"])
+
+    def set_description(self, value):
+        if self.kind != "voice_design":
+            raise tts.TtsError("/description requires a VoiceDesign model")
+        if not isinstance(value, str) or not value.strip() or len(value.encode("utf-8")) > 4096:
+            raise tts.TtsError("VoiceDesign requires --description with 1–4096 UTF-8 bytes")
+        self.description = value.strip()
 
     def set_voice(self, value):
         if self.kind != "custom_voice":
-            raise tts.TtsError("Base uses a fixed synthetic reference; use CustomVoice for named voices")
+            raise tts.TtsError("use CustomVoice for named voices")
         choices = {v.lower(): v for v in self.voices()}
         if value.lower() not in choices:
             raise tts.TtsError("unknown voice; use /voices")
@@ -132,6 +149,8 @@ class ResidentQwen:
             if self.kind == "base":
                 waves, rate = self.model.generate_voice_clone(
                     **kwargs, voice_clone_prompt=self.prompt)
+            elif self.kind == "voice_design":
+                waves, rate = self.model.generate_voice_design(**kwargs, instruct=self.description)
             else:
                 waves, rate = self.model.generate_custom_voice(**kwargs, speaker=self.voice)
         if len(waves) != 1 or rate != 24000:
@@ -182,7 +201,8 @@ def run(args, *, read=input, emit=print, engine_factory=None, player_factory=Non
                              language=args.language or "English", device=args.device,
                              threads=args.threads, seed=args.seed,
                              synthetic_reference=args.synthetic_reference,
-                             attention=args.attention)
+                             attention=args.attention,
+                             description=getattr(args, "description", None))
         else:
             factory = engine_factory or tts.make_tts
             engine = factory(model=args.model, voice=args.voice, rate=args.rate)
@@ -221,6 +241,12 @@ def run(args, *, read=input, emit=print, engine_factory=None, player_factory=Non
                         raise tts.TtsError("/language is for Qwen; use /voice for this engine")
                     engine.set_language(line[10:].strip())
                     emit(f"Language: {engine.language}")
+                    continue
+                if line.startswith("/description "):
+                    if not args.qwen_model_dir:
+                        raise tts.TtsError("/description requires a VoiceDesign model")
+                    engine.set_description(line[13:].strip())
+                    emit(f"Description: {engine.description}")
                     continue
                 if line.startswith("/save "):
                     if last is None:

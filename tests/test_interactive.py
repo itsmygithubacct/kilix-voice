@@ -133,9 +133,38 @@ class SessionTests(unittest.TestCase):
 
     def test_qwen_bad_kind_refused_before_dependency_import(self):
         with tempfile.TemporaryDirectory() as tmp:
-            (Path(tmp) / "config.json").write_text('{"tts_model_type":"voice_design"}')
+            (Path(tmp) / "config.json").write_text('{"tts_model_type":"unknown"}')
             with self.assertRaisesRegex(interactive.tts.TtsError, "supports Qwen"):
                 interactive.ResidentQwen(tmp)
+
+    def test_voice_design_loads_offline_and_uses_description(self):
+        torch = mock.MagicMock()
+        upstream = mock.Mock()
+        model = upstream.from_pretrained.return_value
+        model.get_supported_languages.return_value = ["english"]
+        samples = mock.MagicMock(ndim=1, size=240)
+        np = mock.Mock()
+        np.asarray.return_value = samples
+        np.clip.return_value.astype.return_value.tobytes.return_value = b"\x01\x00" * 240
+        model.generate_voice_design.return_value = ([samples], 24000)
+        modules = {"torch": torch, "numpy": np,
+                   "qwen_tts": SimpleNamespace(Qwen3TTSModel=upstream)}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict("sys.modules", modules), \
+                mock.patch.dict(interactive.os.environ):
+            (Path(tmp) / "config.json").write_text('{"tts_model_type":"voice_design"}')
+            with self.assertRaisesRegex(interactive.tts.TtsError, "description"):
+                interactive.ResidentQwen(tmp)
+            upstream.from_pretrained.assert_not_called()
+            engine = interactive.ResidentQwen(tmp, description="A calm low voice")
+            self.assertTrue(upstream.from_pretrained.call_args.kwargs["local_files_only"])
+            self.assertEqual(engine.synth("Hello"), (b"\x01\x00" * 240, 24000))
+            self.assertEqual(model.generate_voice_design.call_args.kwargs["instruct"], "A calm low voice")
+            model.generate_custom_voice.assert_not_called()
+            model.generate_voice_clone.assert_not_called()
+            engine.set_description("A bright warm voice")
+            engine.synth("Again")
+            self.assertEqual(model.generate_voice_design.call_args.kwargs["instruct"], "A bright warm voice")
+            engine.close()
 
     def test_base_requires_explicit_synthetic_reference(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -145,6 +174,24 @@ class SessionTests(unittest.TestCase):
 
 
 class SessionCliTests(unittest.TestCase):
+    def test_each_qwen_model_installs_and_enters_session(self):
+        tool = load_tool()
+        for model, options in ((qwen_setup.MODEL_IDS[0], []),
+                               (qwen_setup.MODEL_IDS[1], ["--synthetic-reference"]),
+                               (qwen_setup.MODEL_IDS[2], ["--description", "A warm clear voice"])):
+            with self.subTest(model=model), \
+                    mock.patch.object(tool.sys.stdin, "isatty", return_value=True), \
+                    mock.patch.object(tool.sys.stdout, "isatty", return_value=True), \
+                    mock.patch.object(qwen_setup, "install", return_value="/installed/model") as acquire, \
+                    mock.patch.object(interactive, "run", return_value=0) as session:
+                args = ["--interactive", "--download-qwen", model, *options]
+                self.assertEqual(tool.main([*args, "--check-session"]), 0)
+                acquire.assert_not_called()
+                session.assert_not_called()
+                self.assertEqual(tool.main(args), 0)
+                acquire.assert_called_once_with(model)
+                self.assertEqual(session.call_args.args[0].qwen_model_dir, "/installed/model")
+
     def test_download_continues_into_interactive_in_same_process(self):
         tool = load_tool()
         events = []

@@ -34,7 +34,13 @@ class QwenSetupTests(unittest.TestCase):
             with self.subTest(key=key):
                 self.exercise(accept=True, key=key)
 
-    def exercise(self, *, accept, key):
+    def test_all_five_models_use_the_same_first_use_gate(self):
+        for model_id in (*qwen_setup.MODEL_IDS, qwen_setup.PIPER_ID, qwen_setup.POCKET_ID):
+            with self.subTest(model=model_id):
+                self.exercise(accept=False, key="q", model_id=model_id)
+                self.exercise(accept=True, key=" ", model_id=model_id)
+
+    def exercise(self, *, accept, key, model_id=qwen_setup.MODEL_IDS[0]):
         from kilix_license import ReceiptStore
         from kilix_content.install import Installer
         with tempfile.TemporaryDirectory() as tmp:
@@ -51,18 +57,19 @@ class QwenSetupTests(unittest.TestCase):
                     mock.patch.object(ReceiptStore, "shared", return_value=store), \
                     mock.patch.object(Installer, "ensure_upstream_asset", side_effect=fetch) as acquire:
                 if accept:
-                    result = qwen_setup.install(qwen_setup.MODEL_IDS[0],
+                    result = qwen_setup.install(model_id,
                                                 read_key=lambda output: key, output=output)
-                    self.assertTrue(result.endswith("qwen3-tts-0.6b-customvoice/model"))
+                    self.assertTrue(result.endswith(model_id + "/model"))
                     acquire.assert_called_once()
                 else:
                     with self.assertRaises(qwen_setup.Declined):
-                        qwen_setup.install(qwen_setup.MODEL_IDS[0],
+                        qwen_setup.install(model_id,
                                            read_key=lambda output: key, output=output)
                     acquire.assert_not_called()
                     self.assertFalse(list(store.root.glob("*.json")))
-            self.assertIn("Apache License", output.getvalue())
-            self.assertIn("Continuing accepts", output.getvalue())
+            self.assertIn(model_id, output.getvalue())
+            self.assertIn("Continuing records" if model_id == qwen_setup.PIPER_ID
+                          else "Continuing accepts", output.getvalue())
 
     def test_real_terminal_single_key_and_stale_input(self):
         for key in (b" ", b"q", b"\n"):
