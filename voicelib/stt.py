@@ -21,6 +21,7 @@ import dataclasses
 import json
 import os
 import re
+import stat
 import subprocess
 import tempfile
 import wave
@@ -510,13 +511,23 @@ class VibeVoiceStt:
     the turn ends. It has no partial results. The audio goes to a private
     temporary WAV that is removed as soon as the process exits; nothing is
     kept. ``close()`` kills a transcription still running.
+
+    Consent binds bytes, and asr_infer only opens the model when the turn
+    ends, so the model files are opened HERE, right after the consent gate,
+    and held. Their digest must equal the one consent was granted for; the
+    child is given those same descriptors (``/proc/self/fd/N``), so replacing
+    the path during the turn changes nothing it loads; and each held file's
+    stat is re-checked before and after the child runs. Any change re-hashes
+    the held bytes, and a transcript is refused unless they are still the
+    consented ones.
     """
 
     name = ENGINE_VIBEVOICE
     supports_partials = False
 
     def __init__(self, rate: int = DEFAULT_RATE, *, model_path: str | None = None,
-                 threads: int | None = None) -> None:
+                 threads: int | None = None,
+                 consented_payload: str | None = None) -> None:
         try:
             self._rate = int(rate)
         except (TypeError, ValueError) as error:
@@ -545,6 +556,29 @@ class VibeVoiceStt:
         self._open = False
         self._closed = False
         self._process: subprocess.Popen | None = None
+        self._held: dict[str, tuple[int, str]] = {}
+        try:
+            for name in models.REQUIRED_FILES[ENGINE_VIBEVOICE]:
+                path = os.path.join(self._model_path, name)
+                try:
+                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                except OSError as error:
+                    raise SttError(f"cannot open {path}: {error.strerror}.") from error
+                self._held[name] = (fd, path)
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise SttError(f"{path} is not a regular file.")
+            self._stats = self._held_stats()
+            self._payload = consent.payload_digest_of(ENGINE_VIBEVOICE, self._held)
+            if consented_payload is not None:
+                if self._payload != consented_payload:
+                    raise SttError(
+                        f"the VibeVoice model in {self._model_path} changed after "
+                        "dictation consent was checked, so it was not loaded. "
+                        "Grant consent again with `kilix-stt --grant-consent` if "
+                        "the new files are intended.")
+        except BaseException:
+            self._release()
+            raise
 
     @property
     def rate(self) -> int:
@@ -553,6 +587,37 @@ class VibeVoiceStt:
     @property
     def model_path(self) -> str:
         return self._model_path
+
+    def _held_stats(self) -> dict[str, tuple[int, int, int, int, int]]:
+        stats = {}
+        for name, (fd, _path) in self._held.items():
+            info = os.fstat(fd)
+            stats[name] = (info.st_dev, info.st_ino, info.st_size,
+                           info.st_mtime_ns, info.st_ctime_ns)
+        return stats
+
+    def _require_unchanged(self, when: str) -> None:
+        stats = self._held_stats()
+        if stats == self._stats:
+            return
+        # Unlinking or replacing the path also moves a held file's ctime, with
+        # its bytes intact; only the bytes decide. A rewrite always moves ctime,
+        # even one that restores mtime, so it is always re-hashed here.
+        if consent.payload_digest_of(ENGINE_VIBEVOICE, self._held) == self._payload:
+            self._stats = stats
+            return
+        raise SttError(
+                f"a VibeVoice model file was modified {when}, so this turn's "
+                "transcript was discarded. Grant consent again with "
+                "`kilix-stt --grant-consent` if the change is intended.")
+
+    def _release(self) -> None:
+        held, self._held = self._held, {}
+        for fd, _path in held.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def start_utterance(self) -> None:
         self._require_live()
@@ -591,14 +656,20 @@ class VibeVoiceStt:
                 wav.setsampwidth(2)
                 wav.setframerate(self._rate)
                 wav.writeframes(pcm)
+            vae_fd = self._held[VIBEASR_VAE][0]
+            lm_fd = self._held[VIBEASR_LM][0]
+            # The child opens the very files consent verified: the held
+            # descriptors are passed down and named through /proc/self/fd.
             command = [self._binary,
-                       "--vae-model", os.path.join(self._model_path, VIBEASR_VAE),
-                       "--lm-model", os.path.join(self._model_path, VIBEASR_LM),
+                       "--vae-model", f"/proc/self/fd/{vae_fd}",
+                       "--lm-model", f"/proc/self/fd/{lm_fd}",
                        "--audio", audio_path, "-t", str(self._threads), "--greedy"]
             timeout = VIBEASR_BASE_TIMEOUT_S + VIBEASR_TIMEOUT_PER_AUDIO_S * seconds
+            self._require_unchanged("since dictation consent was checked")
             self._process = subprocess.Popen(
                 command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, start_new_session=True)
+                stderr=subprocess.PIPE, start_new_session=True,
+                pass_fds=(vae_fd, lm_fd))
             try:
                 stdout, stderr = self._process.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -611,6 +682,7 @@ class VibeVoiceStt:
             self._process = None
             if self._closed:
                 return ""
+            self._require_unchanged("while it was being transcribed")
             if returncode != 0:
                 detail = _clean_text(stderr.decode("utf-8", "replace"))[-400:]
                 raise SttError(
@@ -629,6 +701,7 @@ class VibeVoiceStt:
         self._closed = True
         self._pcm = bytearray()
         self._kill()
+        self._release()
 
     def _kill(self) -> None:
         process, self._process = self._process, None
@@ -668,6 +741,10 @@ class ResolvedStt:
     # is a CPU transcription, as every Vosk model is.
     device_class: str = resources.DEVICE_CPU
     task: str = "transcribe"
+    # The payload digest the consent gate granted, set by the gate for this
+    # turn. An engine that loads its model after construction (VibeVoice)
+    # re-verifies the files it holds against exactly this.
+    consented_payload: str | None = None
 
 
 def resolve_stt(cfg: dict | None = None) -> ResolvedStt:
@@ -751,7 +828,8 @@ def make_stt(cfg: dict | None = None, rate: int | None = None, *,
         rate = int(cfg_get(config, "audio.rate", DEFAULT_RATE))
     if target.engine == ENGINE_VIBEVOICE:
         return VibeVoiceStt(rate, model_path=target.model_dir,
-                            threads=cfg_get(config, "stt.threads"))
+                            threads=cfg_get(config, "stt.threads"),
+                            consented_payload=target.consented_payload)
     return VoskStt(
         rate,
         # model_path, not model_id: the directory is already resolved, so the

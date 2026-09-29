@@ -300,18 +300,32 @@ _DIGESTS: dict[tuple, tuple[int, str]] = {}
 
 def _file_digest(target: str) -> tuple[int, str]:
     with open(target, "rb") as handle:
-        info = os.fstat(handle.fileno())
-        key = (os.path.abspath(target), info.st_dev, info.st_ino, info.st_size,
-               info.st_mtime_ns, info.st_ctime_ns)
-        cached = _DIGESTS.get(key)
-        if cached is not None:
-            return cached
-        digest = hashlib.sha256()
-        size = 0
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            size += len(block)
-            digest.update(block)
-        after = os.fstat(handle.fileno())
+        return fd_digest(handle.fileno(), target)
+
+
+def fd_digest(fd: int, label: str) -> tuple[int, str]:
+    """(size, sha256) of the file open on ``fd``, read from offset 0.
+
+    Hashing a held descriptor is what lets a caller bind consent to the exact
+    bytes it will hand on: replacing the path afterwards cannot change them.
+    ``label`` is the path the file was opened from; the cache key still rests
+    on the file's own identity (device, inode, size, mtime, ctime).
+    """
+    info = os.fstat(fd)
+    key = (os.path.abspath(label), info.st_dev, info.st_ino, info.st_size,
+           info.st_mtime_ns, info.st_ctime_ns)
+    cached = _DIGESTS.get(key)
+    if cached is not None:
+        return cached
+    digest = hashlib.sha256()
+    size = 0
+    while True:
+        block = os.pread(fd, 1024 * 1024, size)
+        if not block:
+            break
+        size += len(block)
+        digest.update(block)
+    after = os.fstat(fd)
     result = (size, digest.hexdigest())
     settled = time.time_ns() - RACY_SECONDS * 1_000_000_000
     if ((after.st_size, after.st_mtime_ns, after.st_ctime_ns) == key[3:]
@@ -320,6 +334,22 @@ def _file_digest(target: str) -> tuple[int, str]:
         # write that has not happened yet.
         _DIGESTS[key] = result
     return result
+
+
+def payload_digest_of(engine: str, held: dict[str, tuple[int, str]]) -> str:
+    """The payload digest ``payload_digest_at`` gives, computed over held files.
+
+    ``held`` maps each of the engine's REQUIRED_FILES to (fd, path). The result
+    is byte-for-byte the same format, so it compares directly with the digest
+    the consent gate bound.
+    """
+    from . import models
+    parts = []
+    for relative in models.REQUIRED_FILES[engine]:
+        fd, path = held[relative]
+        size, hexdigest = fd_digest(fd, path)
+        parts.append(f"{relative}:{size}:{hexdigest}")
+    return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
 
 
 def capture_digest(model_id: str, engine: str, payload_digest: str = "") -> str:

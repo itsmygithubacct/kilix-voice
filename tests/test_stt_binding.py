@@ -20,6 +20,8 @@ touches the network: every test runs against a private temporary tree.
 from __future__ import annotations
 
 import ctypes
+import dataclasses
+import hashlib
 import json
 import os
 import pathlib
@@ -31,7 +33,7 @@ import time
 import unittest
 from unittest import mock
 
-from voicelib import models, paths, settings, stt
+from voicelib import consent, models, paths, settings, stt
 
 # One capture frame: 20 ms of 16 kHz s16le mono, 640 bytes. The samples
 # themselves are never looked at — the stub decides what it "hears".
@@ -448,18 +450,25 @@ class StubLibraryTestCase(unittest.TestCase):
 # what FAKE_TEXT says (with a control character the engine must strip), exits
 # with FAKE_STATUS, or sleeps FAKE_SLEEP seconds first.
 FAKE_ASR = r"""#!{python}
-import json, os, sys, time, wave
+import hashlib, json, os, sys, time, wave
 args = sys.argv[1:]
 audio = args[args.index("--audio") + 1]
+# What the runtime would load: the bytes behind each model argument.
+loaded = {{flag: hashlib.sha256(open(args[args.index(flag) + 1], "rb").read()).hexdigest()
+          for flag in ("--vae-model", "--lm-model")}}
 with wave.open(audio) as w:
     shape = [w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()]
 with open(os.environ["FAKE_LOG"], "a") as log:
-    log.write(json.dumps({{"argv": args, "wav": shape}}) + "\n")
+    log.write(json.dumps({{"argv": args, "wav": shape, "loaded": loaded}}) + "\n")
 time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
 print("loading...", file=sys.stderr)
 sys.stdout.write(os.environ.get("FAKE_TEXT", "\nhello\x1b[31m world.\n"))
 sys.exit(int(os.environ.get("FAKE_STATUS", "0")))
 """
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 class VibeVoiceEngineTestCase(unittest.TestCase):
@@ -469,8 +478,8 @@ class VibeVoiceEngineTestCase(unittest.TestCase):
         self.root = _isolate(self)
         self.model = os.path.join(paths.data_dir(), "models", models.VIBEVOICE_MODEL)
         os.makedirs(self.model)
-        for name in models.REQUIRED_FILES[models.ENGINE_VIBEVOICE]:
-            pathlib.Path(self.model, name).write_bytes(b"gguf")
+        pathlib.Path(self.model, stt.VIBEASR_VAE).write_bytes(b"vae A")
+        pathlib.Path(self.model, stt.VIBEASR_LM).write_bytes(b"lm A")
         self.binary = os.path.join(self.root, "asr_infer")
         pathlib.Path(self.binary).write_text(
             FAKE_ASR.format(python=sys.executable), encoding="utf-8")
@@ -481,9 +490,11 @@ class VibeVoiceEngineTestCase(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def engine(self, **cfg) -> "stt.VibeVoiceStt":
-        recogniser = stt.make_stt({"stt": {"engine": stt.ENGINE_VIBEVOICE, **cfg}},
-                                  stt.DEFAULT_RATE)
+    def engine(self, consented_payload=None, **cfg) -> "stt.VibeVoiceStt":
+        config = {"stt": {"engine": stt.ENGINE_VIBEVOICE, **cfg}}
+        resolved = dataclasses.replace(stt.resolve_stt(config),
+                                       consented_payload=consented_payload)
+        recogniser = stt.make_stt(config, stt.DEFAULT_RATE, resolved=resolved)
         self.addCleanup(recogniser.close)
         self.assertIsInstance(recogniser, stt.VibeVoiceStt)
         return recogniser
@@ -503,10 +514,10 @@ class VibeVoiceEngineTestCase(unittest.TestCase):
         self.assertEqual(recogniser.end_utterance(), "hello [31m world.")
         (call,) = self.calls()
         argv = call["argv"]
-        self.assertEqual(argv[argv.index("--vae-model") + 1],
-                         os.path.join(self.model, stt.VIBEASR_VAE))
-        self.assertEqual(argv[argv.index("--lm-model") + 1],
-                         os.path.join(self.model, stt.VIBEASR_LM))
+        # The runtime is handed the held files, and loads the model's bytes.
+        self.assertRegex(argv[argv.index("--vae-model") + 1], r"^/proc/self/fd/\d+$")
+        self.assertRegex(argv[argv.index("--lm-model") + 1], r"^/proc/self/fd/\d+$")
+        self.assertEqual(call["loaded"], {"--vae-model": sha(b"vae A"), "--lm-model": sha(b"lm A")})
         self.assertIn("--greedy", argv)
         self.assertEqual(argv[argv.index("-t") + 1], "2")
         # mono, 16-bit, the capture rate, and exactly the frames fed
@@ -558,6 +569,62 @@ class VibeVoiceEngineTestCase(unittest.TestCase):
         recogniser.end_utterance()
         self.assertEqual([call["wav"][3] for call in self.calls()],
                          [3 * len(FRAME) // 2, len(FRAME) // 2, 2 * len(FRAME) // 2])
+
+    def consented(self) -> str:
+        return consent.payload_digest_at(self.model, models.ENGINE_VIBEVOICE)
+
+    def turn(self, recogniser) -> str:
+        recogniser.start_utterance()
+        recogniser.feed(FRAME)
+        return recogniser.end_utterance()
+
+    def test_a_path_swap_after_consent_cannot_change_what_loads(self) -> None:
+        # Seat 1's High: consent is checked, then the model is replaced at the
+        # same path while the turn records. The runtime must still load A.
+        recogniser = self.engine(consented_payload=self.consented())
+        swap = os.path.join(self.model, stt.VIBEASR_LM + ".new")
+        pathlib.Path(swap).write_bytes(b"lm B")
+        os.replace(swap, os.path.join(self.model, stt.VIBEASR_LM))
+        self.assertEqual(self.turn(recogniser), "hello [31m world.")
+        (call,) = self.calls()
+        self.assertEqual(call["loaded"]["--lm-model"], sha(b"lm A"))
+
+    def test_an_in_place_rewrite_during_the_turn_discards_it(self) -> None:
+        recogniser = self.engine(consented_payload=self.consented())
+        time.sleep(0.05)                 # a later timestamp tick than the write
+        with open(os.path.join(self.model, stt.VIBEASR_LM), "r+b") as handle:
+            handle.write(b"lm B")        # same inode, same length
+        with self.assertRaises(stt.SttError) as caught:
+            self.turn(recogniser)
+        self.assertIn("modified", str(caught.exception))
+        self.assertEqual(self.calls(), [])
+
+    def test_a_rewrite_that_restores_mtime_is_still_seen(self) -> None:
+        recogniser = self.engine(consented_payload=self.consented())
+        target = os.path.join(self.model, stt.VIBEASR_LM)
+        before = os.stat(target)
+        time.sleep(0.05)
+        with open(target, "r+b") as handle:
+            handle.write(b"lm B")
+        os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        with self.assertRaises(stt.SttError):
+            self.turn(recogniser)
+        self.assertEqual(self.calls(), [])
+
+    def test_a_model_swapped_before_the_engine_opens_it_is_refused(self) -> None:
+        granted = self.consented()
+        pathlib.Path(self.model, stt.VIBEASR_LM).write_bytes(b"lm B")
+        with self.assertRaises(stt.SttError) as caught:
+            self.engine(consented_payload=granted)
+        self.assertIn("changed after dictation consent", str(caught.exception))
+
+    def test_close_releases_the_held_files(self) -> None:
+        recogniser = stt.VibeVoiceStt(stt.DEFAULT_RATE, model_path=self.model)
+        held = [fd for fd, _path in recogniser._held.values()]
+        recogniser.close()
+        for fd in held:
+            with self.assertRaises(OSError):
+                os.fstat(fd)
 
     def test_a_missing_gguf_is_named(self) -> None:
         os.unlink(os.path.join(self.model, stt.VIBEASR_LM))

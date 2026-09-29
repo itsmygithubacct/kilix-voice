@@ -51,6 +51,7 @@ text is never logged — it is the user's, and stderr is not private.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import fcntl
 import hashlib
 import json
@@ -2141,7 +2142,12 @@ class Daemon(OwnedTurns):
         # budget or to stop-dictation at all, so a stop arriving during
         # preparation did not prevent the microphone opening.
         turn.stop.check()
-        self._require_capture_consent(resolved)
+        identity = self._require_capture_consent(resolved)
+        if identity is not None:
+            # The bytes consented to travel with the turn, so an engine that
+            # loads its model later (VibeVoice) re-verifies exactly these.
+            resolved = dataclasses.replace(
+                resolved, consented_payload=identity.payload_digest)
         turn.stop.check()
         # S04 (LEASE-02): an engine on an accelerator runs only under a grant
         # from the one lease home, waited for here, before the engine is
@@ -2274,7 +2280,8 @@ class Daemon(OwnedTurns):
             raise DeadlineExceeded(f"the request deadline elapsed {where}")
 
     def _require_capture_consent(
-            self, resolved: stt_lib.ResolvedStt | None = None) -> None:
+            self, resolved: stt_lib.ResolvedStt | None = None
+    ) -> stt_lib.ConsentIdentity | None:
         """Refuse to open the microphone without a matching consent record.
 
         S02/S03 reach production here. The digest binds the model and engine
@@ -2290,7 +2297,7 @@ class Daemon(OwnedTurns):
         # Default ON. Set KILIX_VOICE_REQUIRE_CONSENT=0 to disable, which is a
         # deliberate deployment choice rather than the absence of one.
         if os.environ.get("KILIX_VOICE_REQUIRE_CONSENT", "1") == "0":
-            return
+            return None
         # F03: this used to call settings.stt_model()/stt_engine() with no
         # settings path, while make_stt read stt.engine, stt.model,
         # stt.model_path and settings_path from the daemon's effective config.
@@ -2329,6 +2336,7 @@ class Daemon(OwnedTurns):
                 f"with the same {stt_lib.ENV_MODEL} and {ENV_CONFIG} as the "
                 "daemon; a change of model or of the installed payload asks "
                 "again.")
+        return identity
 
     def _record(self, turn: _DictationTurn, capture: audio.MicCapture,
                 engine: SttEngine) -> bool:
