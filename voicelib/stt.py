@@ -666,19 +666,24 @@ class VibeVoiceStt:
                        "--audio", audio_path, "-t", str(self._threads), "--greedy"]
             timeout = VIBEASR_BASE_TIMEOUT_S + VIBEASR_TIMEOUT_PER_AUDIO_S * seconds
             self._require_unchanged("since dictation consent was checked")
-            self._process = subprocess.Popen(
+            # A local handle: close() on another thread clears self._process
+            # and kills the child, and this thread still reaps it and closes
+            # its pipes through communicate().
+            process = self._process = subprocess.Popen(
                 command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, start_new_session=True,
                 pass_fds=(vae_fd, lm_fd))
             try:
-                stdout, stderr = self._process.communicate(timeout=timeout)
+                stdout, stderr = process.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
-                self._kill()
+                process.kill()
+                process.communicate()     # reap it and close both pipes
+                self._process = None
                 raise SttError(
                     f"VibeVoice did not finish transcribing {seconds:.1f} s of "
                     f"audio within {timeout:.0f} s. The machine may be busy; try "
                     "again, or choose a lighter model.") from None
-            returncode = self._process.returncode
+            returncode = process.returncode
             self._process = None
             if self._closed:
                 return ""
@@ -704,10 +709,11 @@ class VibeVoiceStt:
         self._release()
 
     def _kill(self) -> None:
+        # Only kills: the thread in end_utterance() owns the process and reaps
+        # it, so two threads never communicate() with it at once.
         process, self._process = self._process, None
         if process is not None and process.poll() is None:
             process.kill()
-            process.wait()
 
     def _require_live(self) -> None:
         if self._closed:

@@ -33,6 +33,14 @@ class DigestCacheTests(unittest.TestCase):
         consent._file_digest(self.path)
         self.assertEqual(consent._DIGESTS, {})
 
+    def test_an_old_mtime_with_a_fresh_ctime_is_not_cached(self) -> None:
+        # mtime can be set back by anyone who can write the file; ctime
+        # cannot, so the settled rule must hold for both.
+        old = time.time_ns() - 60 * 1_000_000_000
+        os.utime(self.path, ns=(old, old))
+        consent._file_digest(self.path)
+        self.assertEqual(consent._DIGESTS, {})
+
     def test_a_settled_file_is_hashed_once(self) -> None:
         with self.later():
             first = consent._file_digest(self.path)

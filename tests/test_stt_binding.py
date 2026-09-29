@@ -460,6 +460,8 @@ with wave.open(audio) as w:
     shape = [w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()]
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps({{"argv": args, "wav": shape, "loaded": loaded}}) + "\n")
+if os.environ.get("FAKE_PID"):
+    open(os.environ["FAKE_PID"], "w").write(str(os.getpid()))
 time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
 print("loading...", file=sys.stderr)
 sys.stdout.write(os.environ.get("FAKE_TEXT", "\nhello\x1b[31m world.\n"))
@@ -552,6 +554,41 @@ class VibeVoiceEngineTestCase(unittest.TestCase):
                 recogniser.end_utterance()
         self.assertIn("did not finish", str(caught.exception))
         self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_timeout_kills_the_child_and_leaks_no_descriptors(self) -> None:
+        recogniser = self.engine()
+        pid_file = os.path.join(self.root, "asr.pid")
+        before = len(os.listdir("/proc/self/fd"))
+        with mock.patch.dict(os.environ, {"FAKE_SLEEP": "30", "FAKE_PID": pid_file}), \
+                mock.patch.object(stt, "VIBEASR_BASE_TIMEOUT_S", 0.5):
+            with self.assertRaises(stt.SttError):
+                self.turn(recogniser)
+        pid = int(pathlib.Path(pid_file).read_text())
+        self.assertFalse(os.path.exists(f"/proc/{pid}"), "asr_infer was left running")
+        self.assertEqual(len(os.listdir("/proc/self/fd")), before)
+
+    def test_close_from_another_thread_ends_the_turn_quietly(self) -> None:
+        import threading
+        recogniser = self.engine()
+        pid_file = os.path.join(self.root, "asr.pid")
+        result = {}
+
+        def run() -> None:
+            try:
+                result["text"] = self.turn(recogniser)
+            except BaseException as error:        # recorded, not raised
+                result["error"] = error
+
+        with mock.patch.dict(os.environ, {"FAKE_SLEEP": "30", "FAKE_PID": pid_file}):
+            worker = threading.Thread(target=run)
+            worker.start()
+            deadline = time.monotonic() + 10
+            while not os.path.exists(pid_file) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            recogniser.close()
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, {"text": ""})
 
     def test_turns_do_not_share_audio(self) -> None:
         recogniser = self.engine()
