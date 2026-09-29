@@ -623,7 +623,7 @@ def validate_request(msg: dict, session_dir: str) -> dict:
             request["utterance"]=value
         if op == "owned-stop":
             value=msg.get("turn")
-            if not isinstance(value,str) or re.fullmatch(r"speak-[0-9]+",value) is None:
+            if not isinstance(value,str) or re.fullmatch(r"speak-[0-9a-f]{16}-[0-9]+",value) is None:
                 raise ProtocolError("Owned stop requires a speech turn")
             request["turn"]=value
         if op == "owned-speak" and len(request["text"].encode("utf-8")) > 4096:

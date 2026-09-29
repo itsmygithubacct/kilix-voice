@@ -365,3 +365,46 @@ a heartbeat. Releasing press-to-talk closes capture immediately and drains the
 buffer before producing the final transcript. Continuous input uses a per-turn
 silence interval, defaulting to three seconds. These operations retain the
 normal consent, resource, deadline, cancellation and job-outcome checks.
+
+Owned speech never replaces other audio: `owned-speak` is refused as `busy`
+while anything is speaking or listening, including a legacy `speak`. Preserve
+the returned `turn` (`speak-<daemon instance>-<n>`); `owned-stop` needs it and
+the same owner, so a stale stop — including one kept across a daemon restart —
+cannot silence a successor. Poll `owned-status` at least once per second: it
+renews the lease, while global `status` does not. It reports `preparing`,
+`speaking`, `completed`, `cancelled` (stopped by `owned-stop` or `stop-speech`),
+`superseded` (a legacy `speak` replaced it), `expired` (the lease or request
+deadline ran out), `failed` or `unknown`, with any reason in `detail`.
+`playing` describes the active playback process, not sample-accurate timing.
+
+Repeating an identical `owned-speak` while its result is retained returns that
+result without replaying audio; reusing an utterance token for different text
+or options is refused as `malformed`. After a lost acknowledgement, reconcile
+through `owned-status`. Never replay an `unknown` utterance automatically: the
+result may have aged out or the daemon may have restarted. Owner tokens
+coordinate same-user clients; they are not protection against other code
+running under that UID.
+
+### Model sizing
+
+Both tools ask the shared `plebian-model-sizer` provider for read-only resource
+recommendations:
+
+```sh
+./kilix-tts --recommend
+./kilix-stt --recommend --json
+```
+
+Press **n** in the read-aloud settings, or on dictation's Models tab, for the
+same report; dictation then shows each model's resource verdict. Results are
+advisory: selecting, saving defaults and installing stay explicit actions, and
+`--recommend` refuses to combine with any of them. Exit 0 means a valid report,
+which may have an empty shortlist; provider failures exit 1 and incompatible
+options exit 2.
+
+Install `plebian-model-sizer` 0.2.0 or newer, or set `PLEBIAN_MODEL_SIZER` to its
+executable; a source checkout also finds the sibling `kilix-system-monitor`
+launcher. Voice exchanges bounded JSON with it (15-second timeout, 1 MiB reply
+limit) and fetches no model, opens no audio device and writes no settings.
+Candidates are ranked by memory cost, not speech quality, and nothing is
+selected or qualified by the report.

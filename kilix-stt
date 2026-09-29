@@ -61,8 +61,8 @@ for _package_root in (_INSTALLED_LIB, _HERE):
 from voicelib import (
     consent as model_consent,  # noqa: E402  (the import follows the path bootstrap)
     __version__, audio, daemon_config, events, licensing,
-    models as model_catalog, paths, protocol, settings, stt as stt_lib,
-    tui_shell)
+    models as model_catalog, paths, protocol, settings, sizing,
+    stt as stt_lib, tui_shell)
 from voicelib.vad import Vad  # noqa: E402
 
 
@@ -912,6 +912,12 @@ def _print_models_json() -> None:
     print(json.dumps(_model_catalog_document(), sort_keys=True))
 
 
+def _size_models() -> dict:
+    """Ask the shared model sizer about every dictation model; read-only."""
+    return sizing.recommend("stt", {spec.catalog_id: model_payload_present(spec)
+                                    for spec in MODELS})
+
+
 # -- the screen ------------------------------------------------------------
 
 
@@ -986,6 +992,7 @@ class Ui:
         self._selected = [0] * len(SECTIONS)
         self._message = ""
         self._discard_armed = False
+        self._sizing_report: dict | None = None
         self._pulse = pulse_state()
         self._daemon = daemon_status()
         self._diagnostics = diagnose(self._values)
@@ -1142,6 +1149,10 @@ class Ui:
                     f"{spec.catalog_id:<21} {spec.engine:<10} "
                     f"{human_bytes(spec.size):>9}  "
                     f"{'installed' if installed else 'not installed'}")
+            if self._sizing_report is not None:
+                verdict = next((row["verdict"] for row in self._sizing_report["candidates"]
+                                if row["id"] == spec.catalog_id), "unknown")
+                line += f"  {verdict}"
             attr = (tui_shell.attr("selected")
                     if index == selected else curses.A_NORMAL)
             lines.append((line.ljust(max(0, width - 2)), attr))
@@ -1325,6 +1336,7 @@ class Ui:
             help_text = (f"{glyphs.left}/{glyphs.right} tab {glyphs.dot} "
                          f"{glyphs.up}/{glyphs.down} move {glyphs.dot} Enter "
                          f"make default {glyphs.dot} i install {glyphs.dot} "
+                         f"n size models {glyphs.dot} "
                          f"s save {glyphs.dot} "
                          "q quit")
         else:
@@ -1407,6 +1419,7 @@ class Ui:
                          "settings before the next turn.")
 
     def _rescan(self) -> None:
+        self._sizing_report = None
         self._pulse = pulse_state()
         self._daemon = daemon_status()
         self._diagnostics = diagnose(self._values)
@@ -1503,6 +1516,14 @@ class Ui:
                 self._install_model()
         elif key in (ord("r"), ord("R")):
             self._rescan()
+        elif key in (ord("n"), ord("N")) and self._section == SECTION_MODELS:
+            # Advisory only: nothing is selected, saved or installed.
+            try:
+                self._sizing_report = _size_models()
+                self._message = sizing.summary(self._sizing_report)
+            except sizing.SizerError as error:
+                self._sizing_report = None
+                self._message = str(error)
         elif key in (ord("q"), ord("Q"), 27):
             if self._dirty and not self._discard_armed:
                 self._message = "Unsaved changes: s saves; q again discards."
@@ -1545,9 +1566,12 @@ def main(argv: list[str] | None = None) -> int:
                         help="with --grant-consent, the JSON overrides the "
                              "daemon runs with, so consent covers the model it "
                              f"will open (default: ${daemon_config.ENV_CONFIG})")
+    parser.add_argument("--recommend", action="store_true",
+                        help="read-only sizing of dictation models through the "
+                             "shared model sizer")
     parser.add_argument("--json", action="store_true",
                         help="with --models, emit the versioned machine-readable "
-                             "catalog contract")
+                             "catalog contract; with --recommend, the sizing report")
     parser.add_argument("--install", choices=tuple(MODEL_BY_ID),
                         metavar="MODEL",
                         help="install one model through Kilix's verified lazy "
@@ -1572,8 +1596,17 @@ def main(argv: list[str] | None = None) -> int:
                         version=f"kilix-stt {__version__}")
     args = parser.parse_args(argv)
 
+    if args.recommend:
+        if any(value != parser.get_default(key) for key, value in vars(args).items()
+               if key not in {"recommend", "json"}):
+            parser.error("--recommend is standalone; optionally add --json")
+        try:
+            sizing.print_report(_size_models(), as_json=args.json)
+        except sizing.SizerError as error:
+            parser.exit(1, f"kilix-stt: {error}\n")
+        return 0
     if args.json and not args.models:
-        parser.error("--json requires --models")
+        parser.error("--json requires --models or --recommend")
 
     changes = dict(args.changes)
     try:

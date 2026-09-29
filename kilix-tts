@@ -771,9 +771,9 @@ def _draw(stdscr, values: dict, dirty: int, status: Status, last_error: str,
     if scroll + available < len(items):
         more.append("↓ more")
     help_text = ("←/→ section · ↑/↓ move · Enter run · s save · r refresh · "
-                 "q quit" if section_index == TEST_SECTION_INDEX else
+                 "n size models · q quit" if section_index == TEST_SECTION_INDEX else
                  "←/→ section · ↑/↓ move · Space change · ⌫ back · e type · "
-                 "d defaults · s save · q quit")
+                 "d defaults · s save · n size models · q quit")
     footer = " · ".join((*more, help_text))
     body = tui_shell.draw(
         stdscr,
@@ -971,6 +971,12 @@ def _run_tui(stdscr, initial_section: int | None = None) -> int:
         elif key in (ord("r"), ord("R")):
             status = probe()
             message = "Re-checked the daemon, the engine and the sink."
+        elif key in (ord("n"), ord("N")):
+            # Advisory only: nothing is selected, saved or installed.
+            try:
+                message = sizing.summary(_size_models())
+            except sizing.SizerError as error:
+                message = str(error)
         elif key in (ord("s"), ord("S")):
             changes = {name: staged for name, staged in values.items()
                        if original[name] != staged}
@@ -1136,6 +1142,16 @@ def _print_status() -> None:
     print(f"engine_detail={status.engine_detail}")
     print(f"output_available={'yes' if status.output_ok else 'no'}")
     print(f"output_detail={status.output_detail}")
+
+
+def _size_models() -> dict:
+    """Ask the shared model sizer about request-selectable speech; read-only."""
+    # Package presence is separate from an exact runtime/artifact match.
+    return sizing.recommend("tts", {
+        models.TTS_ENGINE_ESPEAK: tts_lib.espeak_binary() is not None,
+        models.TTS_ENGINE_MBROLA: None,
+        models.PIPER_KRISTIN_MODEL: tts_lib.piper_status()[0],
+    })
 
 
 def _print_models() -> None:
@@ -1402,12 +1418,7 @@ def main(argv: list[str] | None = None) -> int:
                if key not in {"recommend", "json"}):
             parser.error("--recommend is standalone; optionally add --json")
         try:
-            report = sizing.recommend("tts", {
-                models.TTS_ENGINE_ESPEAK: tts_lib.espeak_binary() is not None,
-                models.TTS_ENGINE_MBROLA: None,
-                models.PIPER_KRISTIN_MODEL: tts_lib.piper_status()[0],
-            })
-            sizing.print_report(report, as_json=args.json)
+            sizing.print_report(_size_models(), as_json=args.json)
         except sizing.SizerError as error:
             parser.exit(1, f"kilix-tts: {error}\n")
         return 0

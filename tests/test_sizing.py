@@ -84,5 +84,83 @@ class SizerClientTests(unittest.TestCase):
                 sizing._run([sys.executable, "-c", program], b"{}")
 
 
+class VoiceSizingActionsTests(unittest.TestCase):
+    def setUp(self):
+        self.stt = load_stt_tool()
+        self.tts = load_tool()
+
+    def test_cli_recommendations_never_save_install_or_speak(self):
+        for task, tool in (("stt", self.stt), ("tts", self.tts)):
+            report = response(sizing.request_document(task, {}), task)
+            output = StringIO()
+            with mock.patch.object(tool, "_size_models", return_value=report), \
+                 mock.patch.object(settings, "update") as save, redirect_stdout(output):
+                self.assertEqual(tool.main(["--recommend", "--json"]), 0)
+            save.assert_not_called()
+            self.assertEqual(json.loads(output.getvalue()), report)
+
+    def test_sizing_cannot_be_combined_with_mutations(self):
+        for tool, extra in ((self.stt, ["--default", "small-en-us"]), (self.stt, ["--install", "small-en-us"]),
+                            (self.tts, ["--speak", "hello"]), (self.tts, ["--set", "engine=piper"])):
+            with redirect_stderr(StringIO()), mock.patch.object(tool, "_size_models") as size, self.assertRaises(SystemExit) as error:
+                tool.main(["--recommend", *extra])
+            self.assertEqual(error.exception.code, 2)
+            size.assert_not_called()
+
+    def test_missing_provider_has_nonzero_exit_and_no_heuristic_fallback(self):
+        for tool in (self.stt, self.tts):
+            output = StringIO()
+            with mock.patch.object(tool, "_size_models", side_effect=sizing.SizerError("unavailable")), \
+                 redirect_stdout(output), redirect_stderr(StringIO()), self.assertRaises(SystemExit) as error:
+                tool.main(["--recommend", "--json"])
+            self.assertEqual(error.exception.code, 1)
+            self.assertEqual(output.getvalue(), "")
+
+    def test_dictation_tui_sizing_does_not_select_or_write_settings(self):
+        tool = self.stt
+        ui = tool.Ui.__new__(tool.Ui)
+        ui._section = tool.SECTION_MODELS
+        ui._selected = [0] * len(tool.SECTIONS)
+        ui._discard_armed = False
+        ui._sizing_report = None
+        report = response(sizing.request_document("stt", {}), "stt")
+        with mock.patch.object(tool, "_size_models", return_value=report), \
+             mock.patch.object(settings, "update") as save, mock.patch.object(ui, "_use_model") as choose:
+            ui._handle(ord("n"))
+        self.assertEqual(ui._sizing_report, report)
+        self.assertIn("Smallest resource candidate", ui._message)
+        save.assert_not_called(); choose.assert_not_called()
+
+    def test_read_aloud_tui_requests_sizing_without_changing_values(self):
+        tool = self.tts
+        screen = mock.Mock(); screen.getch.side_effect = [ord("n"), ord("q")]
+        report = response(sizing.request_document("tts", {}), "tts")
+        with mock.patch.object(tool.curses, "curs_set"), mock.patch.object(tool, "discover_voices", return_value=()), \
+             mock.patch.object(tool, "discover_sinks", return_value=()), mock.patch.object(tool, "probe"), \
+             mock.patch.object(tool, "_draw") as draw, mock.patch.object(tool, "_size_models", return_value=report), \
+             mock.patch.object(settings, "update") as save:
+            self.assertEqual(tool._run_tui(screen), 0)
+        self.assertIn("Smallest resource candidate", draw.call_args.args[-1])
+        save.assert_not_called()
+
+    def test_installed_runtime_can_delegate_without_source_or_pythonpath(self):
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            temp = Path(directory); prefix = temp / "prefix"
+            subprocess.run(["make", "install", f"PREFIX={prefix}"], cwd=root, check=True, capture_output=True)
+            provider = temp / "provider"
+            provider.write_text(f"#!{sys.executable}\nimport json,sys\nrequest=json.load(sys.stdin)\nprint(json.dumps(request))\n")
+            provider.chmod(0o700)
+            env = {"PATH": os.environ.get("PATH", ""), "PLEBIAN_MODEL_SIZER": str(provider),
+                   "GPU_TERMINAL_HOME": str(temp / "data"), "PYTHONDONTWRITEBYTECODE": "1"}
+            # The fake returns a request instead of a response: proving that
+            # the installed module executes and validates the provider reply.
+            result = subprocess.run([str(prefix / "bin/kilix-stt"), "--recommend"], cwd=temp,
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("incompatible or mismatched", result.stderr)
+            self.assertFalse((temp / "data").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

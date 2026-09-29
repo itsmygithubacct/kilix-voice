@@ -1417,7 +1417,10 @@ class Daemon(OwnedTurns):
 
     # -- speak --------------------------------------------------------------
 
-    def _op_speak(self, request: dict) -> dict:
+    def _op_speak(self, request: dict,
+                  claim: Callable[["_SpeechTurn"], None] | None = None) -> dict:
+        # `claim` is an owned turn's admission: it must not replace other
+        # audio, and it registers the turn under the lock before it starts.
         # The budget starts HERE, before configuration refresh, engine
         # construction and text splitting. Computing it after preparation gave
         # every request a fresh full budget no matter how long preparation
@@ -1511,6 +1514,14 @@ class Daemon(OwnedTurns):
                 # recorded.
                 turn.on_settle = ledger.record
             with self._lock:
+                if claim is not None:
+                    if (self._speech is not None or self._arbiter.listening
+                            or self._arbiter.speaking):
+                        return protocol.reply_error(
+                            "Audio is busy", protocol.ERR_BUSY)
+                    claim(turn)
+                else:
+                    self._owned_supersede()
                 self._cancel_speech()      # a new read replaces the old one
                 self._speech_error = ""
                 self._speech_error_turn = ""
