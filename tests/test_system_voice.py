@@ -15,7 +15,7 @@ class StartupVoiceTests(unittest.TestCase):
         wait = mock.Mock(side_effect=[False, True])
         with mock.patch.object(licensing, 'require_covering_receipt') as receipt, contextlib.redirect_stdout(io.StringIO()):
             system_voice.run(greeting, wait=wait, loaded=lambda: loaded,
-                engine_factory=lambda **kw: engine, player_factory=lambda cfg: player)
+                engine_factory=lambda **kw: engine, player_factory=lambda cfg: player, monitor_factory=None)
         receipt.assert_called_once()
         player.close.assert_called_once()
         return engine, player
@@ -34,6 +34,42 @@ class StartupVoiceTests(unittest.TestCase):
         engine, player = self.run_voice('Welcome back', loaded=False)
         self.assertEqual(engine.synth.call_args_list, [mock.call('Welcome back'), mock.call('hello')])
         player.play.assert_called_once()
+
+    def test_alerts_use_cached_audio_and_close_monitor(self):
+        phrases = ('WARNING: the system is overheating', 'battery low',
+                   'battery critically low', 'offline', 'heavy swapping')
+        engine = mock.Mock()
+        engine.synth.side_effect = lambda text: (text.encode(), 22050)
+        player = mock.Mock(error=None)
+        monitor = mock.Mock(phrases=phrases)
+        monitor.poll.side_effect = [[phrase] for phrase in phrases]
+        wait = mock.Mock(side_effect=[False]*5+[True])
+        with mock.patch.object(licensing, 'require_covering_receipt'), contextlib.redirect_stdout(io.StringIO()):
+            system_voice.run('', wait=wait, loaded=lambda: True,
+                engine_factory=lambda **kw: engine, player_factory=lambda cfg: player,
+                monitor_factory=lambda: monitor, clock=lambda: 0)
+        self.assertEqual(engine.synth.call_args_list,
+                         [mock.call('hello')]+[mock.call(p) for p in phrases])
+        self.assertEqual(player.play.call_args_list,
+                         [mock.call(p.encode(), 22050) for p in phrases])
+        monitor.close.assert_called_once()
+        player.close.assert_called_once()
+        engine.close.assert_called_once()
+        self.assertTrue(all(call == mock.call(2) for call in wait.call_args_list))
+
+    def test_playback_error_releases_monitor_and_player(self):
+        engine = mock.Mock()
+        engine.synth.return_value = (b'pcm', 22050)
+        player = mock.Mock(error='output unavailable')
+        monitor = mock.Mock(phrases=('offline',))
+        monitor.poll.return_value = ['offline']
+        with mock.patch.object(licensing, 'require_covering_receipt'), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(system_voice.tts.TtsError, 'output unavailable'):
+                system_voice.run('', wait=lambda _: False,
+                    engine_factory=lambda **kw: engine, player_factory=lambda cfg: player,
+                    monitor_factory=lambda: monitor, clock=lambda: 0)
+        monitor.close.assert_called_once()
+        player.close.assert_called_once()
 
     def test_refusal_precedes_engine_creation(self):
         factory=mock.Mock()

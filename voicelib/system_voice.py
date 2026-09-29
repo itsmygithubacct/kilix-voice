@@ -1,4 +1,4 @@
-"""Desktop-owned Piper session: greet once, then keep its shared provider warm."""
+"""Desktop-owned Piper greeting, cached health warnings, and provider keepalive."""
 from __future__ import annotations
 
 import json
@@ -6,6 +6,7 @@ import select
 import signal
 import subprocess
 import sys
+import time
 
 from . import audio, licensing, models, tts
 
@@ -31,36 +32,61 @@ def wait_for_owner(seconds):
     return bool(ready and not sys.stdin.read(1))
 
 
+def health_monitor():
+    try:
+        from kilix_sdk.health import HealthMonitor
+    except ImportError as error:
+        raise tts.TtsError('System alerts require the matching Kilix host; use kilix tts --system-voice.') from error
+    return HealthMonitor()
+
+
+def play_clip(player, clip):
+    player.play(*clip)
+    if not player.wait(60):
+        raise tts.TtsError('System voice playback timed out.')
+    if player.error:
+        raise tts.TtsError(player.error)
+
+
 def run(greeting='hello', *, wait=wait_for_owner, loaded=provider_loaded,
-        engine_factory=tts.PiperTts, player_factory=audio.Player):
+        engine_factory=tts.PiperTts, player_factory=audio.Player,
+        monitor_factory=health_monitor, clock=time.monotonic):
     greeting = validate_greeting(greeting)
     licensing.require_covering_receipt(models.PIPER_KRISTIN_MODEL)
     def stop(_signum, _frame):
         raise KeyboardInterrupt
 
     previous = signal.signal(signal.SIGTERM, stop)
-    engine = player = None
+    engine = player = monitor = None
     try:
         engine = engine_factory(rate=170)
         player = player_factory({})
         # An empty greeting still loads the model, without making a sound.
         clip = engine.synth(greeting or 'hello')
         if greeting:
-            player.play(*clip)
-            if not player.wait(60):
-                raise tts.TtsError('Startup greeting playback timed out.')
-            if player.error:
-                raise tts.TtsError(player.error)
+            play_clip(player, clip)
+        monitor = monitor_factory() if monitor_factory is not None else None
+        # Prepare fixed warnings once; incident playback needs no synthesis.
+        warning_clips = {phrase: engine.synth(phrase) for phrase in monitor.phrases} if monitor else {}
         print('System voice ready: Piper Kristin', flush=True)
-        while not wait(60):
-            # Status refreshes the provider's idle timer. Recover a restarted
-            # provider silently; the greeting belongs to desktop startup only.
-            if not loaded():
-                engine.synth('hello')
+        next_keepalive = clock()+60
+        while not wait(2 if monitor else 60):
+            if monitor:
+                for phrase in monitor.poll():
+                    if phrase in warning_clips:
+                        play_clip(player, warning_clips[phrase])
+            if monitor is None or clock() >= next_keepalive:
+                # Recovery stays silent. Alerts use cached PCM even if the
+                # shared provider has restarted in the meantime.
+                if not loaded():
+                    engine.synth('hello')
+                next_keepalive = clock()+60
     except KeyboardInterrupt:
         return 0
     finally:
         signal.signal(signal.SIGTERM, previous)
+        if monitor is not None:
+            monitor.close()
         if player is not None:
             player.close()
         if hasattr(engine, 'close'):
