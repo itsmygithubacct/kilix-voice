@@ -24,6 +24,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import threading
 import wave
 
 from typing import NamedTuple
@@ -556,6 +557,10 @@ class VibeVoiceStt:
         self._open = False
         self._closed = False
         self._process: subprocess.Popen | None = None
+        # Guards the closed flag, the held descriptors and the child handle,
+        # so close() on another thread can never land between reading the
+        # descriptors and starting the child that inherits them.
+        self._lifecycle = threading.Lock()
         self._held: dict[str, tuple[int, str]] = {}
         try:
             for name in models.REQUIRED_FILES[ENGINE_VIBEVOICE]:
@@ -656,23 +661,26 @@ class VibeVoiceStt:
                 wav.setsampwidth(2)
                 wav.setframerate(self._rate)
                 wav.writeframes(pcm)
-            vae_fd = self._held[VIBEASR_VAE][0]
-            lm_fd = self._held[VIBEASR_LM][0]
-            # The child opens the very files consent verified: the held
-            # descriptors are passed down and named through /proc/self/fd.
-            command = [self._binary,
-                       "--vae-model", f"/proc/self/fd/{vae_fd}",
-                       "--lm-model", f"/proc/self/fd/{lm_fd}",
-                       "--audio", audio_path, "-t", str(self._threads), "--greedy"]
             timeout = VIBEASR_BASE_TIMEOUT_S + VIBEASR_TIMEOUT_PER_AUDIO_S * seconds
-            self._require_unchanged("since dictation consent was checked")
-            # A local handle: close() on another thread clears self._process
-            # and kills the child, and this thread still reaps it and closes
-            # its pipes through communicate().
-            process = self._process = subprocess.Popen(
-                command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, start_new_session=True,
-                pass_fds=(vae_fd, lm_fd))
+            with self._lifecycle:
+                if self._closed:
+                    return ""             # closed before the child started
+                vae_fd = self._held[VIBEASR_VAE][0]
+                lm_fd = self._held[VIBEASR_LM][0]
+                # The child opens the very files consent verified: the held
+                # descriptors are passed down and named through /proc/self/fd.
+                command = [self._binary,
+                           "--vae-model", f"/proc/self/fd/{vae_fd}",
+                           "--lm-model", f"/proc/self/fd/{lm_fd}",
+                           "--audio", audio_path, "-t", str(self._threads), "--greedy"]
+                self._require_unchanged("since dictation consent was checked")
+                # A local handle: close() on another thread clears
+                # self._process and kills the child, and this thread still
+                # reaps it and closes its pipes through communicate().
+                process = self._process = subprocess.Popen(
+                    command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, start_new_session=True,
+                    pass_fds=(vae_fd, lm_fd))
             try:
                 stdout, stderr = process.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -684,10 +692,11 @@ class VibeVoiceStt:
                     f"audio within {timeout:.0f} s. The machine may be busy; try "
                     "again, or choose a lighter model.") from None
             returncode = process.returncode
-            self._process = None
-            if self._closed:
-                return ""
-            self._require_unchanged("while it was being transcribed")
+            with self._lifecycle:
+                self._process = None
+                if self._closed:
+                    return ""
+                self._require_unchanged("while it was being transcribed")
             if returncode != 0:
                 detail = _clean_text(stderr.decode("utf-8", "replace"))[-400:]
                 raise SttError(
@@ -703,10 +712,11 @@ class VibeVoiceStt:
 
     def close(self) -> None:
         self._open = False
-        self._closed = True
-        self._pcm = bytearray()
-        self._kill()
-        self._release()
+        with self._lifecycle:
+            self._closed = True
+            self._pcm = bytearray()
+            self._kill()
+            self._release()
 
     def _kill(self) -> None:
         # Only kills: the thread in end_utterance() owns the process and reaps

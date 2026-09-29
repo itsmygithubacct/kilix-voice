@@ -590,6 +590,37 @@ class VibeVoiceEngineTestCase(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertEqual(result, {"text": ""})
 
+    def test_close_before_the_child_starts_ends_the_turn_quietly(self) -> None:
+        # Seat 1 round 2: close() landing between the temporary WAV and the
+        # held-descriptor lookup raised KeyError. Pause the turn exactly there.
+        import threading
+        recogniser = self.engine()
+        entered, release = threading.Event(), threading.Event()
+        real = stt.paths.ensure_private_dir
+        result = {}
+
+        def paused(path, *args, **kwargs):
+            entered.set()
+            release.wait(10)
+            return real(path, *args, **kwargs)
+
+        def run() -> None:
+            try:
+                result["text"] = self.turn(recogniser)
+            except BaseException as error:        # recorded, not raised
+                result["error"] = error
+
+        with mock.patch.object(stt.paths, "ensure_private_dir", paused):
+            worker = threading.Thread(target=run)
+            worker.start()
+            self.assertTrue(entered.wait(10))
+            recogniser.close()
+            release.set()
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, {"text": ""})
+        self.assertEqual(self.calls(), [])        # no child was started
+
     def test_turns_do_not_share_audio(self) -> None:
         recogniser = self.engine()
         recogniser.start_utterance()
