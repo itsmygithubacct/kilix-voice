@@ -1343,7 +1343,33 @@ def main(argv: list[str] | None = None) -> int:
                         help='show the Piper notice and install the startup voice')
     parser.add_argument('--system-voice', action='store_true',
                         help='desktop-owned warm Piper session; --speak sets its greeting')
+    parser.add_argument('--reader-session', metavar='FILE',
+                        help='desktop document reader: JSON status and private stdin playback controls')
+    parser.add_argument('--enable-kristin', action='store_true',
+                        help='opt in: show the Piper notice, install Kristin, and make it the shared read-aloud default')
     args = parser.parse_args(argv)
+
+    if args.reader_session is not None or args.enable_kristin:
+        selected = 'reader_session' if args.reader_session is not None else 'enable_kristin'
+        if any(value != parser.get_default(key) for key, value in vars(args).items()
+               if key != selected):
+            parser.error('--reader-session and --enable-kristin are standalone')
+        if args.reader_session is not None:
+            from voicelib import document_reader
+            return document_reader.run(args.reader_session)
+        if not sys.stdin.isatty() or not sys.stdout.isatty():
+            parser.error('Kristin opt-in requires a terminal for the download notice')
+        try:
+            qwen_setup.install(qwen_setup.PIPER_ID)
+            print(_install_model(qwen_setup.PIPER_ID), flush=True)
+            settings.update({settings.KEY_TTS_ENGINE: models.TTS_ENGINE_PIPER,
+                             settings.KEY_TTS_VOICE: 'en_US-kristin-medium'})
+            print('Piper Kristin is now the default read-aloud voice.', flush=True)
+            return 0
+        except (qwen_setup.Declined, licensing.LicenseRefused) as error:
+            parser.exit(licensing.LICENCE_REFUSED_EXIT, f'kilix-tts: {error}\n')
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            parser.exit(1, f'kilix-tts: {error}\n')
 
     if args.prepare_system_voice or args.system_voice:
         allowed = {'prepare_system_voice', 'system_voice', 'speak'}

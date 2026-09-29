@@ -330,3 +330,27 @@ explicit first-use setup, then `kilix tts --system-voice --speak hello` with a
 pipe held open by the desktop. The latter is offline: it requires installed
 weights and their covering receipt, speaks once, and keeps Piper warm until
 stdin closes or the desktop terminates it. `--speak ''` preloads silently.
+
+### Document reading and Kristin opt-in
+
+Kilix 95 provides **Start → Programs → Document Reader** for TXT, Markdown and
+PDF files, with passage progress, Play, Pause/Resume, Stop, Previous and Next.
+It owns playback independently of the voice daemon. Pause resumes at the start
+of the current passage. PDFs require `pdftotext` (`poppler-utils`); scanned pages
+need OCR. Input is bounded to 16 MiB per file and 8 MiB of extracted UTF-8 text.
+
+To explicitly install Kristin and choose it as the shared read-aloud default:
+
+```sh
+kilix tts --enable-kristin
+```
+
+This requires a terminal, presents the voice download notice, and saves the
+preference only after installation succeeds. It does not enable startup speech.
+The desktop's **Use Kristin for read-aloud…** button runs this same opt-in.
+
+`--reader-session FILE` is the desktop bridge: newline-delimited JSON status on
+stdout, with private single-byte stdin commands (`p` play/resume, `a` pause,
+`s` stop/reset, `n` next, `b` previous, `q` quit). EOF stops its owned playback.
+Opening a session only loads text; speech starts on `p`. The current shared
+voice is read for each passage. No model is downloaded by opening a document.
