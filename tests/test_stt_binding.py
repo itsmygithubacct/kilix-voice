@@ -304,7 +304,7 @@ class EngineSelectionTestCase(unittest.TestCase):
         self.assertIn(stt.ENGINE_VIBEVOICE, str(caught.exception))
 
     def test_off_and_unknown_engines_give_the_null_recogniser(self) -> None:
-        for engine in (stt.ENGINE_OFF, "null", "whisper"):
+        for engine in (stt.ENGINE_OFF, "null", "kaldi"):
             with self.subTest(engine=engine):
                 recogniser = stt.make_stt({"stt": {"engine": engine}})
                 self.addCleanup(recogniser.close)

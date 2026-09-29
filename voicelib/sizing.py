@@ -167,6 +167,30 @@ def validate_report(report: dict, request: dict, task: str) -> None:
             or len(set(shortlist)) != len(shortlist) or set(shortlist) != fitting
             or provisional[task] != (shortlist[0] if shortlist else None)):
         raise SizerError("Model sizer returned an inconsistent recommendation.")
+    # plebian-model-sizer b58b871 adds the model to OFFER by default on this
+    # hardware. It is an offer, never a selection: it must be a fitting model
+    # of this request. A provider from before it simply names no default.
+    if "defaults" in report:
+        defaults = report["defaults"]
+        want = {"stt"} if task == "stt" else set()
+        if not isinstance(defaults, dict) or set(defaults) != want:
+            raise SizerError("Model sizer returned invalid defaults.")
+        for name in defaults.values():
+            if name is not None and (not isinstance(name, str) or name not in fitting):
+                raise SizerError("Model sizer offered a default that does not fit.")
+    if "cpu" in report and report["cpu"] is not None:
+        cpu = report["cpu"]
+        count, flags = (cpu.get("logical_cpus"), cpu.get("flags")) if isinstance(cpu, dict) else (0, 0)
+        if (not isinstance(cpu, dict) or set(cpu) != {"logical_cpus", "flags"}
+                or not (count is None or (type(count) is int and count > 0))
+                or not (flags is None or (isinstance(flags, list)
+                                          and all(isinstance(flag, str) for flag in flags)))):
+            raise SizerError("Model sizer returned an invalid CPU observation.")
+
+
+def default_model(report: dict) -> str | None:
+    """The model the sizer offers by default for this task and hardware."""
+    return (report.get("defaults") or {}).get(report["task"])
 
 
 def recommend(task: str, installed: dict[str, bool | None]) -> dict:
@@ -185,8 +209,12 @@ def recommend_request(request: dict, task: str) -> dict:
 
 def summary(report: dict) -> str:
     candidate = report["provisional_candidates"][report["task"]]
-    return (f"Smallest resource candidate: {candidate}. Selection remains manual." if candidate else
+    text = (f"Smallest resource candidate: {candidate}. Selection remains manual." if candidate else
             "No candidate has a usable resource estimate. See --recommend --json for details.")
+    default = default_model(report)
+    if default:
+        text += f"\nDefault for this hardware: {default}."
+    return text
 
 
 def print_report(report: dict, *, as_json: bool = False) -> None:

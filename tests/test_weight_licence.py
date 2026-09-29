@@ -161,7 +161,8 @@ class _WeightsFixture(unittest.TestCase):
     # line is already unique there, and kilix-tts's passes the same one, so its
     # anchor carries the statement that follows the install gate. The
     # count assertion below is the guard that keeps these honest.
-    GATE_STT = ("    licensing.require_covering_receipt(spec.catalog_id)\n", "")
+    GATE_STT = ("        licensing.require_covering_receipt(spec.catalog_id)\n",
+                "        pass\n")
     GATE_TTS = ("    licensing.require_covering_receipt(catalog_id)\n"
                 "    binary = tts_lib.piper_binary()\n",
                 "    binary = tts_lib.piper_binary()\n")
@@ -193,7 +194,7 @@ class _WeightsFixture(unittest.TestCase):
 
     def record_for(self, catalog_id: str):
         records = LICENCE.RecordIndex(LICENCE.load_determined_records())
-        return records.by_id(catalog_id)
+        return records.by_id(licensing.licence_record_id(catalog_id))
 
     def mint_receipt(self, catalog_id: str, *, manifest: str = FIXTURE_MANIFEST,
                      store=None):
@@ -312,7 +313,10 @@ class NoReceiptTests(_WeightsFixture):
                               result.stderr)
 
     def test_every_catalog_model_refuses(self) -> None:
-        for catalog_id in models.MODEL_IDS:
+        # A content-stored model hands straight to `kilix models install`, the
+        # acceptance route itself: see ContentStoredHandOffTests.
+        for catalog_id in (m for m in models.MODEL_IDS
+                           if m not in models.CONTENT_STORED_MODELS):
             with self.subTest(model=catalog_id):
                 before = self.store_snapshot()
                 result = self.run_tool("kilix-stt", "--install", catalog_id)
@@ -983,6 +987,32 @@ class CheckLicenceProbeTests(_WeightsFixture):
         result = self.run_tool("kilix-stt", "--check-licence", "not-a-model")
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn("invalid choice", result.stderr)
+
+
+class ContentStoredHandOffTests(_WeightsFixture):
+    """A content-stored model is fetched only through the acceptance route.
+
+    `kilix models install ASSET` is kilix-content's first-use flow: it shows
+    the licence and takes the typed agreement before anything is fetched, and
+    it writes the receipt. Requiring a receipt before handing to it would
+    only refuse the one command that can produce one, so with no receipt
+    kilix-stt runs exactly that, then the model's runtime installer, and
+    nothing else.
+    """
+
+    def test_whisper_hands_to_the_licence_screen_then_its_runtime(self) -> None:
+        result = self.run_tool("kilix-stt", "--install", models.WHISPER_MODEL)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._spy_log_text().splitlines(),
+                         ["models install faster-whisper-small-en", "voice whisper"])
+
+    def test_the_licence_record_is_the_content_assets(self) -> None:
+        self.assertEqual(licensing.licence_record_id(models.WHISPER_MODEL),
+                         "faster-whisper-small-en")
+        self.assertEqual(licensing.accept_command(models.WHISPER_MODEL),
+                         "kilix models install faster-whisper-small-en")
+        self.assertEqual(self.record_for(models.WHISPER_MODEL).id,
+                         "faster-whisper-small-en")
 
 
 class PlantedRegressionTests(_WeightsFixture):

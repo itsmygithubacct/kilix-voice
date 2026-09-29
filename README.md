@@ -74,6 +74,7 @@ kilix stt --install small-en-us                    # now installs
 | `piper-en-us-kristin-medium` | `piper-en-us-kristin-medium` |
 | `qwen3-tts-0.6b-customvoice` | `qwen3-tts-0.6b-customvoice` |
 | `vibevoice-asr-bitnet` | `vibevoice-asr-bitnet` |
+| `whisper-small-en` | `faster-whisper-small-en` |
 
 The two sides are bound by the licence record, not by either id: each asset
 names exactly the record digest this authority resolves for the catalog id
@@ -136,7 +137,9 @@ those paths touch the gate: `--print`, `--models`, `--models --json` and the
 whole read-aloud side keep working with no receipt and no authority. Only the
 three actions that cause weights to be fetched are gated — `kilix-stt
 --install` for the Vosk models and for the shared VibeVoice weights, and
-`kilix-tts --install` for the Piper voice.
+`kilix-tts --install` for the Piper voice. `kilix-stt --install
+whisper-small-en` hands straight to `kilix models install`: that command is
+the acceptance route itself, so it is not asked for a receipt first.
 
 One coupling is outside this repository: at the pinned ref,
 `kilix/scripts/install-kilix-voice.sh` fetches the Vosk wheel and the model in
@@ -257,6 +260,39 @@ live partials, and a turn takes roughly its own length again to transcribe on
 four threads. Decoding is greedy, so the same audio gives the same text. The
 turn's audio is written to a private temporary WAV under the voice session
 directory and removed as soon as transcription finishes.
+
+`whisper-small-en` is Whisper small English through the pinned
+`kilix-whisper-stt` provider (faster-whisper, int8 on the CPU). On the
+reference dictation it made about a third of the Vosk small model's errors
+and answered in about a second per sentence. It is the model sizer's default
+on a machine with AVX2, 8 logical CPUs and 16 GiB of RAM.
+
+```sh
+kilix stt --install whisper-small-en
+```
+
+The command above runs kilix-content's `kilix models install
+faster-whisper-small-en`, which shows the licence and takes the typed agreement
+before anything is fetched. It then installs the provider (`kilix voice
+whisper`). Weights that are already installed are not fetched again. Like
+VibeVoice, Whisper transcribes the turn when it ends. Its provider is started
+at the beginning of each turn, so the model loads while you speak.
+
+`kilix stt --setup-default [--result FILE]` is the first-run setup that Kilix 95
+offers. It:
+
+1. asks the model sizer which model suits this computer, falling back to
+   `small-en-us` when the sizer cannot answer;
+2. shows the plan and asks to go ahead;
+3. runs the licence screen and the install;
+4. asks permission for dictation to use the microphone, and records the
+   consent;
+5. makes the model the dictation default;
+6. names the dictation hotkey (Ctrl+Shift+D).
+
+With `--result FILE` it writes `{"status": "ready"|"declined"|"failed", "model":
+ID, "detail": TEXT}` atomically when it ends. It exits 0, 1 or 2 to match that
+status.
 
 `voicelib.models` is the canonical in-process catalog. Cross-process consumers
 use `kilix-stt --models --json`, whose `kilix.speech.models/v1` document

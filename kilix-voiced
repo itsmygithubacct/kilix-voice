@@ -2366,6 +2366,8 @@ class Daemon(OwnedTurns):
         # speaks keeps the turn listening instead of closing it empty.
         needs_words = bool(getattr(engine, "ends_on_words", False))
         words = False
+        # Read off the class, so only an engine written for it opts in.
+        at_end = getattr(type(engine), "transcribes_at_end", False) is True
         # A06 on the CAPTURE side. The time limit above bounds a WELL-BEHAVED
         # stream; it does not bound bytes, and a device reporting an absurd
         # rate or width delivers far more than max_seconds implies. R2: "Capture
@@ -2448,6 +2450,14 @@ class Daemon(OwnedTurns):
             elif event == events.VAD_SPEECH_END and speaking and not getattr(turn, "hold", False):
                 if needs_words and not words:
                     # Sound without a single word is not the end of dictation.
+                    speaking = False
+                    continue
+                if at_end and not engine.provisional():
+                    # The same rule for an engine that transcribes the whole
+                    # turn at once: it decodes what it has now. Nothing there
+                    # (a pop, a cough) drops that audio and keeps listening;
+                    # words end the turn, and end_utterance() returns them
+                    # without decoding again.
                     speaking = False
                     continue
                 break
@@ -2623,18 +2633,22 @@ class Daemon(OwnedTurns):
                     "detail": ("dictation is switched off. Set "
                                f"{settings.KEY_STT_ENGINE}="
                                f"{stt_lib.ENGINE_VOSK} to enable it.")}
-        if engine == stt_lib.ENGINE_VIBEVOICE:
+        if engine in (stt_lib.ENGINE_VIBEVOICE, stt_lib.ENGINE_WHISPER):
             try:
                 resolved = stt_lib.resolve_stt(self._cfg)
             except stt_lib.SttError as error:
                 return {"engine": engine, "model": model_id, "available": False,
                         "detail": str(error)}
-            missing = stt_lib.vibevoice_missing(resolved.model_dir)
+            vibevoice = engine == stt_lib.ENGINE_VIBEVOICE
+            missing = (stt_lib.vibevoice_missing if vibevoice
+                       else stt_lib.whisper_missing)(resolved.model_dir)
+            runtime = "VibeASR" if vibevoice else "Whisper"
             return {"engine": engine, "model": resolved.model_id,
-                    "runtime": stt_lib.vibeasr_binary(),
+                    "runtime": (stt_lib.vibeasr_binary() if vibevoice
+                                else stt_lib.whisper_binary()),
                     "model_path": resolved.model_dir, "available": not missing,
                     "detail": ("; ".join(missing) + "." if missing else
-                               "the VibeASR runtime and the model are both present")}
+                               f"the {runtime} runtime and the model are both present")}
         library = os.environ.get(stt_lib.ENV_LIBRARY) or paths.libvosk_path()
         if os.path.isdir(library):
             library = os.path.join(library, stt_lib.LIBRARY_BASENAME)

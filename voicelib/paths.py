@@ -121,7 +121,22 @@ def model_dir(catalog_id: str) -> str:
             f"invalid model id {catalog_id!r}: expected 1-64 characters from "
             "[A-Za-z0-9._-] starting with a letter or digit. Use a catalog id "
             "such as small-en-us.")
-    return os.path.join(models_dir(), token)
+    local = os.path.join(models_dir(), token)
+    from .models import CONTENT_STORED_MODELS
+    if token in CONTENT_STORED_MODELS and not os.path.isdir(local):
+        # kilix-content keeps these files; a copy under voice/models (placed
+        # there by hand or by an older installer) still wins when present.
+        return content_asset_dir(CONTENT_STORED_MODELS[token])
+    return local
+
+
+def content_asset_dir(asset_id: str) -> str:
+    """Where `kilix models install ASSET` publishes a verified asset.
+
+    kilix-content's installer root on the host is the Kilix data directory's
+    desktop-apps tree, and each asset is one directory named by its id.
+    """
+    return os.path.join(data_home(), "desktop-apps", "assets", asset_id)
 
 
 def ensure_private_dir(path: str, mode: int = DIR_MODE) -> str:

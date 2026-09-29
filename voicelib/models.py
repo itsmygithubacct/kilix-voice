@@ -19,8 +19,9 @@ CATALOG_SCHEMA = "kilix.speech.models/v1"
 
 ENGINE_VOSK = "vosk"
 ENGINE_VIBEVOICE = "vibevoice"
+ENGINE_WHISPER = "whisper"
 ENGINE_OFF = "off"
-ENGINE_CHOICES = (ENGINE_VOSK, ENGINE_VIBEVOICE, ENGINE_OFF)
+ENGINE_CHOICES = (ENGINE_VOSK, ENGINE_VIBEVOICE, ENGINE_WHISPER, ENGINE_OFF)
 
 TTS_ENGINE_ESPEAK = "espeak"
 TTS_ENGINE_MBROLA = "mbrola"
@@ -93,10 +94,25 @@ MODELS = (
         "on natural speech, transcribes when the turn ends (no live partials) "
         "and needs the VibeASR runtime built once",
     ),
+    ModelSpec(
+        "whisper-small-en",
+        ENGINE_WHISPER,
+        486100128,
+        True,
+        "Whisper small English through the kilix-whisper-stt provider: far "
+        "fewer errors than the Vosk models on natural dictation, transcribes "
+        "when the turn ends (about a second per sentence on a laptop CPU)",
+    ),
 )
 
 MODEL_BY_ID = {spec.catalog_id: spec for spec in MODELS}
 VIBEVOICE_MODEL = "vibevoice-asr-bitnet"
+WHISPER_MODEL = "whisper-small-en"
+# Models whose files kilix-content installs and keeps: the voice catalog id
+# maps to the content asset directory unless a copy exists under voice/models.
+# `kilix models install ASSET` shows the licence, records the receipt and
+# verifies every file against the pinned manifest, so there is one copy.
+CONTENT_STORED_MODELS = {WHISPER_MODEL: "faster-whisper-small-en"}
 MODEL_IDS = tuple(MODEL_BY_ID)
 
 TTS_MODELS = (
@@ -141,6 +157,7 @@ REQUIRED_FILES = {
         "vibeasr-lm-i2_s-embed-q6_k.gguf",
         "vibeasr-vae-encoder-i8_s.gguf",
     ),
+    ENGINE_WHISPER: ("model.bin", "config.json", "tokenizer.json", "vocabulary.txt"),
 }
 
 
@@ -159,7 +176,10 @@ __all__ = [
     "ENGINE_CHOICES",
     "ENGINE_OFF",
     "ENGINE_VIBEVOICE",
+    "ENGINE_WHISPER",
+    "CONTENT_STORED_MODELS",
     "VIBEVOICE_MODEL",
+    "WHISPER_MODEL",
     "ENGINE_VOSK",
     "MODELS",
     "MODEL_BY_ID",

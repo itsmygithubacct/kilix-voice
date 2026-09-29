@@ -44,6 +44,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from typing import NamedTuple
@@ -90,7 +91,8 @@ CONTROLS = (
             "The source dictation records from. 'default' follows whatever "
             "the sound server has been told is the system default."),
     Control(settings.KEY_STT_ENGINE, "Recogniser",
-            "vosk recognises locally through libvosk.so. 'off' closes the "
+            "vosk recognises locally through libvosk.so; whisper and "
+            "vibevoice transcribe each turn when it ends. 'off' closes the "
             "microphone to dictation entirely; read-aloud is unaffected."),
     Control(settings.KEY_STT_MODEL, "Model",
             "Which catalog model the recogniser loads. The Models tab shows "
@@ -443,6 +445,12 @@ def model_install_argv(spec: ModelSpec) -> list[str]:
         # Bonsai owns the file-level hashes and writes the exact directory the
         # voice catalog resolves, so there is one copy of these large weights.
         return [kilix, "bonsai", "pull", spec.catalog_id]
+    if spec.catalog_id in model_catalog.CONTENT_STORED_MODELS:
+        # kilix-content's first-use flow: the licence screen, the typed
+        # agreement and the receipt, then a download verified file by file
+        # into the directory the voice catalog resolves.
+        return [kilix, "models", "install",
+                model_catalog.CONTENT_STORED_MODELS[spec.catalog_id]]
     return [kilix, "voice", "install", "--model", spec.catalog_id]
 
 
@@ -452,6 +460,9 @@ def runtime_install_argv(spec: ModelSpec) -> list[str] | None:
         # VibeASR.cpp is built once from the host's pinned source; it is a
         # separate step because the weights are shared with Bonsai.
         return [kilix_launcher(), "voice", "vibeasr"]
+    if spec.engine == stt_lib.ENGINE_WHISPER:
+        # The pinned kilix-whisper-stt provider in its own environment.
+        return [kilix_launcher(), "voice", "whisper"]
     return None
 
 
@@ -487,14 +498,22 @@ def install_model(spec: ModelSpec, screen=None) -> int:
     status is 3 (a human must accept a licence), not 1 (the installer broke).
     Raises licensing.LicenseRefused when no receipt covers the model.
     """
-    licensing.require_covering_receipt(spec.catalog_id)
-    argv = model_install_argv(spec)
+    content_flow = spec.catalog_id in model_catalog.CONTENT_STORED_MODELS
+    if not content_flow:
+        licensing.require_covering_receipt(spec.catalog_id)
+    # A content-stored model is fetched only by `kilix models install`, which
+    # IS the acceptance route: it shows the licence and takes the typed
+    # agreement before any byte is fetched, so asking for a receipt first
+    # would only refuse the one command that can produce it. Installed
+    # weights are not fetched again, which would repeat the licence screen.
+    fetch = not (content_flow and model_payload_present(spec))
+    argv = model_install_argv(spec) if fetch else None
     if screen is not None:
         curses.def_prog_mode()
         curses.endwin()
         print(f"\nInstalling {spec.catalog_id} ({human_bytes(spec.size)})…\n")
     try:
-        status = subprocess.call(argv)
+        status = subprocess.call(argv) if argv is not None else 0
         runtime = runtime_install_argv(spec)
         if status == 0 and runtime is not None:
             status = subprocess.call(runtime)
@@ -538,9 +557,10 @@ def diagnose(values: dict[str, str]) -> Diagnostics:
         capture_ok, capture = False, str(error)
 
     engine = values[settings.KEY_STT_ENGINE]
-    if engine == stt_lib.ENGINE_VIBEVOICE:
-        # VibeVoice's "library" is the VibeASR executable, not libvosk.
-        library = stt_lib.vibeasr_binary()
+    if engine in (stt_lib.ENGINE_VIBEVOICE, stt_lib.ENGINE_WHISPER):
+        # The "library" is the engine's runtime executable, not libvosk.
+        library = (stt_lib.vibeasr_binary() if engine == stt_lib.ENGINE_VIBEVOICE
+                   else stt_lib.whisper_binary())
         library_ok = os.path.isfile(library) and os.access(library, os.X_OK)
     else:
         library = library_path()
@@ -565,6 +585,14 @@ def diagnose(values: dict[str, str]) -> Diagnostics:
         elif not library_ok:
             note = (f"the VibeASR runtime is not built yet; run `kilix stt "
                     f"--install {model_catalog.VIBEVOICE_MODEL}`.")
+    elif engine == stt_lib.ENGINE_WHISPER:
+        spec = MODEL_BY_ID.get(model_id)
+        if spec is not None and spec.engine != stt_lib.ENGINE_WHISPER:
+            note = (f"{model_id} is a {spec.engine} model and Whisper cannot "
+                    f"load it. Choose {model_catalog.WHISPER_MODEL} in the Models tab.")
+        elif not library_ok:
+            note = (f"the Whisper runtime is not installed yet; run `kilix stt "
+                    f"--install {model_catalog.WHISPER_MODEL}`.")
     elif engine == stt_lib.ENGINE_VOSK:
         spec = MODEL_BY_ID.get(model_id)
         if spec is not None and spec.engine != stt_lib.ENGINE_VOSK:
@@ -1606,6 +1634,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--default", choices=tuple(MODEL_BY_ID),
                         dest="default_model", metavar="MODEL",
                         help="make one model and its matching engine the default")
+    parser.add_argument("--setup-default", action="store_true",
+                        dest="setup_default",
+                        help="interactively install the model the sizer offers "
+                             "for this computer and set up dictation with it")
+    parser.add_argument("--result", metavar="FILE",
+                        help="with --setup-default, write the outcome as JSON "
+                             "to FILE when it ends")
     parser.add_argument("--set", action="append", default=[], dest="changes",
                         type=_parse_assignment, metavar="KEY=VALUE",
                         help="set one setting, for example submit=confirm "
@@ -1616,6 +1651,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version",
                         version=f"kilix-stt {__version__}")
     args = parser.parse_args(argv)
+
+    if args.result and not args.setup_default:
+        parser.error("--result requires --setup-default")
+    if args.setup_default:
+        if any(value != parser.get_default(key) for key, value in vars(args).items()
+               if key not in {"setup_default", "result"}):
+            parser.error("--setup-default is standalone; optionally add --result FILE")
+        return setup_default(args.result)
 
     if args.recommend:
         if any(value != parser.get_default(key) for key, value in vars(args).items()
@@ -1687,6 +1730,164 @@ def main(argv: list[str] | None = None) -> int:
         # The screen is already restored by the wrapper, and run()'s finally
         # has closed the microphone; nothing is left to say.
         return 0
+
+
+# -- first-run setup ----------------------------------------------------------
+
+# The model offered when the sizer names none or cannot be asked: the compact
+# Vosk model runs on any machine Kilix supports.
+SETUP_FALLBACK_MODEL = "small-en-us"
+SETUP_STATUS_EXIT = {"ready": 0, "declined": 1, "failed": 2}
+DICTATION_HOTKEY = "Ctrl+Shift+D"
+SETUP_REASONS = {
+    model_catalog.WHISPER_MODEL: (
+        "This computer has the processor and memory for Whisper small "
+        "English. On the reference dictation it made about a third of the "
+        "errors of the compact model and answered in about a second a "
+        "sentence."),
+    SETUP_FALLBACK_MODEL: (
+        "The compact English model suits this computer: it starts fast and "
+        "recognises as you speak."),
+}
+
+
+class SetupDeclined(Exception):
+    """The user said no at one of the setup's questions."""
+
+
+def _ask(question: str, *, default: bool) -> bool:
+    """One yes/no question on the terminal; end of input is a no."""
+    hint = "[Y/n]" if default else "[y/N]"
+    while True:
+        try:
+            answer = input(f"{question} {hint} ").strip().lower()
+        except EOFError:
+            print()
+            return False
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print("Please answer y or n.")
+
+
+def setup_default_model() -> tuple[str, str]:
+    """The model to set up, and why: the sizer's default for this hardware."""
+    try:
+        chosen = sizing.default_model(_size_models())
+    except sizing.SizerError as error:
+        return SETUP_FALLBACK_MODEL, (
+            f"The model sizer could not be asked ({error}), so the compact "
+            "model that runs everywhere is offered.")
+    if chosen not in MODEL_BY_ID:
+        return SETUP_FALLBACK_MODEL, (
+            "The model sizer found no model that clearly fits this computer's "
+            "free memory, so the compact model is offered.")
+    return chosen, SETUP_REASONS.get(chosen, "The model sizer chose it for this computer.")
+
+
+def _write_result(path: str, status: str, model: str | None, detail: str) -> None:
+    target = os.path.abspath(os.path.expanduser(path))
+    directory = os.path.dirname(target)
+    handle, temporary = tempfile.mkstemp(prefix=".setup-", dir=directory)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump({"status": status, "model": model, "detail": detail}, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _setup_steps() -> tuple[str, str]:
+    """Run the interactive setup; return (model, detail) once ready."""
+    model_id, reason = setup_default_model()
+    spec = MODEL_BY_ID[model_id]
+    installed = model_payload_present(spec, model_dir(model_id))
+    print("Kilix dictation setup\n")
+    print(f"Model: {model_id} ({human_bytes(spec.size)} download)")
+    print(textwrap.fill(reason, 76))
+    print()
+    steps = []
+    if not installed:
+        steps.append("show the model's licence and, if you accept it, download "
+                     "and verify the model")
+    if runtime_install_argv(spec) is not None:
+        steps.append("install or update its speech-recognition runtime")
+    steps += ["ask your permission for dictation to use the microphone",
+              "make it the dictation model"]
+    for number, step in enumerate(steps, 1):
+        print(f"  {number}. {step}")
+    print()
+    if not _ask("Set up dictation now?", default=True):
+        raise SetupDeclined("setup was declined")
+    if not installed and model_id not in model_catalog.CONTENT_STORED_MODELS:
+        # The Vosk installer needs a receipt first; the licence screen that
+        # writes one is kilix-content's, so it is shown here when missing.
+        try:
+            licensing.require_covering_receipt(model_id)
+        except licensing.LicenseRefused:
+            status = subprocess.call([kilix_launcher(), "models", "install",
+                                      licensing.content_asset_id(model_id)])
+            if status != 0:
+                raise SetupDeclined(
+                    f"the licence was not accepted, or its installer exited {status}")
+    needs_runtime = runtime_install_argv(spec) is not None
+    status = install_model(spec) if not installed or needs_runtime else 0
+    if status != 0:
+        raise SetupDeclined(
+            f"the installer exited {status}; a declined licence also ends here")
+    if not model_payload_present(spec, model_dir(model_id)):
+        raise RuntimeError(f"the installer finished but {model_id} is not at "
+                           f"{tilde(model_dir(model_id))}")
+    print()
+    print(textwrap.fill(
+        "Dictation records from your microphone only while you dictate, and "
+        "the speech is recognised on this computer; nothing is sent anywhere. "
+        "Changing the model later asks again.", 76))
+    if not _ask(f"Allow dictation to use the microphone with {model_id}?", default=False):
+        raise SetupDeclined("microphone permission was not given")
+    previous = {settings.KEY_STT_MODEL: settings.stt_model(),
+                settings.KEY_STT_ENGINE: settings.stt_engine()}
+    settings.update({settings.KEY_STT_MODEL: model_id,
+                     settings.KEY_STT_ENGINE: spec.engine})
+    try:
+        _consent_command(argparse.Namespace(revoke_consent=False, config=None))
+    except BaseException:
+        settings.update(previous)
+        raise
+    return model_id, f"{model_id} is the dictation model"
+
+
+def setup_default(result_path: str | None = None) -> int:
+    """First-run dictation setup, as Kilix 95 offers it; exit 0, 1 or 2."""
+    status, model, detail = "failed", None, ""
+    try:
+        model, detail = _setup_steps()
+        status = "ready"
+        print(f"\nDictation is ready. Press {DICTATION_HOTKEY} in a Kilix terminal "
+              "to start dictating, and again to stop.")
+    except (SetupDeclined, KeyboardInterrupt) as error:
+        status = "declined"
+        detail = str(error) or "setup was interrupted"
+        print(f"\nDictation was not set up: {detail}. Run `kilix stt "
+              "--setup-default` to try again.")
+    except (licensing.LicenseRefused, ModelInstallError, settings.SettingsError,
+            paths.PathError, daemon_config.ConfigError, stt_lib.SttError,
+            model_consent.ConsentError, OSError, RuntimeError) as error:
+        detail = str(error)
+        print(f"\nDictation setup failed: {detail}", file=sys.stderr)
+    finally:
+        if result_path:
+            _write_result(result_path, status, model, detail)
+    return SETUP_STATUS_EXIT[status]
 
 
 def _consent_command(args) -> None:

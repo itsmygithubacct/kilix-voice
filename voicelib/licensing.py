@@ -115,6 +115,7 @@ CONTENT_ASSET_ID = {
     "lgraph-en-us": "vosk-model-en-us-0.22-lgraph",
     "piper-en-us-kristin-medium": "piper-en-us-kristin-medium",
     "vibevoice-asr-bitnet": "vibevoice-asr-bitnet",
+    "whisper-small-en": "faster-whisper-small-en",
 }
 
 
@@ -128,6 +129,17 @@ CONTENT_ASSET_ID = {
 CHECK_FLAG = "--check-licence"
 CHECK_TOOL_BY_MODEL = {models.PIPER_KRISTIN_MODEL: "kilix-tts"}
 DEFAULT_CHECK_TOOL = "kilix-stt"
+
+
+# The licence record is keyed by this catalog's id for every model whose
+# record predates it; a model catalogued first in kilix-content is keyed by
+# its content asset id instead.
+LICENCE_RECORD_ID = {"whisper-small-en": "faster-whisper-small-en"}
+
+
+def licence_record_id(catalog_id: str) -> str:
+    """Return the kilix-license record id this model's weights are under."""
+    return LICENCE_RECORD_ID.get(catalog_id, catalog_id)
 
 
 def content_asset_id(catalog_id: str) -> str:
@@ -294,7 +306,7 @@ def require_covering_receipt(catalog_id: str, *, manifest_digest: str | None = N
             f"the {AUTHORITY_DISTRIBUTION} authority could not read its "
             f"licence records ({_detail(error)})") from error
     try:
-        record = records.by_id(catalog_id)
+        record = records.by_id(licence_record_id(catalog_id))
     except KeyError as error:
         raise LicenseRefused(
             catalog_id,
@@ -319,7 +331,7 @@ def require_covering_receipt(catalog_id: str, *, manifest_digest: str | None = N
         try:
             return kilix_license.require(
                 kilix_license.AssetRef(
-                    id=catalog_id,
+                    id=licence_record_id(catalog_id),
                     record_digest=record.digest,
                     manifest_digest=manifest_digest),
                 records=records, store=store)

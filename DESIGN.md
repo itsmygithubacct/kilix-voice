@@ -60,8 +60,8 @@ repo never invents a private config file.
 | `KILIX_VOICE_TTS_RATE` | `170` | `120`,`150`,`170`,`200`,`240` |
 | `KILIX_VOICE_TTS_EXTENT` | `screen` | `screen`,`scrollback`,`selection` |
 | `KILIX_VOICE_TTS_MAX_CHARS` | `4000` | `1000`,`4000`,`16000`,`unlimited` |
-| `KILIX_VOICE_STT_ENGINE` | `vosk` | `vosk`, `vibevoice`, `off` |
-| `KILIX_VOICE_STT_MODEL` | `small-en-us` | `small-en-us`,`lgraph-en-us`,`vibevoice-asr-bitnet` |
+| `KILIX_VOICE_STT_ENGINE` | `vosk` | `vosk`, `vibevoice`, `whisper`, `off` |
+| `KILIX_VOICE_STT_MODEL` | `small-en-us` | `small-en-us`,`lgraph-en-us`,`vibevoice-asr-bitnet`,`whisper-small-en` |
 | `KILIX_VOICE_STT_SUBMIT` | `never` | `never`, `confirm` — **no `always` value exists** |
 | `KILIX_VOICE_STT_MAX_SECONDS` | `30` | `15`,`30`,`60`,`120` |
 | `KILIX_VOICE_STT_SILENCE_MS` | `900` | `500`,`900`,`1500` |
@@ -373,6 +373,30 @@ It never falls back to vosk: a missing runtime or GGUF raises `SttError`
 naming what is missing and `kilix stt --install vibevoice-asr-bitnet`.
 The runtime is `$KILIX_DATA_HOME/voice/vibeasr/current/bin/asr_infer`, or
 `KILIX_VOICE_VIBEASR`; there is no PATH fallback.
+
+`whisper` gives `WhisperStt`, which always uses `whisper-small-en`. Its files
+are the kilix-content asset `faster-whisper-small-en`, used where
+`kilix models install` publishes it
+(`$KILIX_DATA_HOME/desktop-apps/assets/faster-whisper-small-en`), so there is
+one copy; a directory at `$KILIX_DATA_HOME/voice/models/whisper-small-en`
+wins when present. The engine starts one `kilix-whisper-stt serve` child when it is
+built, before the microphone opens, so the model loads while the user speaks;
+the child is killed by `close()` and never outlives the recogniser. It is
+given the held model descriptors through a private directory of
+`/proc/self/fd/N` links (pass_fds). Consent is re-checked once the model has
+loaded and after every decode. Each decode sends `{"pcm_bytes": N}` plus the
+PCM and reads one JSON line, under a bound of 20 s plus 3 s per second of
+audio; the model load is bounded at 60 s. The runtime is
+`$KILIX_DATA_HOME/voice/whisper/current/bin/kilix-whisper-stt` (installed by
+`kilix voice whisper`), or `KILIX_VOICE_WHISPER`; there is no PATH fallback.
+
+Both whole-utterance engines have `provisional()`, and their class sets
+`transcribes_at_end`. At a VAD speech end the daemon asks for a provisional
+transcript. If it is empty (a start-up pop, a cough), that audio is dropped
+and the turn keeps listening. If it holds words, the turn ends, and
+`end_utterance()` returns them without decoding again when no audio arrived
+since. This is the Vosk `ends_on_words` rule for engines without partial
+results.
 
 Consent binds the SHA-256 of every required model file. Those digests are
 cached per process only for files whose ctime and mtime were already two

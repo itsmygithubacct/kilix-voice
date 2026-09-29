@@ -21,10 +21,12 @@ import dataclasses
 import json
 import os
 import re
+import select
 import stat
 import subprocess
 import tempfile
 import threading
+import time
 import wave
 
 from typing import NamedTuple
@@ -52,6 +54,22 @@ VIBEASR_LM = "vibeasr-lm-i2_s-embed-q6_k.gguf"
 VIBEASR_BASE_TIMEOUT_S = 30.0
 VIBEASR_TIMEOUT_PER_AUDIO_S = 4.0
 VIBEASR_MAX_THREADS = 4
+# The kilix-whisper-stt provider (faster-whisper in its own pinned
+# environment). Like asr_infer there is no PATH fallback: without the override
+# only the managed install under the voice data directory is run.
+ENV_WHISPER = "KILIX_VOICE_WHISPER"
+WHISPER_BASENAME = "kilix-whisper-stt"
+# The provider imports its libraries and loads the model (about two seconds
+# on the reference laptop) while the user is already speaking. A decode runs
+# at an RTF near 0.3 on four threads; the bounds are generous so a loaded
+# machine is slow rather than refused, and finite so a wedged child cannot
+# hold the turn.
+WHISPER_READY_TIMEOUT_S = 60.0
+WHISPER_BASE_TIMEOUT_S = 20.0
+WHISPER_TIMEOUT_PER_AUDIO_S = 3.0
+WHISPER_MAX_THREADS = 4
+# A reply is one JSON line holding a transcript; anything longer is not one.
+WHISPER_MAX_REPLY_BYTES = 1 << 20
 # The daemon bounds a turn by stt.max_seconds; this is the engine's own ceiling
 # on buffered PCM (10 minutes at 16 kHz), so a caller bug cannot grow it freely.
 VIBEASR_MAX_BUFFER_BYTES = 16000 * 2 * 600
@@ -73,6 +91,7 @@ MAX_RATE = 192000
 # The data-only catalog owns the vocabulary from 0.1.3 onward.
 ENGINE_VOSK = models.ENGINE_VOSK
 ENGINE_VIBEVOICE = models.ENGINE_VIBEVOICE
+ENGINE_WHISPER = models.ENGINE_WHISPER
 ENGINE_OFF = models.ENGINE_OFF
 
 # name -> (argtypes, restype).  This is the whole of the C surface kilix-voice
@@ -509,66 +528,75 @@ def vibevoice_missing(model_dir: str | None) -> list[str]:
     return missing
 
 
-class VibeVoiceStt:
-    """VibeVoice-ASR-BitNet through the VibeASR.cpp ``asr_infer`` executable.
+def whisper_binary() -> str:
+    """Return the kilix-whisper-stt path Whisper would run; it may not exist."""
+    override = os.environ.get(ENV_WHISPER)
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(paths.data_dir(), "whisper", "current", "bin",
+                        WHISPER_BASENAME)
 
-    VibeVoice transcribes a whole utterance at once, so this engine buffers the
-    turn's PCM and runs one bounded, greedy (deterministic) ``asr_infer`` when
-    the turn ends. It has no partial results. The audio goes to a private
-    temporary WAV that is removed as soon as the process exits; nothing is
-    kept. ``close()`` kills a transcription still running.
 
-    Consent binds bytes, and asr_infer only opens the model when the turn
-    ends, so the model files are opened HERE, right after the consent gate,
-    and held. Their digest must equal the one consent was granted for; the
-    child is given those same descriptors (``/proc/self/fd/N``), so replacing
-    the path during the turn changes nothing it loads; and each held file's
-    stat is re-checked before and after the child runs. Any change re-hashes
-    the held bytes, and a transcript is refused unless they are still the
-    consented ones.
+def whisper_missing(model_dir: str | None) -> list[str]:
+    """Name what Whisper dictation lacks; empty when it can run."""
+    missing = []
+    binary = whisper_binary()
+    if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
+        missing.append(
+            f"the Whisper runtime is not at {binary}; install it with "
+            f"`kilix stt --install {models.WHISPER_MODEL}`")
+    if not model_dir or not os.path.isdir(model_dir):
+        missing.append(f"the {models.WHISPER_MODEL} model is not at "
+                       f"{model_dir or paths.model_dir(models.WHISPER_MODEL)}")
+    else:
+        for name in models.REQUIRED_FILES[ENGINE_WHISPER]:
+            if not os.path.isfile(os.path.join(model_dir, name)):
+                missing.append(f"{name} is missing from {model_dir}")
+    return missing
+
+
+def _checked_rate(rate) -> int:
+    try:
+        value = int(rate)
+    except (TypeError, ValueError) as error:
+        raise SttError(
+            f"sample rate must be an integer, got {rate!r}. Capture and "
+            f"recognition both run at {DEFAULT_RATE} Hz.") from error
+    if not MIN_RATE <= value <= MAX_RATE:
+        raise SttError(
+            f"sample rate {value} Hz is outside the usable range "
+            f"{MIN_RATE}-{MAX_RATE}. Create the recogniser with the rate "
+            f"the capture runs at, normally {DEFAULT_RATE}.")
+    return value
+
+
+def _checked_threads(threads, ceiling: int) -> int:
+    try:
+        return max(1, int(threads) if threads else min(
+            ceiling, max(1, (os.cpu_count() or 2) - 1)))
+    except (TypeError, ValueError) as error:
+        raise SttError(f"stt.threads must be an integer, got {threads!r}.") from error
+
+
+class _HeldPayload:
+    """Consent bound to held model files, for engines that load them later.
+
+    Consent binds bytes, and a child process opens the model after the gate,
+    so the model files are opened HERE, right after the consent gate, and
+    held. Their digest must equal the one consent was granted for; the child
+    is given those same descriptors (``/proc/self/fd/N``), so replacing the
+    path afterwards changes nothing it loads; and each held file's stat is
+    re-checked around the child's work. Any change re-hashes the held bytes,
+    and a transcript is refused unless they are still the consented ones.
     """
 
-    name = ENGINE_VIBEVOICE
-    supports_partials = False
+    name = ""
+    label = ""
 
-    def __init__(self, rate: int = DEFAULT_RATE, *, model_path: str | None = None,
-                 threads: int | None = None,
-                 consented_payload: str | None = None) -> None:
-        try:
-            self._rate = int(rate)
-        except (TypeError, ValueError) as error:
-            raise SttError(
-                f"sample rate must be an integer, got {rate!r}. Capture and "
-                f"recognition both run at {DEFAULT_RATE} Hz.") from error
-        if not MIN_RATE <= self._rate <= MAX_RATE:
-            raise SttError(
-                f"sample rate {self._rate} Hz is outside the usable range "
-                f"{MIN_RATE}-{MAX_RATE}. Create the recogniser with the rate "
-                f"the capture runs at, normally {DEFAULT_RATE}.")
-        # Checked before the generic directory resolution, whose message is
-        # about vosk: say everything VibeVoice lacks, runtime included.
-        missing = vibevoice_missing(
-            model_path or _intended_model_dir(models.VIBEVOICE_MODEL))
-        if missing:
-            raise SttError(f"VibeVoice dictation cannot run: {'; '.join(missing)}.")
-        self._model_path = _resolve_model(models.VIBEVOICE_MODEL, model_path)
-        self._binary = vibeasr_binary()
-        try:
-            self._threads = max(1, int(threads) if threads else min(
-                VIBEASR_MAX_THREADS, max(1, (os.cpu_count() or 2) - 1)))
-        except (TypeError, ValueError) as error:
-            raise SttError(f"stt.threads must be an integer, got {threads!r}.") from error
-        self._pcm = bytearray()
-        self._open = False
-        self._closed = False
-        self._process: subprocess.Popen | None = None
-        # Guards the closed flag, the held descriptors and the child handle,
-        # so close() on another thread can never land between reading the
-        # descriptors and starting the child that inherits them.
-        self._lifecycle = threading.Lock()
+    def _hold(self, consented_payload: str | None) -> None:
         self._held: dict[str, tuple[int, str]] = {}
         try:
-            for name in models.REQUIRED_FILES[ENGINE_VIBEVOICE]:
+            for name in models.REQUIRED_FILES[self.name]:
                 path = os.path.join(self._model_path, name)
                 try:
                     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
@@ -577,26 +605,19 @@ class VibeVoiceStt:
                 self._held[name] = (fd, path)
                 if not stat.S_ISREG(os.fstat(fd).st_mode):
                     raise SttError(f"{path} is not a regular file.")
+            self._stats_taken = time.time_ns()
             self._stats = self._held_stats()
-            self._payload = consent.payload_digest_of(ENGINE_VIBEVOICE, self._held)
+            self._payload = consent.payload_digest_of(self.name, self._held)
             if consented_payload is not None:
                 if self._payload != consented_payload:
                     raise SttError(
-                        f"the VibeVoice model in {self._model_path} changed after "
+                        f"the {self.label} model in {self._model_path} changed after "
                         "dictation consent was checked, so it was not loaded. "
                         "Grant consent again with `kilix-stt --grant-consent` if "
                         "the new files are intended.")
         except BaseException:
             self._release()
             raise
-
-    @property
-    def rate(self) -> int:
-        return self._rate
-
-    @property
-    def model_path(self) -> str:
-        return self._model_path
 
     def _held_stats(self) -> dict[str, tuple[int, int, int, int, int]]:
         stats = {}
@@ -606,18 +627,31 @@ class VibeVoiceStt:
                            info.st_mtime_ns, info.st_ctime_ns)
         return stats
 
+    def _settled(self, stats) -> bool:
+        """Whether equal stats can be trusted to mean equal bytes.
+
+        A write in the same timestamp tick as the snapshot leaves every stat
+        field as it was, so a file whose ctime or mtime was that recent when
+        the snapshot was taken is always re-hashed (git's racy-index rule,
+        as the consent digest cache uses).
+        """
+        limit = self._stats_taken - consent.RACY_SECONDS * 1_000_000_000
+        return all(mtime < limit and ctime < limit
+                   for _dev, _ino, _size, mtime, ctime in stats.values())
+
     def _require_unchanged(self, when: str) -> None:
+        taken = time.time_ns()
         stats = self._held_stats()
-        if stats == self._stats:
+        if stats == self._stats and self._settled(stats):
             return
         # Unlinking or replacing the path also moves a held file's ctime, with
         # its bytes intact; only the bytes decide. A rewrite always moves ctime,
         # even one that restores mtime, so it is always re-hashed here.
-        if consent.payload_digest_of(ENGINE_VIBEVOICE, self._held) == self._payload:
-            self._stats = stats
+        if consent.payload_digest_of(self.name, self._held) == self._payload:
+            self._stats, self._stats_taken = stats, taken
             return
         raise SttError(
-                f"a VibeVoice model file was modified {when}, so this turn's "
+                f"a {self.label} model file was modified {when}, so this turn's "
                 "transcript was discarded. Grant consent again with "
                 "`kilix-stt --grant-consent` if the change is intended.")
 
@@ -629,9 +663,29 @@ class VibeVoiceStt:
             except OSError:
                 pass
 
+
+class _WholeUtterance:
+    """A turn buffered in full and transcribed at once, with no partials.
+
+    ``provisional()`` lets the daemon ask, at a VAD speech end, whether the
+    segment so far holds any words. A start-up pop or a cough transcribes to
+    nothing: its audio is dropped and the turn keeps listening. Words are kept
+    as the turn's result, and ``end_utterance()`` returns them without a
+    second decode when no audio arrived since.
+    """
+
+    supports_partials = False
+    # Read off the class by the daemon, so a stand-in engine never opts in by
+    # accident.
+    transcribes_at_end = True
+
+    def _reset_turn(self) -> None:
+        self._pcm = bytearray()
+        self._provisional: tuple[int, str] | None = None
+
     def start_utterance(self) -> None:
         self._require_live()
-        self._pcm = bytearray()
+        self._reset_turn()
         self._open = True
 
     def feed(self, frame: bytes) -> str | None:
@@ -644,19 +698,93 @@ class VibeVoiceStt:
         data = _frame_bytes(frame)
         if len(self._pcm) + len(data) > VIBEASR_MAX_BUFFER_BYTES:
             raise SttError(
-                "this dictation turn exceeded VibeVoice's ten-minute buffer. "
+                f"this dictation turn exceeded {self.label}'s ten-minute buffer. "
                 f"Lower {settings.KEY_STT_MAX_SECONDS} or dictate in shorter turns.")
         self._pcm += data
         return None
+
+    def provisional(self) -> str:
+        """Transcribe the turn so far; an empty result drops that audio."""
+        self._require_live()
+        if not self._open or not self._pcm:
+            return ""
+        pcm = bytes(self._pcm)
+        text = self._decode(pcm)
+        if text:
+            self._provisional = (len(pcm), text)
+        elif len(self._pcm) == len(pcm):
+            self._reset_turn()
+        return text
 
     def end_utterance(self) -> str:
         self._require_live()
         if not self._open:
             return ""
         self._open = False
-        pcm, self._pcm = bytes(self._pcm), bytearray()
+        pcm, cached = bytes(self._pcm), self._provisional
+        self._reset_turn()
         if not pcm:
             return ""
+        # feed() only appends, so an equal length is the same audio.
+        if cached is not None and cached[0] == len(pcm):
+            return cached[1]
+        return self._decode(pcm)
+
+    def _require_live(self) -> None:
+        if self._closed:
+            raise SttError(
+                "this recogniser has been closed. Build a new one with "
+                "make_stt() for the next dictation turn.")
+
+
+class VibeVoiceStt(_HeldPayload, _WholeUtterance):
+    """VibeVoice-ASR-BitNet through the VibeASR.cpp ``asr_infer`` executable.
+
+    VibeVoice transcribes a whole utterance at once, so this engine buffers the
+    turn's PCM and runs one bounded, greedy (deterministic) ``asr_infer`` per
+    decode. It has no partial results. The audio goes to a private temporary
+    WAV that is removed as soon as the process exits; nothing is kept.
+    ``close()`` kills a transcription still running. asr_infer opens the model
+    only when it runs, so the files are held from construction
+    (:class:`_HeldPayload`).
+    """
+
+    name = ENGINE_VIBEVOICE
+    label = "VibeVoice"
+
+    def __init__(self, rate: int = DEFAULT_RATE, *, model_path: str | None = None,
+                 threads: int | None = None,
+                 consented_payload: str | None = None) -> None:
+        self._rate = _checked_rate(rate)
+        # Checked before the generic directory resolution, whose message is
+        # about vosk: say everything VibeVoice lacks, runtime included.
+        missing = vibevoice_missing(
+            model_path or _intended_model_dir(models.VIBEVOICE_MODEL))
+        if missing:
+            raise SttError(f"VibeVoice dictation cannot run: {'; '.join(missing)}.")
+        self._model_path = _resolve_model(models.VIBEVOICE_MODEL, model_path)
+        self._binary = vibeasr_binary()
+        self._threads = _checked_threads(threads, VIBEASR_MAX_THREADS)
+        self._reset_turn()
+        self._open = False
+        self._closed = False
+        self._process: subprocess.Popen | None = None
+        # Guards the closed flag, the held descriptors and the child handle,
+        # so close() on another thread can never land between reading the
+        # descriptors and starting the child that inherits them.
+        self._lifecycle = threading.Lock()
+        self._held = {}
+        self._hold(consented_payload)
+
+    @property
+    def rate(self) -> int:
+        return self._rate
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    def _decode(self, pcm: bytes) -> str:
         seconds = len(pcm) / 2 / self._rate
         work = paths.ensure_private_dir(os.path.join(paths.session_dir(), "stt"))
         handle, audio_path = tempfile.mkstemp(prefix="vibevoice-", suffix=".wav", dir=work)
@@ -724,17 +852,225 @@ class VibeVoiceStt:
             self._release()
 
     def _kill(self) -> None:
-        # Only kills: the thread in end_utterance() owns the process and reaps
+        # Only kills: the thread in _decode() owns the process and reaps
         # it, so two threads never communicate() with it at once.
         process, self._process = self._process, None
         if process is not None and process.poll() is None:
             process.kill()
 
-    def _require_live(self) -> None:
-        if self._closed:
+
+class WhisperStt(_HeldPayload, _WholeUtterance):
+    """Whisper through one persistent ``kilix-whisper-stt serve`` child.
+
+    The child is started at construction, before the microphone opens, so the
+    model loads while the user is already speaking and the first decode costs
+    only its own time. It is given the held model descriptors through a
+    private directory of ``/proc/self/fd/N`` links, so it loads exactly the
+    bytes consent verified (:class:`_HeldPayload`); the held files are
+    re-checked once the model has loaded and after every decode. Requests are
+    length-prefixed PCM on its stdin, replies one JSON line on its stdout,
+    each under a deadline. ``close()`` kills the child; nothing outlives the
+    recogniser.
+    """
+
+    name = ENGINE_WHISPER
+    label = "Whisper"
+
+    def __init__(self, rate: int = DEFAULT_RATE, *, model_path: str | None = None,
+                 threads: int | None = None, beam: int | None = None,
+                 consented_payload: str | None = None) -> None:
+        self._rate = _checked_rate(rate)
+        if self._rate != DEFAULT_RATE:
             raise SttError(
-                "this recogniser has been closed. Build a new one with "
-                "make_stt() for the next dictation turn.")
+                f"Whisper transcribes {DEFAULT_RATE} Hz audio; the capture runs "
+                f"at {self._rate} Hz.")
+        missing = whisper_missing(
+            model_path or _intended_model_dir(models.WHISPER_MODEL))
+        if missing:
+            raise SttError(f"Whisper dictation cannot run: {'; '.join(missing)}.")
+        self._model_path = _resolve_model(models.WHISPER_MODEL, model_path)
+        self._binary = whisper_binary()
+        self._threads = _checked_threads(threads, WHISPER_MAX_THREADS)
+        try:
+            self._beam = int(beam) if beam else 5
+        except (TypeError, ValueError) as error:
+            raise SttError(f"stt.beam must be an integer, got {beam!r}.") from error
+        self._reset_turn()
+        self._open = False
+        self._closed = False
+        self._ready = False
+        self._busy = False
+        self._process: subprocess.Popen | None = None
+        self._links: str | None = None
+        self._lifecycle = threading.Lock()
+        self._held = {}
+        self._hold(consented_payload)
+        try:
+            self._start()
+        except BaseException:
+            self.close()
+            raise
+
+    @property
+    def rate(self) -> int:
+        return self._rate
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    def _start(self) -> None:
+        work = paths.ensure_private_dir(os.path.join(paths.session_dir(), "stt"))
+        self._links = tempfile.mkdtemp(prefix="whisper-", dir=work)
+        for name, (fd, _path) in self._held.items():
+            os.symlink(f"/proc/self/fd/{fd}", os.path.join(self._links, name))
+        with self._lifecycle:
+            if self._closed:
+                return
+            self._require_unchanged("since dictation consent was checked")
+            self._process = subprocess.Popen(
+                [self._binary, "serve", "--model", self._links,
+                 "--threads", str(self._threads), "--beam", str(self._beam)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, start_new_session=True,
+                pass_fds=tuple(fd for fd, _path in self._held.values()))
+            self._stdout = bytearray()
+
+    def _read_reply(self, process: subprocess.Popen, deadline: float, what: str) -> dict:
+        fd = process.stdout.fileno()
+        while b"\n" not in self._stdout:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise SttError(
+                    f"Whisper did not answer within the time allowed {what}. The "
+                    "machine may be busy; try again, or choose a lighter model.")
+            ready, _, _ = select.select([fd], [], [], left)
+            if not ready:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                # End of output comes a moment before the exit status.
+                try:
+                    code = process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    code = None
+                raise SttError(
+                    f"the Whisper provider exited{f' with status {code}' if code is not None else ''} "
+                    f"{what}. Reinstall it with `kilix stt --install {models.WHISPER_MODEL}`.")
+            self._stdout += chunk
+            if len(self._stdout) > WHISPER_MAX_REPLY_BYTES:
+                raise SttError("the Whisper provider sent an over-long reply.")
+        line, _, rest = bytes(self._stdout).partition(b"\n")
+        self._stdout = bytearray(rest)
+        try:
+            reply = json.loads(line)
+        except ValueError:
+            reply = None
+        if not isinstance(reply, dict):
+            raise SttError("the Whisper provider sent a reply that is not JSON.")
+        if "error" in reply:
+            raise SttError(f"Whisper failed {what}: {_clean_text(str(reply['error']))[:400]}.")
+        return reply
+
+    def _write_all(self, process: subprocess.Popen, data: bytes, deadline: float) -> None:
+        fd = process.stdin.fileno()
+        view = memoryview(data)
+        while view:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise SttError("Whisper did not take the audio within the time allowed.")
+            _, ready, _ = select.select([], [fd], [], left)
+            if not ready:
+                continue
+            try:
+                written = os.write(fd, view[:65536])
+            except BrokenPipeError:
+                raise SttError(
+                    "the Whisper provider exited while it was being sent audio. "
+                    f"Reinstall it with `kilix stt --install {models.WHISPER_MODEL}`.") from None
+            view = view[written:]
+
+    def _decode(self, pcm: bytes) -> str:
+        seconds = len(pcm) / 2 / self._rate
+        with self._lifecycle:
+            if self._closed:
+                return ""
+            if self._process is None:
+                raise SttError(
+                    "the Whisper provider stopped after an earlier failure; "
+                    "the next dictation turn starts a new one.")
+            process, self._busy = self._process, True
+        try:
+            if not self._ready:
+                reply = self._read_reply(
+                    process, time.monotonic() + WHISPER_READY_TIMEOUT_S,
+                    "while loading the model")
+                if reply.get("ready") is not True:
+                    raise SttError("the Whisper provider did not report ready.")
+                self._ready = True
+                # Loaded: from here on nothing the path does can reach it,
+                # and the bytes it loaded must still be the consented ones.
+                self._require_unchanged("while the model was loading")
+            deadline = (time.monotonic() + WHISPER_BASE_TIMEOUT_S
+                        + WHISPER_TIMEOUT_PER_AUDIO_S * seconds)
+            os.set_blocking(process.stdin.fileno(), False)
+            self._write_all(process, b'{"pcm_bytes": %d}\n' % len(pcm) + pcm, deadline)
+            reply = self._read_reply(process, deadline, f"on {seconds:.1f} s of audio")
+            text = reply.get("text")
+            if not isinstance(text, str):
+                raise SttError("the Whisper provider sent a reply without text.")
+            self._require_unchanged("while it was being transcribed")
+            return _clean_text(text)
+        except SttError:
+            if self._closed:
+                return ""
+            self._stop_child()
+            raise
+        finally:
+            with self._lifecycle:
+                self._busy = False
+                if self._closed:
+                    self._reap(process)
+
+    def _stop_child(self) -> None:
+        with self._lifecycle:
+            process, self._process = self._process, None
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+            self._reap(process)
+
+    @staticmethod
+    def _reap(process: subprocess.Popen) -> None:
+        for stream in (process.stdin, process.stdout):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def close(self) -> None:
+        self._open = False
+        with self._lifecycle:
+            self._closed = True
+            self._pcm = bytearray()
+            process, self._process = self._process, None
+            if process is not None:
+                if process.poll() is None:
+                    process.kill()
+                # A decode in progress owns the pipes and reaps the child;
+                # otherwise nobody else will.
+                if not self._busy:
+                    self._reap(process)
+            self._release()
+        links, self._links = self._links, None
+        if links:
+            for name in os.listdir(links):
+                os.unlink(os.path.join(links, name))
+            os.rmdir(links)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -768,6 +1104,11 @@ class ResolvedStt:
     consented_payload: str | None = None
 
 
+# Engines with one model: selecting the engine selects the model.
+_SINGLE_MODEL = {ENGINE_VIBEVOICE: models.VIBEVOICE_MODEL,
+                 ENGINE_WHISPER: models.WHISPER_MODEL}
+
+
 def resolve_stt(cfg: dict | None = None) -> ResolvedStt:
     """Resolve the effective recogniser identity from ``cfg``.
 
@@ -781,23 +1122,24 @@ def resolve_stt(cfg: dict | None = None) -> ResolvedStt:
                  or settings.stt_engine(settings_path)).strip().lower()
     model_id = str(cfg_get(config, "stt.model")
                    or settings.stt_model(settings_path) or "")
-    if engine == ENGINE_VIBEVOICE:
-        # VibeVoice has exactly one model. Choosing the engine alone (a
-        # settings screen may offer only that) must not load the default vosk
-        # model's directory into it, so the engine decides the model here.
-        model_id = models.VIBEVOICE_MODEL
+    if engine in _SINGLE_MODEL:
+        # VibeVoice and Whisper have exactly one model each. Choosing the
+        # engine alone (a settings screen may offer only that) must not load
+        # the default vosk model's directory into it, so the engine decides
+        # the model here.
+        model_id = _SINGLE_MODEL[engine]
     model_dir = None
-    if engine in (ENGINE_VOSK, ENGINE_VIBEVOICE):
+    if engine in (ENGINE_VOSK, *_SINGLE_MODEL):
         # The same lookup the recogniser will make, made once, here -- but
         # WITHOUT the existence check, so that "not installed" is still
         # reported by model loading rather than by consent resolution.
         model_dir = _intended_model_dir(
-            model_id=(model_id if engine == ENGINE_VIBEVOICE
+            model_id=(model_id if engine in _SINGLE_MODEL
                       else cfg_get(config, "stt.model")),
             model_path=cfg_get(config, "stt.model_path"),
             settings_path=settings_path)
     spec = (models.MODEL_BY_ID.get(model_id)
-            if engine in (ENGINE_VOSK, ENGINE_VIBEVOICE) else None)
+            if engine in (ENGINE_VOSK, *_SINGLE_MODEL) else None)
     return ResolvedStt(
         engine=engine, model_id=model_id, model_dir=model_dir,
         settings_path=settings_path, lib_path=cfg_get(config, "stt.lib_path"),
@@ -829,7 +1171,8 @@ def consent_identity(resolved: ResolvedStt) -> ConsentIdentity:
 
 
 def make_stt(cfg: dict | None = None, rate: int | None = None, *,
-             resolved: ResolvedStt | None = None) -> NullStt | VoskStt | VibeVoiceStt:
+             resolved: ResolvedStt | None = None
+             ) -> NullStt | VoskStt | VibeVoiceStt | WhisperStt:
     """Return the recogniser the shared settings select.
 
     ``cfg`` may override the settings file for a caller that already knows what
@@ -843,7 +1186,7 @@ def make_stt(cfg: dict | None = None, rate: int | None = None, *,
     # it in, so construction cannot pick a different one. Resolving again here
     # is what F03 was.
     target = resolved if resolved is not None else resolve_stt(config)
-    if target.engine not in (ENGINE_VOSK, ENGINE_VIBEVOICE):
+    if target.engine not in (ENGINE_VOSK, *_SINGLE_MODEL):
         return NullStt()
     if rate is None:
         rate = int(cfg_get(config, "audio.rate", DEFAULT_RATE))
@@ -851,6 +1194,10 @@ def make_stt(cfg: dict | None = None, rate: int | None = None, *,
         return VibeVoiceStt(rate, model_path=target.model_dir,
                             threads=cfg_get(config, "stt.threads"),
                             consented_payload=target.consented_payload)
+    if target.engine == ENGINE_WHISPER:
+        return WhisperStt(rate, model_path=target.model_dir,
+                          threads=cfg_get(config, "stt.threads"),
+                          consented_payload=target.consented_payload)
     return VoskStt(
         rate,
         # model_path, not model_id: the directory is already resolved, so the
