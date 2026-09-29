@@ -2361,6 +2361,11 @@ class Daemon(OwnedTurns):
         last_audio = time.monotonic()
         heard = False
         speaking = False
+        # An engine that reports words as it goes ends a turn on silence only
+        # after it has recognised one, so a pop, click or cough before anyone
+        # speaks keeps the turn listening instead of closing it empty.
+        needs_words = bool(getattr(engine, "ends_on_words", False))
+        words = False
         # A06 on the CAPTURE side. The time limit above bounds a WELL-BEHAVED
         # stream; it does not bound bytes, and a device reporting an absurd
         # rate or width delivers far more than max_seconds implies. R2: "Capture
@@ -2430,6 +2435,8 @@ class Daemon(OwnedTurns):
                     # A stop that gave up waiting landed during this feed: its
                     # partial is not delivered, and nothing more is fed.
                     break
+                if text is not None and text.strip():
+                    words = True
                 if partials and text is not None:
                     # Droppable: a receiver that is not reading loses progress,
                     # not the turn. One that has gone still ends it.
@@ -2439,6 +2446,10 @@ class Daemon(OwnedTurns):
             if event == events.VAD_SPEECH_START:
                 speaking = True
             elif event == events.VAD_SPEECH_END and speaking and not getattr(turn, "hold", False):
+                if needs_words and not words:
+                    # Sound without a single word is not the end of dictation.
+                    speaking = False
+                    continue
                 break
         return heard
 

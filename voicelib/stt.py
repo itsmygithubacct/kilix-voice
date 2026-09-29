@@ -282,6 +282,11 @@ class VoskStt:
 
     name = "vosk"
     supports_partials = True
+    # A turn may end on trailing silence only once this engine has recognised
+    # a word: the capture's own start-up transient (a pop well above speech
+    # level, about a second long on the reference laptop) otherwise opens and
+    # closes a VAD segment before anyone speaks, ending the turn empty.
+    ends_on_words = True
 
     def __init__(self, rate: int = DEFAULT_RATE, *, model_id: str | None = None,
                  model_path: str | None = None, lib_path: str | None = None,
