@@ -15,24 +15,24 @@ class StartupVoiceTests(unittest.TestCase):
         wait = mock.Mock(side_effect=[False, True])
         with mock.patch.object(licensing, 'require_covering_receipt') as receipt, contextlib.redirect_stdout(io.StringIO()):
             system_voice.run(greeting, wait=wait, loaded=lambda: loaded,
-                engine_factory=lambda **kw: engine, player_factory=lambda cfg: player, monitor_factory=None)
+                engine_factory=lambda **kw: engine, player_factory=lambda cfg: player, monitor_factory=None, shutdown_factory=None)
         receipt.assert_called_once()
         player.close.assert_called_once()
         return engine, player
 
     def test_greet_once_and_keep_loaded_provider_alive(self):
         engine, player = self.run_voice()
-        engine.synth.assert_called_once_with('hello')
+        self.assertEqual(engine.synth.call_args_list, [mock.call('hello'), mock.call('Goodbye')])
         player.play.assert_called_once_with(b'\0\0', 22050)
 
     def test_empty_greeting_preloads_without_playback(self):
         engine, player = self.run_voice('')
-        engine.synth.assert_called_once_with('hello')
+        self.assertEqual(engine.synth.call_args_list, [mock.call('hello'), mock.call('Goodbye')])
         player.play.assert_not_called()
 
     def test_provider_restart_recovers_without_repeating_greeting(self):
         engine, player = self.run_voice('Welcome back', loaded=False)
-        self.assertEqual(engine.synth.call_args_list, [mock.call('Welcome back'), mock.call('hello')])
+        self.assertEqual(engine.synth.call_args_list, [mock.call('Welcome back'), mock.call('Goodbye'), mock.call('hello')])
         player.play.assert_called_once()
 
     def test_alerts_use_cached_audio_and_close_monitor(self):
@@ -47,9 +47,9 @@ class StartupVoiceTests(unittest.TestCase):
         with mock.patch.object(licensing, 'require_covering_receipt'), contextlib.redirect_stdout(io.StringIO()):
             system_voice.run('', wait=wait, loaded=lambda: True,
                 engine_factory=lambda **kw: engine, player_factory=lambda cfg: player,
-                monitor_factory=lambda: monitor, clock=lambda: 0)
+                monitor_factory=lambda: monitor, shutdown_factory=None, clock=lambda: 0)
         self.assertEqual(engine.synth.call_args_list,
-                         [mock.call('hello')]+[mock.call(p) for p in phrases])
+                         [mock.call('hello')]+[mock.call(p) for p in phrases]+[mock.call('Goodbye')])
         self.assertEqual(player.play.call_args_list,
                          [mock.call(p.encode(), 22050) for p in phrases])
         monitor.close.assert_called_once()
@@ -67,7 +67,7 @@ class StartupVoiceTests(unittest.TestCase):
             with self.assertRaisesRegex(system_voice.tts.TtsError, 'output unavailable'):
                 system_voice.run('', wait=lambda _: False,
                     engine_factory=lambda **kw: engine, player_factory=lambda cfg: player,
-                    monitor_factory=lambda: monitor, clock=lambda: 0)
+                    monitor_factory=lambda: monitor, shutdown_factory=None, clock=lambda: 0)
         monitor.close.assert_called_once()
         player.close.assert_called_once()
 
