@@ -446,6 +446,15 @@ def model_install_argv(spec: ModelSpec) -> list[str]:
     return [kilix, "voice", "install", "--model", spec.catalog_id]
 
 
+def runtime_install_argv(spec: ModelSpec) -> list[str] | None:
+    """Return the runtime build an engine needs after its weights, if any."""
+    if spec.engine == stt_lib.ENGINE_VIBEVOICE:
+        # VibeASR.cpp is built once from the host's pinned source; it is a
+        # separate step because the weights are shared with Bonsai.
+        return [kilix_launcher(), "voice", "vibeasr"]
+    return None
+
+
 def install_command(spec: ModelSpec) -> str:
     """Return the stable user-facing lazy-install command."""
     return f"kilix stt --install {spec.catalog_id}"
@@ -486,6 +495,9 @@ def install_model(spec: ModelSpec, screen=None) -> int:
         print(f"\nInstalling {spec.catalog_id} ({human_bytes(spec.size)})…\n")
     try:
         status = subprocess.call(argv)
+        runtime = runtime_install_argv(spec)
+        if status == 0 and runtime is not None:
+            status = subprocess.call(runtime)
     except OSError as error:
         raise ModelInstallError(
             f"could not run the model installer: {error}") from error
@@ -525,8 +537,14 @@ def diagnose(values: dict[str, str]) -> Diagnostics:
     except audio.AudioError as error:
         capture_ok, capture = False, str(error)
 
-    library = library_path()
-    library_ok = os.path.isfile(library)
+    engine = values[settings.KEY_STT_ENGINE]
+    if engine == stt_lib.ENGINE_VIBEVOICE:
+        # VibeVoice's "library" is the VibeASR executable, not libvosk.
+        library = stt_lib.vibeasr_binary()
+        library_ok = os.path.isfile(library) and os.access(library, os.X_OK)
+    else:
+        library = library_path()
+        library_ok = os.path.isfile(library)
     model_id = values[settings.KEY_STT_MODEL]
     try:
         model = model_dir(model_id)
@@ -535,15 +553,18 @@ def diagnose(values: dict[str, str]) -> Diagnostics:
     except paths.PathError as error:
         model, model_ok = str(error), False
 
-    engine = values[settings.KEY_STT_ENGINE]
     note = ""
     if engine == stt_lib.ENGINE_OFF:
         note = (f"dictation is off ({settings.KEY_STT_ENGINE}=off): the "
                 "microphone is never opened for it. Read-aloud is unaffected.")
     elif engine == stt_lib.ENGINE_VIBEVOICE:
-        note = (f"{settings.KEY_STT_ENGINE}={stt_lib.ENGINE_VIBEVOICE} is not "
-                "implemented in this release; it arrives in a later phase. "
-                f"Set it to {stt_lib.ENGINE_VOSK} for local recognition now.")
+        spec = MODEL_BY_ID.get(model_id)
+        if spec is not None and spec.engine != stt_lib.ENGINE_VIBEVOICE:
+            note = (f"{model_id} is a {spec.engine} model and VibeVoice cannot "
+                    f"load it. Choose {model_catalog.VIBEVOICE_MODEL} in the Models tab.")
+        elif not library_ok:
+            note = (f"the VibeASR runtime is not built yet; run `kilix stt "
+                    f"--install {model_catalog.VIBEVOICE_MODEL}`.")
     elif engine == stt_lib.ENGINE_VOSK:
         spec = MODEL_BY_ID.get(model_id)
         if spec is not None and spec.engine != stt_lib.ENGINE_VOSK:

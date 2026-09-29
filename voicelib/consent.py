@@ -23,6 +23,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from contextlib import contextmanager
 
 from . import paths
@@ -277,17 +278,48 @@ def payload_digest_at(root: str | None, engine: str) -> str:
     parts = []
     for relative in required:
         target = os.path.join(root, relative)
-        digest = hashlib.sha256()
-        size = 0
         try:
-            with open(target, "rb") as handle:
-                for block in iter(lambda: handle.read(1024 * 1024), b""):
-                    size += len(block)
-                    digest.update(block)
+            size, hexdigest = _file_digest(target)
         except OSError:
             return ""            # not installed: nothing to bind yet
-        parts.append(f"{relative}:{size}:{digest.hexdigest()}")
+        parts.append(f"{relative}:{size}:{hexdigest}")
     return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
+
+
+# VibeVoice's payload is 1.7 GB, and hashing it on every dictation turn costs
+# seconds before the microphone opens. A plain (size, mtime) cache is wrong --
+# two equal-length writes in one timestamp tick share every stat field, which
+# is why an earlier cache was removed -- so this one follows git's racy-index
+# rule: a digest is remembered only for a file whose ctime and mtime were
+# already RACY_SECONDS old when it was hashed. Any later write, equal length or
+# not, stamps a ctime newer than that and so misses the cache; a file written
+# moments ago is simply hashed every time.
+RACY_SECONDS = 2
+_DIGESTS: dict[tuple, tuple[int, str]] = {}
+
+
+def _file_digest(target: str) -> tuple[int, str]:
+    with open(target, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        key = (os.path.abspath(target), info.st_dev, info.st_ino, info.st_size,
+               info.st_mtime_ns, info.st_ctime_ns)
+        cached = _DIGESTS.get(key)
+        if cached is not None:
+            return cached
+        digest = hashlib.sha256()
+        size = 0
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            size += len(block)
+            digest.update(block)
+        after = os.fstat(handle.fileno())
+    result = (size, digest.hexdigest())
+    settled = time.time_ns() - RACY_SECONDS * 1_000_000_000
+    if ((after.st_size, after.st_mtime_ns, after.st_ctime_ns) == key[3:]
+            and info.st_ctime_ns < settled and info.st_mtime_ns < settled):
+        # Unchanged while it was read, and too old to share a tick with a
+        # write that has not happened yet.
+        _DIGESTS[key] = result
+    return result
 
 
 def capture_digest(model_id: str, engine: str, payload_digest: str = "") -> str:

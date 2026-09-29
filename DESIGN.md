@@ -366,8 +366,18 @@ before the next call into the library. A missing library or model raises
 `SttError` with an actionable message, never a bare `OSError`.
 
 `make_stt(cfg, rate)` dispatches on `KILIX_VOICE_STT_ENGINE`; `off`/unknown →
-`NullStt`. `vibevoice` is **not implemented in this phase** — `make_stt` must
-raise `SttError` naming it as a later phase, not silently fall back.
+`NullStt`. `vibevoice` gives `VibeVoiceStt`, which always uses the one
+VibeVoice model, buffers the turn and runs VibeASR.cpp's `asr_infer --greedy`
+once at `end_utterance()` under a bound of 30 s plus 4 s per second of audio.
+It never falls back to vosk: a missing runtime or GGUF raises `SttError`
+naming what is missing and `kilix stt --install vibevoice-asr-bitnet`.
+The runtime is `$KILIX_DATA_HOME/voice/vibeasr/current/bin/asr_infer`, or
+`KILIX_VOICE_VIBEASR`; there is no PATH fallback.
+
+Consent binds the SHA-256 of every required model file. Those digests are
+cached per process only for files whose ctime and mtime were already two
+seconds old when hashed (git's racy-index rule), so VibeVoice's 1.7 GB is not
+re-read every turn while a rewrite, even of equal length, is always seen.
 
 ### voicelib/tts.py
 

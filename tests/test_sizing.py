@@ -44,7 +44,7 @@ class SizerClientTests(unittest.TestCase):
         self.assertEqual(argv, ["/provider", "recommend", "voice", "--task", "stt", "--catalog", "-",
                                 "--data-root", "/test-data/voice", "--json"])
         self.assertEqual(json.loads(body), request)
-        self.assertFalse(next(row for row in request["models"] if row["id"] == "vibevoice-asr-bitnet")["runtime_supported"])
+        self.assertTrue(next(row for row in request["models"] if row["id"] == "vibevoice-asr-bitnet")["runtime_supported"])
 
     def test_wrong_schema_binding_model_and_promotion_are_rejected(self):
         request = sizing.request_document("stt", {})

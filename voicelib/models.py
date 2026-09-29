@@ -88,13 +88,15 @@ MODELS = (
         "vibevoice-asr-bitnet",
         ENGINE_VIBEVOICE,
         1705771590,
-        False,
-        "shared with Kilix Bonsai; its weights can be installed and selected "
-        "here, but this voice runtime cannot run them yet",
+        True,
+        "multilingual CPU recogniser shared with Kilix Bonsai: more accurate "
+        "on natural speech, transcribes when the turn ends (no live partials) "
+        "and needs the VibeASR runtime built once",
     ),
 )
 
 MODEL_BY_ID = {spec.catalog_id: spec for spec in MODELS}
+VIBEVOICE_MODEL = "vibevoice-asr-bitnet"
 MODEL_IDS = tuple(MODEL_BY_ID)
 
 TTS_MODELS = (
@@ -157,6 +159,7 @@ __all__ = [
     "ENGINE_CHOICES",
     "ENGINE_OFF",
     "ENGINE_VIBEVOICE",
+    "VIBEVOICE_MODEL",
     "ENGINE_VOSK",
     "MODELS",
     "MODEL_BY_ID",

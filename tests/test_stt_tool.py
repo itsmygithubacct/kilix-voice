@@ -82,7 +82,9 @@ class ModelCatalogTests(unittest.TestCase):
             self.assertIn(f"install=kilix stt --install {catalog_id}", shown)
         self.assertIn(
             "model=vibevoice-asr-bitnet engine=vibevoice", shown)
-        self.assertIn("runtime_supported=no", shown)
+        vibevoice = next(line for line in shown.splitlines()
+                         if line.startswith("model=vibevoice-asr-bitnet"))
+        self.assertIn("runtime_supported=yes", vibevoice)
 
     def test_json_catalog_is_versioned_complete_and_download_free(self) -> None:
         with tempfile.TemporaryDirectory() as root, mock.patch.dict(

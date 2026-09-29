@@ -20,15 +20,18 @@ touches the network: every test runs against a private temporary tree.
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 import pathlib
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
-from voicelib import paths, settings, stt
+from voicelib import models, paths, settings, stt
 
 # One capture frame: 20 ms of 16 kHz s16le mono, 640 bytes. The samples
 # themselves are never looked at — the stub decides what it "hears".
@@ -178,7 +181,7 @@ def _isolate(test: unittest.TestCase) -> str:
     patcher.start()
     test.addCleanup(patcher.stop)
     # patch.dict restores the whole mapping, so removing overrides here is safe.
-    for key in (stt.ENV_LIBRARY, stt.ENV_MODEL):
+    for key in (stt.ENV_LIBRARY, stt.ENV_MODEL, stt.ENV_VIBEASR):
         os.environ.pop(key, None)
     return root
 
@@ -273,14 +276,20 @@ class EngineSelectionTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.root = _isolate(self)
 
-    def test_vibevoice_is_refused_as_a_later_phase(self) -> None:
+    def test_vibevoice_without_its_runtime_names_the_install(self) -> None:
         with self.assertRaises(stt.SttError) as caught:
             stt.make_stt({"stt": {"engine": stt.ENGINE_VIBEVOICE}})
         message = str(caught.exception)
-        self.assertIn(stt.ENGINE_VIBEVOICE, message)
-        self.assertIn("later phase", message)
+        self.assertIn("VibeASR runtime", message)
+        self.assertIn(f"kilix stt --install {models.VIBEVOICE_MODEL}", message)
         # A silent fall-back would have failed on the missing library instead.
         self.assertNotIn(stt.LIBRARY_BASENAME, message)
+
+    def test_vibevoice_never_resolves_a_vosk_model(self) -> None:
+        resolved = stt.resolve_stt({"stt": {"engine": stt.ENGINE_VIBEVOICE,
+                                            "model": "small-en-us"}})
+        self.assertEqual(resolved.model_id, models.VIBEVOICE_MODEL)
+        self.assertEqual(resolved.model_dir, paths.model_dir(models.VIBEVOICE_MODEL))
 
     def test_vibevoice_in_the_shared_settings_is_refused_too(self) -> None:
         document = pathlib.Path(paths.settings_file())
@@ -420,19 +429,147 @@ class StubLibraryTestCase(unittest.TestCase):
         self.assertIn(other, message)
         self.assertIn("vosk_set_log_level", message)
 
-    def test_make_stt_refuses_vibevoice_even_where_vosk_works(self) -> None:
+    def test_make_stt_never_serves_vibevoice_with_vosk(self) -> None:
         cfg = {"stt": {"engine": stt.ENGINE_VOSK, "lib_path": self.library,
                        "model_path": self.model}}
         recogniser = stt.make_stt(cfg, stt.DEFAULT_RATE)
         self.addCleanup(recogniser.close)
         self.assertIsInstance(recogniser, stt.VoskStt)
         # Same config, same working library: the only difference is the engine
-        # name, so a raise here can only mean vibevoice was refused outright
-        # rather than quietly served by vosk.
+        # name, so a raise here can only mean vibevoice was refused for its own
+        # missing runtime rather than quietly served by vosk.
         cfg["stt"]["engine"] = stt.ENGINE_VIBEVOICE
         with self.assertRaises(stt.SttError) as caught:
             stt.make_stt(cfg, stt.DEFAULT_RATE)
-        self.assertIn("later phase", str(caught.exception))
+        self.assertIn("VibeASR runtime", str(caught.exception))
+
+
+# A stand-in asr_infer: records its argv and the WAV it was given, then prints
+# what FAKE_TEXT says (with a control character the engine must strip), exits
+# with FAKE_STATUS, or sleeps FAKE_SLEEP seconds first.
+FAKE_ASR = r"""#!{python}
+import json, os, sys, time, wave
+args = sys.argv[1:]
+audio = args[args.index("--audio") + 1]
+with wave.open(audio) as w:
+    shape = [w.getnchannels(), w.getsampwidth(), w.getframerate(), w.getnframes()]
+with open(os.environ["FAKE_LOG"], "a") as log:
+    log.write(json.dumps({{"argv": args, "wav": shape}}) + "\n")
+time.sleep(float(os.environ.get("FAKE_SLEEP", "0")))
+print("loading...", file=sys.stderr)
+sys.stdout.write(os.environ.get("FAKE_TEXT", "\nhello\x1b[31m world.\n"))
+sys.exit(int(os.environ.get("FAKE_STATUS", "0")))
+"""
+
+
+class VibeVoiceEngineTestCase(unittest.TestCase):
+    """The VibeVoice engine against a fake asr_infer; no weights, no audio."""
+
+    def setUp(self) -> None:
+        self.root = _isolate(self)
+        self.model = os.path.join(paths.data_dir(), "models", models.VIBEVOICE_MODEL)
+        os.makedirs(self.model)
+        for name in models.REQUIRED_FILES[models.ENGINE_VIBEVOICE]:
+            pathlib.Path(self.model, name).write_bytes(b"gguf")
+        self.binary = os.path.join(self.root, "asr_infer")
+        pathlib.Path(self.binary).write_text(
+            FAKE_ASR.format(python=sys.executable), encoding="utf-8")
+        os.chmod(self.binary, 0o755)
+        self.log = os.path.join(self.root, "asr.log")
+        patcher = mock.patch.dict(os.environ, {stt.ENV_VIBEASR: self.binary,
+                                               "FAKE_LOG": self.log})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def engine(self, **cfg) -> "stt.VibeVoiceStt":
+        recogniser = stt.make_stt({"stt": {"engine": stt.ENGINE_VIBEVOICE, **cfg}},
+                                  stt.DEFAULT_RATE)
+        self.addCleanup(recogniser.close)
+        self.assertIsInstance(recogniser, stt.VibeVoiceStt)
+        return recogniser
+
+    def calls(self) -> list[dict]:
+        if not os.path.exists(self.log):
+            return []
+        with open(self.log, encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle]
+
+    def test_one_turn_is_one_greedy_transcription_of_its_audio(self) -> None:
+        recogniser = self.engine(threads=2)
+        self.assertFalse(recogniser.supports_partials)
+        recogniser.start_utterance()
+        for _ in range(50):
+            self.assertIsNone(recogniser.feed(FRAME))
+        self.assertEqual(recogniser.end_utterance(), "hello [31m world.")
+        (call,) = self.calls()
+        argv = call["argv"]
+        self.assertEqual(argv[argv.index("--vae-model") + 1],
+                         os.path.join(self.model, stt.VIBEASR_VAE))
+        self.assertEqual(argv[argv.index("--lm-model") + 1],
+                         os.path.join(self.model, stt.VIBEASR_LM))
+        self.assertIn("--greedy", argv)
+        self.assertEqual(argv[argv.index("-t") + 1], "2")
+        # mono, 16-bit, the capture rate, and exactly the frames fed
+        self.assertEqual(call["wav"], [1, 2, stt.DEFAULT_RATE, 50 * len(FRAME) // 2])
+        # the private WAV is gone once the turn is over
+        self.assertFalse(os.path.exists(argv[argv.index("--audio") + 1]))
+
+    def test_a_silent_turn_runs_nothing(self) -> None:
+        recogniser = self.engine()
+        recogniser.start_utterance()
+        self.assertEqual(recogniser.end_utterance(), "")
+        self.assertEqual(self.calls(), [])
+
+    def test_a_failed_transcription_names_the_status(self) -> None:
+        recogniser = self.engine()
+        recogniser.start_utterance()
+        recogniser.feed(FRAME)
+        with mock.patch.dict(os.environ, {"FAKE_STATUS": "7"}):
+            with self.assertRaises(stt.SttError) as caught:
+                recogniser.end_utterance()
+        self.assertIn("status 7", str(caught.exception))
+        self.assertIn("loading", str(caught.exception))
+
+    def test_a_wedged_transcription_is_killed_at_its_bound(self) -> None:
+        recogniser = self.engine()
+        recogniser.start_utterance()
+        recogniser.feed(FRAME)
+        started = time.monotonic()
+        with mock.patch.dict(os.environ, {"FAKE_SLEEP": "30"}), \
+                mock.patch.object(stt, "VIBEASR_BASE_TIMEOUT_S", 0.5):
+            with self.assertRaises(stt.SttError) as caught:
+                recogniser.end_utterance()
+        self.assertIn("did not finish", str(caught.exception))
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_turns_do_not_share_audio(self) -> None:
+        recogniser = self.engine()
+        recogniser.start_utterance()
+        recogniser.feed(FRAME * 3)
+        recogniser.end_utterance()
+        recogniser.start_utterance()
+        recogniser.feed(FRAME)
+        recogniser.end_utterance()
+        # An abandoned turn (started, fed, never ended) leaves nothing behind.
+        recogniser.start_utterance()
+        recogniser.feed(FRAME * 5)
+        recogniser.start_utterance()
+        recogniser.feed(FRAME * 2)
+        recogniser.end_utterance()
+        self.assertEqual([call["wav"][3] for call in self.calls()],
+                         [3 * len(FRAME) // 2, len(FRAME) // 2, 2 * len(FRAME) // 2])
+
+    def test_a_missing_gguf_is_named(self) -> None:
+        os.unlink(os.path.join(self.model, stt.VIBEASR_LM))
+        with self.assertRaises(stt.SttError) as caught:
+            stt.make_stt({"stt": {"engine": stt.ENGINE_VIBEVOICE}}, stt.DEFAULT_RATE)
+        self.assertIn(stt.VIBEASR_LM, str(caught.exception))
+
+    def test_the_consent_identity_binds_the_vibevoice_payload(self) -> None:
+        resolved = stt.resolve_stt({"stt": {"engine": stt.ENGINE_VIBEVOICE}})
+        self.assertEqual(resolved.model_id, models.VIBEVOICE_MODEL)
+        self.assertEqual(resolved.model_dir, self.model)
+        self.assertTrue(stt.consent_identity(resolved).payload_digest)
 
 
 if __name__ == "__main__":

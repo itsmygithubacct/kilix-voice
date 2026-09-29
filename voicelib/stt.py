@@ -21,6 +21,9 @@ import dataclasses
 import json
 import os
 import re
+import subprocess
+import tempfile
+import wave
 
 from typing import NamedTuple
 
@@ -34,6 +37,22 @@ LIBRARY_BASENAME = "libvosk.so"
 # distribution package, a hand-built library, or a fixture in the test suite.
 ENV_LIBRARY = "KILIX_VOICE_LIBVOSK"
 ENV_MODEL = "KILIX_VOICE_MODEL_PATH"
+# The VibeASR.cpp `asr_infer` executable. Without the override the managed
+# build under the voice data directory is used; there is deliberately no PATH
+# fallback, because `asr_infer` is too generic a name to trust from PATH.
+ENV_VIBEASR = "KILIX_VOICE_VIBEASR"
+VIBEASR_BASENAME = "asr_infer"
+VIBEASR_VAE = "vibeasr-vae-encoder-i8_s.gguf"
+VIBEASR_LM = "vibeasr-lm-i2_s-embed-q6_k.gguf"
+# asr_infer loads both GGUFs (about two seconds) and then transcribes at an RTF
+# near 0.7 on four threads. The bound is generous so a loaded machine is slow
+# rather than refused, and finite so a wedged process cannot hold the turn.
+VIBEASR_BASE_TIMEOUT_S = 30.0
+VIBEASR_TIMEOUT_PER_AUDIO_S = 4.0
+VIBEASR_MAX_THREADS = 4
+# The daemon bounds a turn by stt.max_seconds; this is the engine's own ceiling
+# on buffered PCM (10 minutes at 16 kHz), so a caller bug cannot grow it freely.
+VIBEASR_MAX_BUFFER_BYTES = 16000 * 2 * 600
 
 # vosk logs to stderr, which under a curses TUI is the user's screen.
 LOG_LEVEL_SILENT = -1
@@ -456,6 +475,174 @@ class VoskStt:
         return _clean_text(text) if isinstance(text, str) else ""
 
 
+def vibeasr_binary() -> str:
+    """Return the asr_infer path VibeVoice would run; it may not exist."""
+    override = os.environ.get(ENV_VIBEASR)
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(paths.data_dir(), "vibeasr", "current", "bin",
+                        VIBEASR_BASENAME)
+
+
+def vibevoice_missing(model_dir: str | None) -> list[str]:
+    """Name what VibeVoice dictation lacks; empty when it can run."""
+    missing = []
+    binary = vibeasr_binary()
+    if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
+        missing.append(
+            f"the VibeASR runtime is not at {binary}; build it with "
+            f"`kilix stt --install {models.VIBEVOICE_MODEL}`")
+    if not model_dir or not os.path.isdir(model_dir):
+        missing.append(f"the {models.VIBEVOICE_MODEL} model is not at "
+                       f"{model_dir or paths.models_dir()}")
+    else:
+        for name in models.REQUIRED_FILES[ENGINE_VIBEVOICE]:
+            if not os.path.isfile(os.path.join(model_dir, name)):
+                missing.append(f"{name} is missing from {model_dir}")
+    return missing
+
+
+class VibeVoiceStt:
+    """VibeVoice-ASR-BitNet through the VibeASR.cpp ``asr_infer`` executable.
+
+    VibeVoice transcribes a whole utterance at once, so this engine buffers the
+    turn's PCM and runs one bounded, greedy (deterministic) ``asr_infer`` when
+    the turn ends. It has no partial results. The audio goes to a private
+    temporary WAV that is removed as soon as the process exits; nothing is
+    kept. ``close()`` kills a transcription still running.
+    """
+
+    name = ENGINE_VIBEVOICE
+    supports_partials = False
+
+    def __init__(self, rate: int = DEFAULT_RATE, *, model_path: str | None = None,
+                 threads: int | None = None) -> None:
+        try:
+            self._rate = int(rate)
+        except (TypeError, ValueError) as error:
+            raise SttError(
+                f"sample rate must be an integer, got {rate!r}. Capture and "
+                f"recognition both run at {DEFAULT_RATE} Hz.") from error
+        if not MIN_RATE <= self._rate <= MAX_RATE:
+            raise SttError(
+                f"sample rate {self._rate} Hz is outside the usable range "
+                f"{MIN_RATE}-{MAX_RATE}. Create the recogniser with the rate "
+                f"the capture runs at, normally {DEFAULT_RATE}.")
+        # Checked before the generic directory resolution, whose message is
+        # about vosk: say everything VibeVoice lacks, runtime included.
+        missing = vibevoice_missing(
+            model_path or _intended_model_dir(models.VIBEVOICE_MODEL))
+        if missing:
+            raise SttError(f"VibeVoice dictation cannot run: {'; '.join(missing)}.")
+        self._model_path = _resolve_model(models.VIBEVOICE_MODEL, model_path)
+        self._binary = vibeasr_binary()
+        try:
+            self._threads = max(1, int(threads) if threads else min(
+                VIBEASR_MAX_THREADS, max(1, (os.cpu_count() or 2) - 1)))
+        except (TypeError, ValueError) as error:
+            raise SttError(f"stt.threads must be an integer, got {threads!r}.") from error
+        self._pcm = bytearray()
+        self._open = False
+        self._closed = False
+        self._process: subprocess.Popen | None = None
+
+    @property
+    def rate(self) -> int:
+        return self._rate
+
+    @property
+    def model_path(self) -> str:
+        return self._model_path
+
+    def start_utterance(self) -> None:
+        self._require_live()
+        self._pcm = bytearray()
+        self._open = True
+
+    def feed(self, frame: bytes) -> str | None:
+        self._require_live()
+        if not self._open:
+            raise SttError(
+                "feed() was called before start_utterance(). Open every "
+                "dictation turn with start_utterance() so audio from one turn "
+                "cannot appear in the next.")
+        data = _frame_bytes(frame)
+        if len(self._pcm) + len(data) > VIBEASR_MAX_BUFFER_BYTES:
+            raise SttError(
+                "this dictation turn exceeded VibeVoice's ten-minute buffer. "
+                f"Lower {settings.KEY_STT_MAX_SECONDS} or dictate in shorter turns.")
+        self._pcm += data
+        return None
+
+    def end_utterance(self) -> str:
+        self._require_live()
+        if not self._open:
+            return ""
+        self._open = False
+        pcm, self._pcm = bytes(self._pcm), bytearray()
+        if not pcm:
+            return ""
+        seconds = len(pcm) / 2 / self._rate
+        work = paths.ensure_private_dir(os.path.join(paths.session_dir(), "stt"))
+        handle, audio_path = tempfile.mkstemp(prefix="vibevoice-", suffix=".wav", dir=work)
+        try:
+            with os.fdopen(handle, "wb") as raw, wave.open(raw, "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(self._rate)
+                wav.writeframes(pcm)
+            command = [self._binary,
+                       "--vae-model", os.path.join(self._model_path, VIBEASR_VAE),
+                       "--lm-model", os.path.join(self._model_path, VIBEASR_LM),
+                       "--audio", audio_path, "-t", str(self._threads), "--greedy"]
+            timeout = VIBEASR_BASE_TIMEOUT_S + VIBEASR_TIMEOUT_PER_AUDIO_S * seconds
+            self._process = subprocess.Popen(
+                command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, start_new_session=True)
+            try:
+                stdout, stderr = self._process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self._kill()
+                raise SttError(
+                    f"VibeVoice did not finish transcribing {seconds:.1f} s of "
+                    f"audio within {timeout:.0f} s. The machine may be busy; try "
+                    "again, or choose a lighter model.") from None
+            returncode = self._process.returncode
+            self._process = None
+            if self._closed:
+                return ""
+            if returncode != 0:
+                detail = _clean_text(stderr.decode("utf-8", "replace"))[-400:]
+                raise SttError(
+                    f"VibeVoice's asr_infer exited with status {returncode}: "
+                    f"{detail or 'no diagnostic'}. Rebuild the runtime with "
+                    f"`kilix stt --install {models.VIBEVOICE_MODEL}`.")
+            return _clean_text(stdout.decode("utf-8", "replace"))
+        finally:
+            try:
+                os.unlink(audio_path)
+            except FileNotFoundError:
+                pass
+
+    def close(self) -> None:
+        self._open = False
+        self._closed = True
+        self._pcm = bytearray()
+        self._kill()
+
+    def _kill(self) -> None:
+        process, self._process = self._process, None
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+
+    def _require_live(self) -> None:
+        if self._closed:
+            raise SttError(
+                "this recogniser has been closed. Build a new one with "
+                "make_stt() for the next dictation turn.")
+
+
 @dataclasses.dataclass(frozen=True)
 class ResolvedStt:
     """The recogniser identity a turn is committed to, resolved exactly once.
@@ -494,27 +681,25 @@ def resolve_stt(cfg: dict | None = None) -> ResolvedStt:
     settings_path = cfg_get(config, "settings_path")
     engine = str(cfg_get(config, "stt.engine")
                  or settings.stt_engine(settings_path)).strip().lower()
-    if engine == ENGINE_VIBEVOICE:
-        # Never fall through to vosk here: a user who selected vibevoice would
-        # otherwise be told nothing and believe they were running it.
-        raise SttError(
-            f"{settings.KEY_STT_ENGINE}={ENGINE_VIBEVOICE} is not implemented "
-            "in this release — the VibeVoice recogniser arrives in a later "
-            f"phase. Set it to {ENGINE_VOSK!r} for local recognition now, or "
-            f"{ENGINE_OFF!r} to disable dictation; kilix-voice will not "
-            "quietly run an engine other than the one you chose.")
     model_id = str(cfg_get(config, "stt.model")
                    or settings.stt_model(settings_path) or "")
+    if engine == ENGINE_VIBEVOICE:
+        # VibeVoice has exactly one model. Choosing the engine alone (a
+        # settings screen may offer only that) must not load the default vosk
+        # model's directory into it, so the engine decides the model here.
+        model_id = models.VIBEVOICE_MODEL
     model_dir = None
-    if engine == ENGINE_VOSK:
+    if engine in (ENGINE_VOSK, ENGINE_VIBEVOICE):
         # The same lookup the recogniser will make, made once, here -- but
         # WITHOUT the existence check, so that "not installed" is still
         # reported by model loading rather than by consent resolution.
         model_dir = _intended_model_dir(
-            model_id=cfg_get(config, "stt.model"),
+            model_id=(model_id if engine == ENGINE_VIBEVOICE
+                      else cfg_get(config, "stt.model")),
             model_path=cfg_get(config, "stt.model_path"),
             settings_path=settings_path)
-    spec = models.MODEL_BY_ID.get(model_id) if engine == ENGINE_VOSK else None
+    spec = (models.MODEL_BY_ID.get(model_id)
+            if engine in (ENGINE_VOSK, ENGINE_VIBEVOICE) else None)
     return ResolvedStt(
         engine=engine, model_id=model_id, model_dir=model_dir,
         settings_path=settings_path, lib_path=cfg_get(config, "stt.lib_path"),
@@ -546,7 +731,7 @@ def consent_identity(resolved: ResolvedStt) -> ConsentIdentity:
 
 
 def make_stt(cfg: dict | None = None, rate: int | None = None, *,
-             resolved: ResolvedStt | None = None) -> NullStt | VoskStt:
+             resolved: ResolvedStt | None = None) -> NullStt | VoskStt | VibeVoiceStt:
     """Return the recogniser the shared settings select.
 
     ``cfg`` may override the settings file for a caller that already knows what
@@ -560,10 +745,13 @@ def make_stt(cfg: dict | None = None, rate: int | None = None, *,
     # it in, so construction cannot pick a different one. Resolving again here
     # is what F03 was.
     target = resolved if resolved is not None else resolve_stt(config)
-    if target.engine != ENGINE_VOSK:
+    if target.engine not in (ENGINE_VOSK, ENGINE_VIBEVOICE):
         return NullStt()
     if rate is None:
         rate = int(cfg_get(config, "audio.rate", DEFAULT_RATE))
+    if target.engine == ENGINE_VIBEVOICE:
+        return VibeVoiceStt(rate, model_path=target.model_dir,
+                            threads=cfg_get(config, "stt.threads"))
     return VoskStt(
         rate,
         # model_path, not model_id: the directory is already resolved, so the

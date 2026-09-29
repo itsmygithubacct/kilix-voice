@@ -249,8 +249,14 @@ Models tab, `i` hands the terminal to Kilix's checksum-pinned lazy installer,
 Enter pairs the selected model with its matching recognizer, and `s` saves the
 default. The catalog is `small-en-us` and `lgraph-en-us` for the runnable Vosk
 engine, plus `vibevoice-asr-bitnet`, whose shared weights are installed through
-Kilix Bonsai. VibeVoice can be installed and selected for forward compatibility,
-but this voice runtime does not yet run it and says so in both TUI and CLI output.
+Kilix Bonsai. `kilix stt --install vibevoice-asr-bitnet` pulls those weights and
+then builds the pinned VibeASR.cpp runtime (`kilix voice vibeasr`, needs a C/C++
+toolchain and cmake). VibeVoice is multilingual and more accurate on natural
+speech than Vosk, but it transcribes the whole turn when it ends: there are no
+live partials, and a turn takes roughly its own length again to transcribe on
+four threads. Decoding is greedy, so the same audio gives the same text. The
+turn's audio is written to a private temporary WAV under the voice session
+directory and removed as soon as transcription finishes.
 
 `voicelib.models` is the canonical in-process catalog. Cross-process consumers
 use `kilix-stt --models --json`, whose `kilix.speech.models/v1` document

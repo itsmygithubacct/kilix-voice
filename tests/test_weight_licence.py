@@ -769,8 +769,9 @@ class CoveringReceiptTests(_WeightsFixture):
         self.mint_receipt("vibevoice-asr-bitnet")
         result = self.run_tool("kilix-stt", "--install", "vibevoice-asr-bitnet")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self._spy_log_text().strip(),
-                         "bonsai pull vibevoice-asr-bitnet")
+        # the weights through Bonsai's pinned pull, then the pinned runtime
+        self.assertEqual(self._spy_log_text().strip().splitlines(),
+                         ["bonsai pull vibevoice-asr-bitnet", "voice vibeasr"])
 
     def test_a_covering_receipt_lets_the_piper_voice_install(self) -> None:
         self.mint_receipt(PIPER_MODEL)

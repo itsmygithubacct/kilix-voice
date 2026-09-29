@@ -2605,12 +2605,17 @@ class Daemon(OwnedTurns):
                                f"{settings.KEY_STT_ENGINE}="
                                f"{stt_lib.ENGINE_VOSK} to enable it.")}
         if engine == stt_lib.ENGINE_VIBEVOICE:
-            return {"engine": engine, "model": model_id, "available": False,
-                    "detail": (f"{settings.KEY_STT_ENGINE}="
-                               f"{stt_lib.ENGINE_VIBEVOICE} is not implemented "
-                               "in this release; it arrives in a later phase. "
-                               f"Set it to {stt_lib.ENGINE_VOSK} for local "
-                               "recognition now.")}
+            try:
+                resolved = stt_lib.resolve_stt(self._cfg)
+            except stt_lib.SttError as error:
+                return {"engine": engine, "model": model_id, "available": False,
+                        "detail": str(error)}
+            missing = stt_lib.vibevoice_missing(resolved.model_dir)
+            return {"engine": engine, "model": resolved.model_id,
+                    "runtime": stt_lib.vibeasr_binary(),
+                    "model_path": resolved.model_dir, "available": not missing,
+                    "detail": ("; ".join(missing) + "." if missing else
+                               "the VibeASR runtime and the model are both present")}
         library = os.environ.get(stt_lib.ENV_LIBRARY) or paths.libvosk_path()
         if os.path.isdir(library):
             library = os.path.join(library, stt_lib.LIBRARY_BASENAME)
