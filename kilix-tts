@@ -1339,7 +1339,32 @@ def main(argv: list[str] | None = None) -> int:
                         help="open the interactive screen on this section")
     parser.add_argument("--version", action="version",
                         version=f"kilix-tts {__version__}")
+    parser.add_argument('--prepare-system-voice', action='store_true',
+                        help='show the Piper notice and install the startup voice')
+    parser.add_argument('--system-voice', action='store_true',
+                        help='desktop-owned warm Piper session; --speak sets its greeting')
     args = parser.parse_args(argv)
+
+    if args.prepare_system_voice or args.system_voice:
+        allowed = {'prepare_system_voice', 'system_voice', 'speak'}
+        if (args.prepare_system_voice and args.system_voice or
+                args.prepare_system_voice and args.speak is not None or
+                any(value != parser.get_default(key) for key, value in vars(args).items()
+                    if key not in allowed)):
+            parser.error('system voice is standalone; only --system-voice accepts --speak')
+        try:
+            if args.prepare_system_voice:
+                if not sys.stdin.isatty() or not sys.stdout.isatty():
+                    parser.error('system voice setup requires a terminal')
+                qwen_setup.install(qwen_setup.PIPER_ID)
+                print(_install_model(qwen_setup.PIPER_ID), flush=True)
+                return 0
+            from voicelib import system_voice
+            return system_voice.run('hello' if args.speak is None else args.speak)
+        except (qwen_setup.Declined, licensing.LicenseRefused) as error:
+            parser.exit(licensing.LICENCE_REFUSED_EXIT, f'kilix-tts: {error}\n')
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+            parser.exit(1, f'kilix-tts: {error}\n')
 
     if args.check_session and (not args.interactive or args.tier):
         parser.error("--check-session requires a direct interactive session")

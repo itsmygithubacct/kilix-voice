@@ -324,3 +324,9 @@ private to your user.
 ## Licence
 
 GPL-3.0. See [LICENSE](LICENSE).
+
+Desktop startup voice uses `kilix tts --prepare-system-voice` in a terminal for
+explicit first-use setup, then `kilix tts --system-voice --speak hello` with a
+pipe held open by the desktop. The latter is offline: it requires installed
+weights and their covering receipt, speaks once, and keeps Piper warm until
+stdin closes or the desktop terminates it. `--speak ''` preloads silently.
