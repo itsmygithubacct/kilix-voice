@@ -354,3 +354,14 @@ stdout, with private single-byte stdin commands (`p` play/resume, `a` pause,
 `s` stop/reset, `n` next, `b` previous, `q` quit). EOF stops its owned playback.
 Opening a session only loads text; speech starts on `p`. The current shared
 voice is read for each passage. No model is downloaded by opening a document.
+
+### Avatar-owned turns
+
+The optional `owned-speech/v1` and `owned-dictation/v1` capabilities add
+owner-scoped speech status/stop and press-to-talk recording. Speech utterance
+IDs are idempotent, bounded to 128 retained results, and expire after five seconds
+without an owner heartbeat. Microphone turns expire after three seconds without
+a heartbeat. Releasing press-to-talk closes capture immediately and drains the
+buffer before producing the final transcript. Continuous input uses a per-turn
+silence interval, defaulting to three seconds. These operations retain the
+normal consent, resource, deadline, cancellation and job-outcome checks.

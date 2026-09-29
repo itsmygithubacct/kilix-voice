@@ -86,6 +86,7 @@ from voicelib import (
 from voicelib.arbiter import Arbiter, ArbiterError  # noqa: E402
 from voicelib.cancel import (  # noqa: E402
     Cancellation, Cancelled, CancellationError, DeadlineExceeded)
+from voicelib.owned import OwnedTurns
 from voicelib.vad import Vad  # noqa: E402
 
 # Both live with the config builder kilix-stt shares (see _refresh_config).
@@ -765,7 +766,7 @@ def _connect_dictation(path: str) -> socket.socket:
         "probably gone away — start dictation again from a live pane.")
 
 
-class Daemon:
+class Daemon(OwnedTurns):
     """The control socket, the request dispatch, and the two kinds of turn."""
 
     # File identity (st_dev, st_ino) of the bound control socket, recorded by
@@ -998,6 +999,7 @@ class Daemon:
             pass  # nothing buffered, or the pipe is closing under us
 
     def _check_idle(self) -> None:
+        self._owned_expire()
         if self._idle_seconds <= 0:
             return
         if self._busy():
@@ -1295,6 +1297,7 @@ class Daemon:
             protocol.OP_INGEST_AUDIO: lambda request: self._op_ingest_audio(
                 request, fds, truncated),
         }
+        handlers.update({op: self._op_owned for op in protocol.OWNED_OPS})
         handler = handlers[request["op"]]
         if request["op"] == protocol.OP_INGEST_AUDIO and self._ingest_slots is not None:
             # ING-02: read off the accept loop; see _Deferred.
@@ -1900,6 +1903,13 @@ class Daemon:
         self._refuse_own_control_socket(request["sock"], "sock")
         receiver = _connect_dictation(request["sock"])
         turn = _DictationTurn(self._next_turn_id("listen"), receiver, deadline)
+        turn.owner = request.get("owner", "")
+        turn.hold = request.get("hold", False)
+        turn.silence_ms = request.get("silence_ms")
+        turn.lease_until = time.monotonic()+3
+        turn.owned_finish = threading.Event()
+        turn.capture_lock = threading.Lock()
+        turn.capture = None
         if turn.expired():
             # Same rule speak already followed: a budget spent before the
             # microphone opens must not open it.
@@ -2146,13 +2156,25 @@ class Daemon:
         marked reaped only once the engine has closed.
         """
         capture = audio.MicCapture(self._cfg)
-        engine = stt_lib.make_stt(self._cfg, capture.rate, resolved=resolved)
+        engine = None
         try:
+            if getattr(turn, "owner", ""):
+                turn.stop.check()
+                with turn.capture_lock:
+                    finished = turn.owned_finish.is_set()
+                    if not finished:
+                        capture.start()
+                        turn.capture = capture
+                if finished:
+                    self._deliver_terminal(turn, protocol.dictation_final("", turn.id))
+                    return
+                self._send(turn.receiver, {"listening": True})
+            engine = stt_lib.make_stt(self._cfg, capture.rate, resolved=resolved)
             # The last boundary before the device is opened. Everything above
             # can take real time -- a payload hash and a model load -- and a
             # stop or an expiry during it must still mean the mic stays shut.
             turn.stop.check()
-            capture.start()
+            if not getattr(turn, "owner", ""): capture.start()
             engine.start_utterance()
             heard = self._record(turn, capture, engine)
             # Recording stopping because the budget ran out is not a completed
@@ -2187,7 +2209,7 @@ class Daemon:
             # remains between here and the send is in-process work measured
             # in microseconds, which is the accepted tolerance.
             self._check_delivery(turn, "before the transcript was ready")
-            if not heard and not text:
+            if not heard and not text and not getattr(turn, "owner", ""):
                 raise DaemonError(
                     "no audio arrived from the microphone. Check that one is "
                     "connected and that PulseAudio or PipeWire is running "
@@ -2200,7 +2222,7 @@ class Daemon:
             self._deliver_terminal(turn, protocol.dictation_final(text, turn.id))
         finally:
             capture.stop()
-            engine.close()
+            if engine is not None: engine.close()
             if grant is not None:
                 # Only after a close that did not raise: an engine whose
                 # teardown failed leaves the accelerator quarantined.
@@ -2300,10 +2322,13 @@ class Daemon:
     def _record(self, turn: _DictationTurn, capture: audio.MicCapture,
                 engine: SttEngine) -> bool:
         """Feed the recogniser until the turn ends; True if audio arrived."""
-        detector = Vad(self._cfg)
+        vad_cfg = self._cfg
+        if getattr(turn, "silence_ms", None) is not None:
+            vad_cfg = dict(self._cfg, vad=dict(self._cfg.get("vad", {}), silence_ms=turn.silence_ms))
+        detector = Vad(vad_cfg)
         max_seconds = float(util.cfg_get(self._cfg, "stt.max_seconds",
                                          settings.stt_max_seconds()))
-        silence_s = float(util.cfg_get(self._cfg, "vad.silence_ms", 900)) / 1000
+        silence_s = float(util.cfg_get(vad_cfg, "vad.silence_ms", 900)) / 1000
         # MicCapture.read() reports a timeout and an ended stream the same way,
         # so a stream that stops arriving for longer than the silence window
         # ends the turn: a recorder that exited, a fixture that ran out and a
@@ -2344,8 +2369,11 @@ class Daemon:
             left = turn.stop.remaining()
             read_timeout = (CAPTURE_POLL_S if left is None
                             else max(0.0, min(CAPTURE_POLL_S, left)))
-            frame = capture.read(timeout=read_timeout)
+            finishing = bool(getattr(turn, "owner", "") and turn.owned_finish.is_set())
+            if finishing: capture.stop()
+            frame = capture.read(timeout=0 if finishing else read_timeout)
             if frame is None:
+                if finishing: break
                 if capture.error:
                     raise DaemonError(capture.error)
                 if time.monotonic() - last_audio > stall_s:
@@ -2391,7 +2419,7 @@ class Daemon:
                         break
             if event == events.VAD_SPEECH_START:
                 speaking = True
-            elif event == events.VAD_SPEECH_END and speaking:
+            elif event == events.VAD_SPEECH_END and speaking and not getattr(turn, "hold", False):
                 break
         return heard
 
@@ -2480,6 +2508,7 @@ class Daemon:
             # `version` is the PACKAGE release and stays for the chrome that
             # shows it; `protocol` is the wire contract a client checks.
             "version": __version__,
+            "capabilities": ["owned-speech/v1", "owned-dictation/v1"],
             "protocol": protocol.protocol_identity(),
             "pid": os.getpid(),
             "session": self._session_dir,

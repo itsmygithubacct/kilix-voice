@@ -49,7 +49,7 @@ for _package_root in (_INSTALLED_LIB, _HERE):
         sys.path.insert(0, _package_root)
 
 from voicelib import (  # noqa: E402  (the import follows the path bootstrap)
-    __version__, audio, licensing, models, paths, protocol, settings,
+    __version__, audio, licensing, models, paths, protocol, settings, sizing,
     tts as tts_lib, tui_shell, util)
 
 # A reply is a status payload at most, and the daemon answers a read as soon as
@@ -1300,7 +1300,9 @@ def main(argv: list[str] | None = None) -> int:
     from voicelib import tts_tiers
     parser.add_argument("--tiers", action="store_true",
                         help="show hardware-aware TTS audition tiers without loading weights")
-    parser.add_argument("--json", action="store_true", help="machine-readable --tiers report")
+    parser.add_argument("--recommend", action="store_true",
+                        help="read-only sizing of request-selectable speech models")
+    parser.add_argument("--json", action="store_true", help="machine-readable sizing report")
     parser.add_argument("--tier", choices=tts_tiers.TIER_IDS,
                         help="interactive only: select an installed, estimated-fit audition tier")
     parser.add_argument("--qwen-model-dir", metavar="DIR",
@@ -1395,8 +1397,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.check_session and (not args.interactive or args.tier):
         parser.error("--check-session requires a direct interactive session")
 
+    if args.recommend:
+        if any(value != parser.get_default(key) for key, value in vars(args).items()
+               if key not in {"recommend", "json"}):
+            parser.error("--recommend is standalone; optionally add --json")
+        try:
+            report = sizing.recommend("tts", {
+                models.TTS_ENGINE_ESPEAK: tts_lib.espeak_binary() is not None,
+                models.TTS_ENGINE_MBROLA: None,
+                models.PIPER_KRISTIN_MODEL: tts_lib.piper_status()[0],
+            })
+            sizing.print_report(report, as_json=args.json)
+        except sizing.SizerError as error:
+            parser.exit(1, f"kilix-tts: {error}\n")
+        return 0
     if args.json and not args.tiers:
-        parser.error("--json requires --tiers")
+        parser.error("--json requires --tiers or --recommend")
     if args.tiers:
         if any(value != parser.get_default(key) for key, value in vars(args).items()
                if key not in {"tiers", "json"}):

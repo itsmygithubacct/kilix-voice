@@ -24,6 +24,8 @@ OP_STATUS = "status"
 # A01/A08: caller-facing audio input, handed over as a descriptor.
 OP_INGEST_AUDIO = "ingest-audio"
 
+OWNED_OPS = ("owned-speak", "owned-status", "owned-stop", "owned-dictate",
+             "owned-dictation-status", "owned-stop-dictation")
 OPS = (OP_SPEAK, OP_STOP_SPEECH, OP_DICTATE, OP_STOP_DICTATION, OP_STATUS,
        OP_INGEST_AUDIO)
 
@@ -607,6 +609,35 @@ def validate_request(msg: dict, session_dir: str) -> dict:
         if length is not None:
             check_audio_bytes(length, embedded=True, key=key)
     op = msg.get("op")
+    if op in OWNED_OPS:
+        owner = msg.get("owner")
+        if not isinstance(owner, str) or re.fullmatch(r"[a-f0-9]{32}", owner) is None:
+            raise ProtocolError("Owned requests require a 32-character hexadecimal owner")
+        base_op = {"owned-speak": OP_SPEAK, "owned-dictate": OP_DICTATE}.get(op, OP_STATUS)
+        request = validate_request(dict(msg, op=base_op), session_dir)
+        request.update(op=op, owner=owner)
+        if op in ("owned-speak", "owned-status"):
+            value=msg.get("utterance")
+            if not isinstance(value,str) or re.fullmatch(r"[a-f0-9]{32}",value) is None:
+                raise ProtocolError("Owned speech requires an utterance token")
+            request["utterance"]=value
+        if op == "owned-stop":
+            value=msg.get("turn")
+            if not isinstance(value,str) or re.fullmatch(r"speak-[0-9]+",value) is None:
+                raise ProtocolError("Owned stop requires a speech turn")
+            request["turn"]=value
+        if op == "owned-speak" and len(request["text"].encode("utf-8")) > 4096:
+            raise ProtocolError("Owned speech is limited to 4096 bytes")
+        if op == "owned-dictate":
+            if type(msg.get("hold",False)) is not bool:
+                raise ProtocolError("hold must be boolean")
+            request["hold"]=msg.get("hold",False)
+            value=msg.get("silence_ms",3000)
+            if type(value) is not int or not 300 <= value <= 10000:
+                raise ProtocolError("silence_ms must be an integer from 300 to 10000")
+            request["silence_ms"]=value
+        return request
+
     # Two different refusals that used to share one message and, on the wire,
     # the code `internal`. A missing or non-string op is a request that is not
     # shaped like one: malformed. A string this daemon does not implement is a

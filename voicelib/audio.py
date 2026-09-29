@@ -294,6 +294,16 @@ class MicCapture:
             return None
         return item
 
+    def request_stop(self) -> None:
+        """Close capture promptly; the worker still joins and drains it."""
+        self._stopping.set()
+        process = self._process
+        if process is not None:
+            try:
+                process.terminate()
+            except OSError:
+                pass
+
     def stop(self) -> None:
         """Stop the recorder and join the reader. Idempotent."""
         self._stopping.set()
