@@ -1755,6 +1755,24 @@ class SetupDeclined(Exception):
     """The user said no at one of the setup's questions."""
 
 
+def _installer_refused(model_id: str, status: int) -> Exception:
+    """Why an installer exited non-zero: a declined licence, or a failure.
+
+    Both exit 1, and the difference decides whether Kilix 95 asks again. The
+    licence screen writes its receipt before anything is downloaded, so a
+    receipt on disk means the user accepted and the install then failed (no
+    network, a full disk); no receipt means the user said no.
+    """
+    try:
+        licensing.require_covering_receipt(model_id)
+    except licensing.LicenseRefused:
+        return SetupDeclined(
+            f"the licence was not accepted (the installer exited {status})")
+    return RuntimeError(
+        f"the licence was accepted but the installer exited {status}; check "
+        "the network connection and free disk space, then try again")
+
+
 def _ask(question: str, *, default: bool) -> bool:
     """One yes/no question on the terminal; end of input is a no."""
     hint = "[Y/n]" if default else "[y/N]"
@@ -1837,13 +1855,11 @@ def _setup_steps() -> tuple[str, str]:
             status = subprocess.call([kilix_launcher(), "models", "install",
                                       licensing.content_asset_id(model_id)])
             if status != 0:
-                raise SetupDeclined(
-                    f"the licence was not accepted, or its installer exited {status}")
+                raise _installer_refused(model_id, status)
     needs_runtime = runtime_install_argv(spec) is not None
     status = install_model(spec) if not installed or needs_runtime else 0
     if status != 0:
-        raise SetupDeclined(
-            f"the installer exited {status}; a declined licence also ends here")
+        raise _installer_refused(model_id, status)
     if not model_payload_present(spec, model_dir(model_id)):
         raise RuntimeError(f"the installer finished but {model_id} is not at "
                            f"{tilde(model_dir(model_id))}")

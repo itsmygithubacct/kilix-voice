@@ -106,15 +106,16 @@ class WhisperHandOffTests(Fixture):
 
 class SetupDefaultTests(Fixture):
     def setup(self, answers, *, default=WHISPER.catalog_id, sizer_error=None,
-              installs=WHISPER, status=0):
+              installs=WHISPER, status=0, accepted=True):
         result = self.root / "result.json"
         size = (mock.patch.object(tool, "_size_models", side_effect=sizer_error)
                 if sizer_error else
                 mock.patch.object(tool, "_size_models",
                                   return_value={"task": "stt", "defaults": {"stt": default}}))
         def receipt(catalog_id, **_options):
-            # Only kilix-content's licence screen writes a receipt.
-            if not any(argv[1:3] == ["models", "install"] for argv in self.calls):
+            # Only kilix-content's licence screen writes a receipt, and only
+            # when the user accepts there.
+            if not accepted or not any(argv[1:3] == ["models", "install"] for argv in self.calls):
                 raise licensing.LicenseRefused(catalog_id, "none")
         pending = list(answers)
         def answer(_prompt):
@@ -160,8 +161,17 @@ class SetupDefaultTests(Fixture):
         self.assertEqual((code, result["status"]), (1, "declined"))
 
     def test_a_declined_licence_is_declined(self) -> None:
-        code, result = self.setup(["y"], installs=None, status=4)
+        code, result = self.setup(["y"], installs=None, status=1, accepted=False)
         self.assertEqual((code, result["status"]), (1, "declined"))
+        self.assertIn("not accepted", result["detail"])
+        self.assertEqual(settings.stt_engine(), "vosk")
+
+    def test_an_accepted_licence_whose_download_fails_has_failed(self) -> None:
+        # No network on first boot: the user said yes, so Kilix 95 must ask
+        # again rather than record a no it was never given.
+        code, result = self.setup(["y"], installs=None, status=1, accepted=True)
+        self.assertEqual((code, result["status"]), (2, "failed"))
+        self.assertIn("network", result["detail"])
         self.assertEqual(settings.stt_engine(), "vosk")
 
     def test_an_installer_that_leaves_no_model_has_failed(self) -> None:
