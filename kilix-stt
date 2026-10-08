@@ -91,7 +91,7 @@ CONTROLS = (
             "The source dictation records from. 'default' follows whatever "
             "the sound server has been told is the system default."),
     Control(settings.KEY_STT_ENGINE, "Recogniser",
-            "vosk recognises locally through libvosk.so; whisper and "
+            "vosk recognises locally through libvosk.so; whisper, whistle and "
             "vibevoice transcribe each turn when it ends. 'off' closes the "
             "microphone to dictation entirely; read-aloud is unaffected."),
     Control(settings.KEY_STT_MODEL, "Model",
@@ -460,6 +460,8 @@ def runtime_install_argv(spec: ModelSpec) -> list[str] | None:
         # VibeASR.cpp is built once from the host's pinned source; it is a
         # separate step because the weights are shared with Bonsai.
         return [kilix_launcher(), "voice", "vibeasr"]
+    if spec.engine == stt_lib.ENGINE_WHISTLE:
+        return [kilix_launcher(), "voice", "whistle"]
     if spec.engine == stt_lib.ENGINE_WHISPER:
         # The pinned kilix-whisper-stt provider in its own environment.
         return [kilix_launcher(), "voice", "whisper"]
@@ -557,7 +559,10 @@ def diagnose(values: dict[str, str]) -> Diagnostics:
         capture_ok, capture = False, str(error)
 
     engine = values[settings.KEY_STT_ENGINE]
-    if engine in (stt_lib.ENGINE_VIBEVOICE, stt_lib.ENGINE_WHISPER):
+    if engine == stt_lib.ENGINE_WHISTLE:
+        library = stt_lib.whistle_library()
+        library_ok = os.path.isfile(library)
+    elif engine in (stt_lib.ENGINE_VIBEVOICE, stt_lib.ENGINE_WHISPER):
         # The "library" is the engine's runtime executable, not libvosk.
         library = (stt_lib.vibeasr_binary() if engine == stt_lib.ENGINE_VIBEVOICE
                    else stt_lib.whisper_binary())
@@ -585,6 +590,12 @@ def diagnose(values: dict[str, str]) -> Diagnostics:
         elif not library_ok:
             note = (f"the VibeASR runtime is not built yet; run `kilix stt "
                     f"--install {model_catalog.VIBEVOICE_MODEL}`.")
+    elif engine == stt_lib.ENGINE_WHISTLE:
+        spec = MODEL_BY_ID.get(model_id)
+        if spec is not None and spec.engine != stt_lib.ENGINE_WHISTLE:
+            note = f"{model_id} is a {spec.engine} model; choose whistle in the Models tab."
+        elif not library_ok:
+            note = "the Whistle runtime is not installed; run `kilix stt --install whistle`."
     elif engine == stt_lib.ENGINE_WHISPER:
         spec = MODEL_BY_ID.get(model_id)
         if spec is not None and spec.engine != stt_lib.ENGINE_WHISPER:

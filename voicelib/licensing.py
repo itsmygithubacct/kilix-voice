@@ -116,6 +116,7 @@ CONTENT_ASSET_ID = {
     "piper-en-us-kristin-medium": "piper-en-us-kristin-medium",
     "vibevoice-asr-bitnet": "vibevoice-asr-bitnet",
     "whisper-small-en": "faster-whisper-small-en",
+    "whistle": "whistle",
 }
 
 

@@ -24,6 +24,7 @@ import re
 import select
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -92,6 +93,7 @@ MAX_RATE = 192000
 ENGINE_VOSK = models.ENGINE_VOSK
 ENGINE_VIBEVOICE = models.ENGINE_VIBEVOICE
 ENGINE_WHISPER = models.ENGINE_WHISPER
+ENGINE_WHISTLE = models.ENGINE_WHISTLE
 ENGINE_OFF = models.ENGINE_OFF
 
 # name -> (argtypes, restype).  This is the whole of the C surface kilix-voice
@@ -875,6 +877,17 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
 
     name = ENGINE_WHISPER
     label = "Whisper"
+    model_id = models.WHISPER_MODEL
+
+    def _missing(self, model_dir):
+        return whisper_missing(model_dir)
+
+    def _binary_path(self):
+        return whisper_binary()
+
+    def _command(self):
+        return [self._binary, "serve", "--model", self._links,
+                "--threads", str(self._threads), "--beam", str(self._beam)]
 
     def __init__(self, rate: int = DEFAULT_RATE, *, model_path: str | None = None,
                  threads: int | None = None, beam: int | None = None,
@@ -882,14 +895,14 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
         self._rate = _checked_rate(rate)
         if self._rate != DEFAULT_RATE:
             raise SttError(
-                f"Whisper transcribes {DEFAULT_RATE} Hz audio; the capture runs "
+                f"{self.label} transcribes {DEFAULT_RATE} Hz audio; the capture runs "
                 f"at {self._rate} Hz.")
-        missing = whisper_missing(
-            model_path or _intended_model_dir(models.WHISPER_MODEL))
+        missing = self._missing(
+            model_path or _intended_model_dir(self.model_id))
         if missing:
-            raise SttError(f"Whisper dictation cannot run: {'; '.join(missing)}.")
-        self._model_path = _resolve_model(models.WHISPER_MODEL, model_path)
-        self._binary = whisper_binary()
+            raise SttError(f"{self.label} dictation cannot run: {'; '.join(missing)}.")
+        self._model_path = _resolve_model(self.model_id, model_path)
+        self._binary = self._binary_path()
         self._threads = _checked_threads(threads, WHISPER_MAX_THREADS)
         try:
             self._beam = int(beam) if beam else 5
@@ -921,7 +934,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
 
     def _start(self) -> None:
         work = paths.ensure_private_dir(os.path.join(paths.session_dir(), "stt"))
-        self._links = tempfile.mkdtemp(prefix="whisper-", dir=work)
+        self._links = tempfile.mkdtemp(prefix=self.name + "-", dir=work)
         for name, (fd, _path) in self._held.items():
             os.symlink(f"/proc/self/fd/{fd}", os.path.join(self._links, name))
         with self._lifecycle:
@@ -929,8 +942,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
                 return
             self._require_unchanged("since dictation consent was checked")
             self._process = subprocess.Popen(
-                [self._binary, "serve", "--model", self._links,
-                 "--threads", str(self._threads), "--beam", str(self._beam)],
+                self._command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, start_new_session=True,
                 pass_fds=tuple(fd for fd, _path in self._held.values()))
@@ -942,7 +954,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
             left = deadline - time.monotonic()
             if left <= 0:
                 raise SttError(
-                    f"Whisper did not answer within the time allowed {what}. The "
+                    f"{self.label} did not answer within the time allowed {what}. The "
                     "machine may be busy; try again, or choose a lighter model.")
             ready, _, _ = select.select([fd], [], [], left)
             if not ready:
@@ -955,11 +967,11 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
                 except subprocess.TimeoutExpired:
                     code = None
                 raise SttError(
-                    f"the Whisper provider exited{f' with status {code}' if code is not None else ''} "
-                    f"{what}. Reinstall it with `kilix stt --install {models.WHISPER_MODEL}`.")
+                    f"the {self.label} provider exited{f' with status {code}' if code is not None else ''} "
+                    f"{what}. Reinstall it with `kilix stt --install {self.model_id}`.")
             self._stdout += chunk
             if len(self._stdout) > WHISPER_MAX_REPLY_BYTES:
-                raise SttError("the Whisper provider sent an over-long reply.")
+                raise SttError(f"the {self.label} provider sent an over-long reply.")
         line, _, rest = bytes(self._stdout).partition(b"\n")
         self._stdout = bytearray(rest)
         try:
@@ -967,9 +979,9 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
         except ValueError:
             reply = None
         if not isinstance(reply, dict):
-            raise SttError("the Whisper provider sent a reply that is not JSON.")
+            raise SttError(f"the {self.label} provider sent a reply that is not JSON.")
         if "error" in reply:
-            raise SttError(f"Whisper failed {what}: {_clean_text(str(reply['error']))[:400]}.")
+            raise SttError(f"{self.label} failed {what}: {_clean_text(str(reply['error']))[:400]}.")
         return reply
 
     def _write_all(self, process: subprocess.Popen, data: bytes, deadline: float) -> None:
@@ -978,7 +990,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
         while view:
             left = deadline - time.monotonic()
             if left <= 0:
-                raise SttError("Whisper did not take the audio within the time allowed.")
+                raise SttError(f"{self.label} did not take the audio within the time allowed.")
             _, ready, _ = select.select([], [fd], [], left)
             if not ready:
                 continue
@@ -986,8 +998,8 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
                 written = os.write(fd, view[:65536])
             except BrokenPipeError:
                 raise SttError(
-                    "the Whisper provider exited while it was being sent audio. "
-                    f"Reinstall it with `kilix stt --install {models.WHISPER_MODEL}`.") from None
+                    f"the {self.label} provider exited while it was being sent audio. "
+                    f"Reinstall it with `kilix stt --install {self.model_id}`.") from None
             view = view[written:]
 
     def _decode(self, pcm: bytes) -> str:
@@ -997,7 +1009,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
                 return ""
             if self._process is None:
                 raise SttError(
-                    "the Whisper provider stopped after an earlier failure; "
+                    f"the {self.label} provider stopped after an earlier failure; "
                     "the next dictation turn starts a new one.")
             process, self._busy = self._process, True
         try:
@@ -1006,7 +1018,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
                     process, time.monotonic() + WHISPER_READY_TIMEOUT_S,
                     "while loading the model")
                 if reply.get("ready") is not True:
-                    raise SttError("the Whisper provider did not report ready.")
+                    raise SttError(f"the {self.label} provider did not report ready.")
                 self._ready = True
                 # Loaded: from here on nothing the path does can reach it,
                 # and the bytes it loaded must still be the consented ones.
@@ -1018,7 +1030,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
             reply = self._read_reply(process, deadline, f"on {seconds:.1f} s of audio")
             text = reply.get("text")
             if not isinstance(text, str):
-                raise SttError("the Whisper provider sent a reply without text.")
+                raise SttError(f"the {self.label} provider sent a reply without text.")
             self._require_unchanged("while it was being transcribed")
             return _clean_text(text)
         except SttError:
@@ -1073,6 +1085,40 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
             os.rmdir(links)
 
 
+def whistle_library() -> str:
+    override = os.environ.get("KILIX_VOICE_WHISTLE_LIBRARY")
+    if override:
+        return os.path.abspath(os.path.expanduser(override))
+    return os.path.join(paths.data_dir(), "whistle", "current", "libneedle3.so")
+
+
+def whistle_missing(model_dir: str | None) -> list[str]:
+    missing = []
+    if not os.path.isfile(whistle_library()):
+        missing.append("the Whistle runtime; install it with `kilix stt --install whistle`")
+    if not model_dir or not os.path.isfile(os.path.join(model_dir, "whistle.cact")):
+        missing.append("the whistle.cact weights")
+    return missing
+
+
+class WhistleStt(WhisperStt):
+    """Whistle uses the same bounded child protocol and held-weight lifecycle."""
+    name = ENGINE_WHISTLE
+    label = "Whistle"
+    model_id = models.WHISTLE_MODEL
+
+    def _missing(self, model_dir):
+        return whistle_missing(model_dir)
+
+    def _binary_path(self):
+        return whistle_library()
+
+    def _command(self):
+        return [sys.executable, os.path.join(os.path.dirname(__file__), "whistle_provider.py"),
+                "serve", "--model", self._links, "--library", self._binary,
+                "--language", "en"]
+
+
 @dataclasses.dataclass(frozen=True)
 class ResolvedStt:
     """The recogniser identity a turn is committed to, resolved exactly once.
@@ -1106,7 +1152,8 @@ class ResolvedStt:
 
 # Engines with one model: selecting the engine selects the model.
 _SINGLE_MODEL = {ENGINE_VIBEVOICE: models.VIBEVOICE_MODEL,
-                 ENGINE_WHISPER: models.WHISPER_MODEL}
+                 ENGINE_WHISPER: models.WHISPER_MODEL,
+                 ENGINE_WHISTLE: models.WHISTLE_MODEL}
 
 
 def resolve_stt(cfg: dict | None = None) -> ResolvedStt:
@@ -1172,7 +1219,7 @@ def consent_identity(resolved: ResolvedStt) -> ConsentIdentity:
 
 def make_stt(cfg: dict | None = None, rate: int | None = None, *,
              resolved: ResolvedStt | None = None
-             ) -> NullStt | VoskStt | VibeVoiceStt | WhisperStt:
+             ) -> NullStt | VoskStt | VibeVoiceStt | WhisperStt | WhistleStt:
     """Return the recogniser the shared settings select.
 
     ``cfg`` may override the settings file for a caller that already knows what
@@ -1194,6 +1241,9 @@ def make_stt(cfg: dict | None = None, rate: int | None = None, *,
         return VibeVoiceStt(rate, model_path=target.model_dir,
                             threads=cfg_get(config, "stt.threads"),
                             consented_payload=target.consented_payload)
+    if target.engine == ENGINE_WHISTLE:
+        return WhistleStt(rate, model_path=target.model_dir,
+                          consented_payload=target.consented_payload)
     if target.engine == ENGINE_WHISPER:
         return WhisperStt(rate, model_path=target.model_dir,
                           threads=cfg_get(config, "stt.threads"),

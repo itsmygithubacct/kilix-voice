@@ -267,6 +267,21 @@ reference dictation it made about a third of the Vosk small model's errors
 and answered in about a second per sentence. It is the model sizer's default
 on a machine with AVX2, 8 logical CPUs and 16 GiB of RAM.
 
+`whistle` selects Cactus Whistle through a pinned local Needle 3 native
+library on Linux x86-64 (glibc). `kilix stt --install whistle` shows the
+weight licence through Kilix Content and installs the native runtime;
+`kilix stt --default whistle` selects it explicitly. It is an optional
+engine; installing it does not replace the saved default or the model
+sizer's Whisper recommendation.
+
+Whistle dictation is English, without keyword bias. Turns up to 30 seconds
+use whole-clip decoding; longer turns use the native streaming decoder
+and can take substantially longer. The provider returns text at the end of
+the turn, keeps model bytes bound to capture consent, and performs no
+network requests. The native runtime chooses its own thread count.
+The normal dictation deadline still applies: long turns can time out on
+slower CPUs. Prefer Whisper for long dictation.
+
 ```sh
 kilix stt --install whisper-small-en
 ```
