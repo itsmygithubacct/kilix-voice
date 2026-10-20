@@ -41,6 +41,7 @@ import math
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1521,7 +1522,16 @@ class Ui:
     # -- main loop ----------------------------------------------------------
 
     def run(self) -> int:
+        # Capture owns a private process group. Terminal hangup/termination
+        # must unwind this owner and run its cleanup, just as Ctrl-C does.
+        def interrupted(_number, _frame):
+            raise KeyboardInterrupt
+
+        previous = {}
         try:
+            for number in (signal.SIGHUP, signal.SIGTERM):
+                if signal.getsignal(number) != signal.SIG_IGN:
+                    previous[number] = signal.signal(number, interrupted)
             while True:
                 if self._mic is not None:
                     self._mic.poll()
@@ -1534,7 +1544,11 @@ class Ui:
                 if outcome is not None:
                     return outcome
         finally:
-            self._stop_capture()
+            try:
+                self._stop_capture()
+            finally:
+                for number, handler in previous.items():
+                    signal.signal(number, handler)
 
     def _handle(self, key: int) -> int | None:
         """Act on one keystroke; return an exit code to leave the screen."""

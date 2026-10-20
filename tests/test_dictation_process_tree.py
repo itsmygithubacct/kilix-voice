@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -238,3 +239,105 @@ class WhisperProcessTreeTests(_TreeFixture, unittest.TestCase):
 @unittest.skipUnless(sys.platform.startswith("linux"), "Linux process groups and subreaping")
 class WhistleProcessTreeTests(_TreeFixture, unittest.TestCase):
     engine_name = "whistle"
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "Linux process groups and subreaping")
+class CaptureMeterSignalTests(unittest.TestCase):
+    """The microphone meter also owns capture; terminal signals must close it."""
+    entries = _TreeFixture.entries
+    descendants_gone = _TreeFixture.descendants_gone
+    clean_descendants = _TreeFixture.clean_descendants
+
+    def setUp(self):
+        libc = ctypes.CDLL(None, use_errno=True)
+        prior = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(prior), 0, 0, 0), 0)
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
+        self.addCleanup(libc.prctl, 36, prior.value, 0, 0, 0)
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.process_log = self.root / "processes.jsonl"
+        self.addCleanup(self.clean_descendants)
+
+    def wait_for(self, predicate, seconds, message):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(.005)
+        self.fail(message)
+
+    def meter_signal(self, number):
+        capture = self.root / "capture.py"
+        capture.write_text(FORK + '\nfork_descendants("capture")\n' + live.CAPTURE)
+        mode = self.root / "mode"
+        mode.write_text("silent")
+        ready = self.root / "ready"
+        launcher = self.root / "meter.py"
+        tool = Path(__file__).resolve().parents[1] / "kilix-stt"
+        launcher.write_text(
+            "import os, runpy, signal, sys, time\n"
+            "from pathlib import Path\n"
+            f"tool = runpy.run_path({str(tool)!r}, run_name='meter_fixture')\n"
+            "class Screen:\n"
+            "    def timeout(self, ms): pass\n"
+            "    def getch(self):\n"
+            f"        Path({str(ready)!r}).touch()\n"
+            "        time.sleep(.02)\n"
+            "        return -1\n"
+            "ui = object.__new__(tool['Ui'])\n"
+            "ui._screen = Screen()\n"
+            "ui._draw = lambda: None\n"
+            f"ui._mic = tool['MicTest']({{'audio': {{'capture_cmd': [sys.executable, {str(capture)!r}]}}}}, 30)\n"
+            "ui._mic.start()\n"
+            "previous = {n: signal.getsignal(n) for n in (signal.SIGHUP, signal.SIGTERM)}\n"
+            "try:\n"
+            "    ui.run()\n"
+            "except KeyboardInterrupt:\n"
+            "    pass\n"
+            "assert all(signal.getsignal(n) == h for n, h in previous.items())\n")
+        env = dict(os.environ, TEST_PROCESSES=str(self.process_log),
+                   TEST_CAPTURE_FILE=str(mode))
+        process = subprocess.Popen([sys.executable, str(launcher)], env=env,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, start_new_session=True)
+
+        def cleanup():
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=3)
+            for row in self.entries("capture"):
+                try:
+                    os.kill(row["pid"], signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    os.waitpid(row["pid"], 0)
+                except ChildProcessError:
+                    pass
+            self.clean_descendants()
+
+        self.addCleanup(cleanup)
+        self.wait_for(lambda: ready.exists() and self.entries("capture")
+                      and len(self.entries("descendant")) == 2, 3, "meter did not open capture")
+        capture_pid = self.entries("capture")[-1]["pid"]
+        os.killpg(process.pid, number)  # our private simulated terminal group
+        self.wait_for(lambda: process.poll() is not None, 1, "meter ignored terminal signal")
+
+        def gone():
+            try:
+                os.waitpid(capture_pid, os.WNOHANG)
+            except ChildProcessError:
+                pass
+            return not Path(f"/proc/{capture_pid}").exists()
+
+        self.wait_for(gone, 1, "terminal exit left the microphone meter recording")
+        self.wait_for(self.descendants_gone, 1, "terminal exit left capture descendants")
+        self.assertEqual(process.returncode, 0, "terminal signal bypassed the UI cleanup path")
+
+    def test_terminal_hangup_closes_meter_capture(self):
+        self.meter_signal(signal.SIGHUP)
+
+    def test_terminal_termination_closes_meter_capture(self):
+        self.meter_signal(signal.SIGTERM)
