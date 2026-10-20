@@ -1,11 +1,14 @@
 """Cleanup boundaries with real synthetic recorders, no audio device."""
 import contextlib
 import io
+import math
 import os
 from pathlib import Path
+import queue
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -13,8 +16,28 @@ from types import SimpleNamespace
 from unittest import mock
 
 from tests.test_stt_tool import tool
-from tests.test_terminal_outcomes import voiced
-from voicelib import audio, processes, stt
+from tests.test_terminal_outcomes import voiced, _worker_daemon
+from voicelib import audio, jobs, processes, stt
+
+
+class ObservedLock:
+    """A real lock with an event at a selected caller's acquire boundary."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.observed_thread = None
+        self.attempted = threading.Event()
+        self.boundary = threading.Event()
+
+    def __enter__(self):
+        if threading.current_thread() is self.observed_thread:
+            self.attempted.set()
+            self.boundary.set()
+        self.lock.acquire()
+        return self
+
+    def __exit__(self, *args):
+        self.lock.release()
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Linux waitid and groups")
@@ -145,13 +168,71 @@ class CleanupTests(unittest.TestCase):
                 mock.patch.object(audio, "kill_group", side_effect=KeyboardInterrupt), \
                 contextlib.redirect_stderr(stderr):
             status = tool.main([])
-        self.assertNotEqual(status, 0, "main reported success after abandoning capture cleanup")
+        self.assertEqual(status, 130, "main lost the interactive interrupt status")
         self.assertTrue(stderr.getvalue().strip(), "interruption was not reported")
         self.assertIs(mic._capture, capture)
         self.assertIs(capture._process, process)
         self.assertEqual({n: signal.getsignal(n) for n in previous}, previous)
         mic.stop()
         self.assertFalse(Path(f"/proc/{process.pid}").exists())
+
+    def test_main_returns_130_after_interactive_interrupt(self):
+        capture, process = self.capture()
+        ui, mic = self.ui(capture)
+        ui._screen.getch.side_effect = lambda: signal.raise_signal(signal.SIGINT)
+        previous = {n: signal.getsignal(n) for n in
+                    (signal.SIGINT, signal.SIGHUP, signal.SIGTERM)}
+        with mock.patch.object(tool.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(tool.sys.stdout, "isatty", return_value=True), \
+                mock.patch.object(tool.curses, "wrapper", side_effect=lambda *_: ui.run()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            status = tool.main([])
+        self.assertEqual(status, 130)
+        self.assertIsNone(mic._capture)
+        self.assertIsNone(capture._process)
+        self.assertIsNotNone(process.returncode)
+        self.assertFalse(Path(f"/proc/{process.pid}").exists())
+        self.assertEqual({n: signal.getsignal(n) for n in previous}, previous)
+
+    def test_interrupt_during_restoration_restores_every_handler(self):
+        numbers = (signal.SIGINT, signal.SIGHUP, signal.SIGTERM)
+        for boundary in numbers:
+            with self.subTest(boundary=boundary):
+                capture, process = self.capture()
+                ui, mic = self.ui(capture)
+                ui._screen.getch.return_value = ord("q")
+                previous = {n: signal.getsignal(n) for n in numbers}
+                old_mask = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+                original = signal.signal
+                injected = []
+
+                def setting(number, handler):
+                    result = original(number, handler)
+                    if number == boundary and handler is previous[number] and not injected:
+                        injected.append(True)
+                        signal.raise_signal(signal.SIGINT)
+                    return result
+
+                interrupted = False
+                try:
+                    with mock.patch.object(signal, "signal", side_effect=setting):
+                        try:
+                            ui.run()
+                        except KeyboardInterrupt:
+                            interrupted = True
+                    self.assertTrue(injected, "restoration boundary was not reached")
+                    self.assertEqual({n: signal.getsignal(n) for n in numbers}, previous,
+                                     "interrupt abandoned the remaining dispositions")
+                    self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, []), old_mask)
+                    self.assertTrue(interrupted, "new interrupt was swallowed")
+                    self.assertIsNone(mic._capture)
+                    self.assertIsNone(capture._process)
+                    self.assertIsNotNone(process.returncode)
+                    self.assertFalse(Path(f"/proc/{process.pid}").exists())
+                finally:
+                    for number, handler in previous.items():
+                        original(number, handler)
+                    signal.pthread_sigmask(signal.SIG_SETMASK, old_mask)
 
     def test_normal_meter_exit_survives_signals_during_cleanup(self):
         for number in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
@@ -326,6 +407,305 @@ class CleanupTests(unittest.TestCase):
                         self.assertFalse(Path(f"/proc/{process.pid}").exists())
                         self.assertIsNone(engine._process)
 
+    def test_worker_preserves_stop_cause_after_provider_cleanup_failure(self):
+        # Real _run_dictation -> _dictate -> _record_turn -> _record, with
+        # real recorder/provider children. Only model construction, consent,
+        # and the accelerator service are replaced; no audio device is used.
+        for engine_type in (stt.WhisperStt, stt.WhistleStt):
+            for cause in ("cancelled", "deadline"):
+                for boundary in ("close", "reap"):
+                    with self.subTest(engine=engine_type.__name__, cause=cause,
+                                      boundary=boundary):
+                        engine, process = self.provider(engine_type)
+                        sent, ledger = [], jobs.JobLedger()
+                        daemon = _worker_daemon(sent, ledger)
+                        daemon._cfg = {"audio": {"capture_cmd": [
+                            sys.executable, "-c", "import time; time.sleep(60)"]},
+                            "stt": {"engine": "null", "max_seconds": 30}}
+                        daemon._lock = threading.RLock()
+                        daemon._arbiter = mock.Mock()
+                        daemon._stopping = threading.Event()
+                        daemon._require_capture_consent = lambda _: None
+                        daemon._clear_dictation = lambda t: voiced.Daemon._clear_dictation(daemon, t)
+                        daemon._warn = mock.Mock()
+                        now = [0.0]
+                        turn = voiced._DictationTurn("cleanup-" + cause, mock.Mock(),
+                                                    deadline=1, clock=lambda: now[0])
+                        turn.on_settle = ledger.record
+                        daemon._dictation = turn
+                        capture = audio.MicCapture(daemon._cfg)
+                        self.addCleanup(capture.stop)
+                        children = []
+                        accepted = []
+
+                        def reading(**kwargs):
+                            children.append(capture._process)
+                            if cause == "cancelled":
+                                accepted.append(daemon._op_stop_dictation(
+                                    {"id": "stop", "mode": "abort"})["stopped"])
+                            # Expire even after abort: its earlier cause must win.
+                            now[0] = 2.0
+                            return None
+
+                        grant = mock.Mock()
+                        target, method = ((engine, "close") if boundary == "close"
+                                          else (process, "wait"))
+                        with mock.patch.object(voiced.audio, "MicCapture", return_value=capture), \
+                                mock.patch.object(voiced.stt_lib, "make_stt", return_value=engine), \
+                                mock.patch.object(voiced.accelerator, "execution",
+                                                  return_value=contextlib.nullcontext(grant)), \
+                                mock.patch.object(capture, "read", side_effect=reading), \
+                                mock.patch.object(target, method, side_effect=
+                                                  subprocess.TimeoutExpired(process.args, 5)):
+                            daemon._run_dictation(turn)
+                        row = ledger.get(turn.id)
+                        with self.subTest(check="outcome"):
+                            self.assertEqual((row["outcome"], row["code"]), (cause, cause))
+                            self.assertEqual(len(sent), 1)
+                            self.assertEqual(sent[0]["code"], cause)
+                            self.assertNotIn("final", sent[0])
+                        with self.subTest(check="diagnostic"):
+                            messages = [str(call.args[0]) for call in daemon._warn.call_args_list]
+                            self.assertTrue(any("cleanup failed" in m and "provider" in m
+                                                and "TimeoutExpired" in m and turn.id in m
+                                                for m in messages), messages)
+                        with self.subTest(check="ownership"):
+                            retained = getattr(daemon, "_failed_dictation_cleanup", None) or {}
+                            self.assertIs(retained.get((turn.id, "provider")), engine,
+                                          "settled worker discarded the uncompleted provider")
+                        self.assertEqual(accepted, [True] if cause == "cancelled" else [])
+                        self.assertIsNone(daemon._dictation)
+                        daemon._arbiter.end_listen.assert_called_once_with(turn.id)
+                        turn.receiver.close.assert_called_once()
+                        grant.reaped.assert_not_called()
+                        self.assertTrue(children, "test never reached recording")
+                        self.assertIsNone(capture._process)
+                        self.assertIsNotNone(children[0].returncode)
+                        self.assertFalse(Path(f"/proc/{children[0].pid}").exists())
+                        self.assertIs(engine._process, process)
+                        retry = getattr(daemon, "_close_dictation_resources", None)
+                        self.assertTrue(callable(retry), "daemon cannot retry its retained owners")
+                        self.assertIsNone(retry(turn, capture, engine))
+                        self.assertEqual(daemon._failed_dictation_cleanup, {})
+                        self.assertIsNone(engine._process)
+                        self.assertFalse(Path(f"/proc/{process.pid}").exists())
+
+    def test_worker_attempts_both_cleanups_and_keeps_each_failed_owner(self):
+        for provider_fails in (False, True):
+            with self.subTest(provider_fails=provider_fails):
+                sent, ledger = [], jobs.JobLedger()
+                daemon = _worker_daemon(sent, ledger)
+                daemon._cfg = {}
+                daemon._warn = mock.Mock()
+                capture, engine, grant = mock.Mock(), mock.Mock(), mock.Mock()
+                capture.stop.side_effect = subprocess.TimeoutExpired("recorder", 1)
+                if provider_fails:
+                    engine.close.side_effect = subprocess.TimeoutExpired("provider", 5)
+                turn = voiced._DictationTurn("two-cleanups", mock.Mock())
+                turn.on_settle = ledger.record
+
+                def record(*_):
+                    turn.abort = True
+                    turn.stop.set()
+                    turn.stop.check()
+
+                daemon._record = record
+                daemon._dictate = lambda t: daemon._record_turn(t, SimpleNamespace(), grant)
+                with mock.patch.object(voiced.audio, "MicCapture", return_value=capture), \
+                        mock.patch.object(voiced.stt_lib, "make_stt", return_value=engine):
+                    daemon._run_dictation(turn)
+                self.assertEqual(ledger.get(turn.id)["outcome"], "cancelled")
+                capture.stop.assert_called_once()
+                engine.close.assert_called_once()
+                grant.reaped.assert_not_called()
+                expected = {(turn.id, "capture"): capture}
+                if provider_fails:
+                    expected[(turn.id, "provider")] = engine
+                self.assertEqual(daemon._failed_dictation_cleanup, expected)
+                self.assertEqual(daemon._warn.call_count, len(expected))
+                capture.stop.side_effect = engine.close.side_effect = None
+                self.assertIsNone(daemon._close_dictation_resources(turn, capture, engine))
+                self.assertEqual(daemon._failed_dictation_cleanup, {})
+
+    def test_provider_teardown_methods_contend_on_lifecycle_lock(self):
+        for engine_type in (stt.WhisperStt, stt.WhistleStt):
+            for method in ("_stop_child", "close", "cancel"):
+                with self.subTest(engine=engine_type.__name__, method=method):
+                    engine, process = self.provider(engine_type)
+                    lock = engine._lifecycle = ObservedLock()
+                    done, signalled = threading.Event(), threading.Event()
+                    errors = []
+                    original = stt.kill_group
+
+                    def sending(child):
+                        signalled.set()
+                        lock.boundary.set()
+                        original(child)
+
+                    def stopping():
+                        try:
+                            getattr(engine, method)()
+                        except BaseException as error:
+                            errors.append(error)
+                        finally:
+                            done.set()
+                            lock.boundary.set()
+
+                    worker = lock.observed_thread = threading.Thread(target=stopping)
+                    with mock.patch.object(stt, "kill_group", side_effect=sending):
+                        try:
+                            with lock:
+                                worker.start()
+                                reached = lock.boundary.wait(2)
+                                attempted = lock.attempted.is_set()
+                                premature = done.is_set() or signalled.is_set()
+                        finally:
+                            worker.join(3)
+                    self.assertTrue(reached, "worker did not reach a lifecycle boundary")
+                    self.assertTrue(attempted, "teardown bypassed the held lifecycle lock")
+                    self.assertFalse(premature, "teardown ran while another owner held the lock")
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(errors, [])
+                    engine.close()
+                    self.assertIsNone(engine._process)
+                    self.assertIsNotNone(process.returncode)
+
+    def test_close_waits_for_inflight_provider_startup(self):
+        for engine_type in (stt.WhisperStt, stt.WhistleStt):
+            with self.subTest(engine=engine_type.__name__), tempfile.TemporaryDirectory() as root:
+                engine, _ = self.provider(engine_type)
+                engine.close()
+                engine._closed = False
+                lock = engine._lifecycle = ObservedLock()
+                engine._command = lambda: [sys.executable, "-c", "import time; time.sleep(60)"]
+                entered, release, closed = (threading.Event() for _ in range(3))
+                children, errors = [], []
+                original = subprocess.Popen
+
+                def launch(*args, **kwargs):
+                    entered.set()
+                    if not release.wait(3):
+                        raise AssertionError("test never released process creation")
+                    child = original(*args, **kwargs)
+                    children.append(child)
+                    return child
+
+                def starting():
+                    try:
+                        engine._start()
+                    except BaseException as error:
+                        errors.append(error)
+
+                def closing():
+                    try:
+                        engine.close()
+                    except BaseException as error:
+                        errors.append(error)
+                    finally:
+                        closed.set()
+                        lock.boundary.set()
+
+                startup = threading.Thread(target=starting)
+                closer = lock.observed_thread = threading.Thread(target=closing)
+                try:
+                    with mock.patch.object(stt.paths, "session_dir", return_value=root), \
+                            mock.patch.object(stt.subprocess, "Popen", side_effect=launch):
+                        try:
+                            startup.start()
+                            self.assertTrue(entered.wait(2))
+                            closer.start()
+                            self.assertTrue(lock.boundary.wait(2))
+                            contended = lock.attempted.is_set()
+                            premature = closed.is_set()
+                        finally:
+                            release.set()
+                            startup.join(3)
+                            if closer.ident is not None:
+                                closer.join(3)
+                    self.assertFalse(startup.is_alive() or closer.is_alive())
+                    self.assertEqual(errors, [])
+                    self.assertTrue(contended, "close never contended with launch's held lock")
+                    self.assertFalse(premature, "close returned while launch was in flight")
+                    self.assertEqual(len(children), 1)
+                    self.assertIsNone(engine._process)
+                    self.assertIsNotNone(children[0].returncode)
+                    self.assertFalse(Path(f"/proc/{children[0].pid}").exists())
+                finally:
+                    for child in children:
+                        if child.returncode is None:
+                            child.kill()
+                        child.wait(timeout=3)
+                        child.stdin.close()
+                        child.stdout.close()
+                    engine.close()
+
+    def test_busy_failed_close_hands_group_signal_to_decode_finalizer(self):
+        for engine_type in (stt.WhisperStt, stt.WhistleStt):
+            with self.subTest(engine=engine_type.__name__):
+                engine, process = self.provider(engine_type)
+                entered, release = threading.Event(), threading.Event()
+                errors, sealed_before_wait = [], []
+                original_reap = engine._reap
+
+                def writing(*_):
+                    entered.set()
+                    if not release.wait(3):
+                        raise AssertionError("test never released decode")
+
+                def reaping(child):
+                    sealed = getattr(child, "_voice_group_signalled", False)
+                    sealed_before_wait.append(sealed)
+                    if not sealed:
+                        # Contain a broken finalizer by our fixture PID, then
+                        # fail the assertion below instead of a wait timeout.
+                        os.kill(child.pid, signal.SIGKILL)
+                    original_reap(child)
+
+                def decode():
+                    try:
+                        engine._decode(b"\0\0")
+                    except BaseException as error:
+                        errors.append(error)
+
+                worker = threading.Thread(target=decode)
+                with mock.patch.object(engine, "_write_all", side_effect=writing), \
+                        mock.patch.object(engine, "_read_reply", return_value={"text": "words"}), \
+                        mock.patch.object(engine, "_reap", side_effect=reaping), \
+                        mock.patch.object(processes.os, "killpg", wraps=os.killpg) as send:
+                    try:
+                        worker.start()
+                        self.assertTrue(entered.wait(2))
+                        with mock.patch.object(stt, "kill_group", side_effect=InterruptedError):
+                            with self.assertRaises(InterruptedError):
+                                engine.close()
+                        self.assertIs(engine._process, process)
+                        self.assertTrue(engine._busy)
+                        self.assertIsNone(processes.poll_exit(process))
+                    finally:
+                        release.set()
+                        worker.join(3)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(errors, [])
+                    self.assertEqual(sealed_before_wait, [True],
+                                     "decode finalizer reaped before completing the failed group signal")
+                    send.assert_called_once_with(process.pid, signal.SIGKILL)
+                self.assertIsNone(engine._process)
+                self.assertIsNotNone(process.returncode)
+                self.assertFalse(Path(f"/proc/{process.pid}").exists())
+                engine.close()
+
+    def test_provider_reap_requests_a_finite_timeout(self):
+        for engine_type in (stt.WhisperStt, stt.WhistleStt):
+            with self.subTest(engine=engine_type.__name__):
+                process = SimpleNamespace(stdin=mock.Mock(), stdout=mock.Mock(), wait=mock.Mock())
+                engine_type._reap(process)
+                process.wait.assert_called_once()
+                timeout = process.wait.call_args.kwargs.get("timeout")
+                self.assertIsInstance(timeout, (int, float), "reap requested an unbounded wait")
+                self.assertTrue(math.isfinite(timeout))
+                self.assertGreater(timeout, 0)
+                self.assertLessEqual(timeout, 5)
+
     def test_busy_provider_close_keeps_process_until_decode_reaps(self):
         for engine_type in (stt.WhisperStt, stt.WhistleStt):
             with self.subTest(engine=engine_type.__name__):
@@ -413,6 +793,68 @@ class CleanupTests(unittest.TestCase):
         self.assertTrue(Path(f"/proc/{process.pid}").exists(),
                         "capture reader released the group identity")
         self.assert_signal_before_reap(capture, process)
+
+    def test_observe_signal_exit_without_reaping(self):
+        child = subprocess.Popen([sys.executable, "-c",
+            "import os, signal; os.kill(os.getpid(), signal.SIGTERM)"], start_new_session=True)
+        try:
+            self.assertEqual(processes.wait_exit(child, 2), -signal.SIGTERM)
+            self.assertEqual(processes.poll_exit(child), -signal.SIGTERM)
+            self.assertIsNone(child.returncode, "observation reaped the group leader")
+            self.assertTrue(Path(f"/proc/{child.pid}").exists())
+            info = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+            self.assertIsNotNone(info, "leader was no longer waitable")
+            self.assertEqual(info.si_status, signal.SIGTERM)
+            processes.kill_group(child)
+            self.assertEqual(child.wait(timeout=2), -signal.SIGTERM)
+        finally:
+            if child.returncode is None:
+                child.kill()
+                child.wait(timeout=3)
+
+    def test_wait_observation_timeout_boundary(self):
+        child = SimpleNamespace(args=["fixture"])
+        # Equal to the deadline and just past it must both use the documented
+        # exception, without handing a negative duration to sleep().
+        for timeout, end in ((0, 10), (.01, 10.02)):
+            with self.subTest(timeout=timeout):
+                caught = None
+                with mock.patch.object(processes, "poll_exit", return_value=None), \
+                        mock.patch.object(processes.time, "monotonic", side_effect=[10, end, end + .01]):
+                    try:
+                        processes.wait_exit(child, timeout)
+                    except Exception as error:
+                        caught = error
+                self.assertIsInstance(caught, subprocess.TimeoutExpired,
+                                      f"wait expiry raised {type(caught).__name__}")
+                self.assertEqual(caught.timeout, timeout)
+
+    def test_capture_publishes_eof_when_recorder_keeps_running(self):
+        capture = audio.MicCapture({"audio": {"capture_cmd": [sys.executable, "-c",
+            "import os, time; os.close(1); time.sleep(60)"]}})
+        capture._TERM_TIMEOUT = .03
+        self.addCleanup(capture.stop)
+        errors = []
+        # Record a broken reader as evidence for assertions, rather than
+        # letting an unhandled thread exception masquerade as a test catch.
+        with mock.patch.object(threading, "excepthook", side_effect=lambda args: errors.append(args.exc_value)):
+            capture.start()
+            child, reader = capture._process, capture._reader
+            reader.join(2)
+        self.assertFalse(reader.is_alive(), "EOF reader did not finish its bounded observation")
+        self.assertEqual(errors, [], "reader missed the timeout exception contract")
+        try:
+            item = capture._queue.get(timeout=.1)
+        except queue.Empty:
+            item = None
+        self.assertIs(item, audio._EOF, "reader failed to publish EOF while recorder stayed alive")
+        self.assertIsNone(processes.poll_exit(child))
+        self.assertIsNone(child.returncode)
+        self.assertIs(capture._process, child, "EOF reader discarded recorder ownership")
+        self.assertTrue(Path(f"/proc/{child.pid}").exists())
+        capture.stop()
+        self.assertIsNotNone(child.returncode)
+        self.assertFalse(Path(f"/proc/{child.pid}").exists())
 
     def test_group_helper_refuses_an_already_reaped_object(self):
         with subprocess.Popen([sys.executable, "-c", "pass"],

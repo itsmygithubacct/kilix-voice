@@ -887,6 +887,10 @@ class Daemon(OwnedTurns):
     # ingest-audio on the calling thread, as the unit tests' daemons do.
     _ingest_slots: threading.BoundedSemaphore | None = None
     _ingest_in_flight = 0
+    # Failed teardown must outlive the worker and its settled turn. Only
+    # registry updates take this lock; signalling and waiting never do.
+    _cleanup_lock = threading.Lock()
+    _failed_dictation_cleanup: dict | None = None
 
     def __init__(self, *, config_path: str | None = None,
                  idle_seconds: float | None = None,
@@ -2389,15 +2393,53 @@ class Daemon(OwnedTurns):
             self._check_delivery(turn, "while recognition stopped")
             raise
         finally:
+            primary_error = sys.exc_info()[1]
             with turn.capture_lock:
                 turn.capture = None
                 turn.interrupt = None
-            capture.stop()
-            if engine is not None: engine.close()
-            if grant is not None:
+            cleanup_error = self._close_dictation_resources(turn, capture, engine)
+            if cleanup_error is not None:
+                # Teardown is secondary to the cause already unwinding this
+                # turn. Also honour a stop that arrived during cleanup itself.
+                if primary_error is None:
+                    self._check_delivery(turn, "while resources shut down")
+                    raise cleanup_error
+            elif grant is not None:
                 # Only after a close that did not raise: an engine whose
                 # teardown failed leaves the accelerator quarantined.
                 grant.reaped()
+
+    def _close_dictation_resources(self, turn: _DictationTurn, capture, engine) -> Exception | None:
+        """Attempt both cleanups, retaining each failed owner for a later retry.
+
+        The registry belongs to this daemon, not to the turn that the worker
+        removes when it settles. Retrying this method removes only resources
+        whose cleanup succeeds; an accelerator's unproven grant stays
+        quarantined by its execution context.
+        """
+        first_error = None
+        for kind, resource, method in (("capture", capture, "stop"),
+                                       ("provider", engine, "close")):
+            if resource is None:
+                continue
+            key = (turn.id, kind)
+            try:
+                getattr(resource, method)()
+            except Exception as error:
+                with self._cleanup_lock:
+                    if self._failed_dictation_cleanup is None:
+                        self._failed_dictation_cleanup = {}
+                    self._failed_dictation_cleanup[key] = resource
+                # Exception text can contain command arguments or heard text.
+                self._warn(f"{turn.id}: {kind} cleanup failed "
+                           f"({type(error).__name__}); ownership retained")
+                if first_error is None:
+                    first_error = error
+            else:
+                with self._cleanup_lock:
+                    if self._failed_dictation_cleanup is not None:
+                        self._failed_dictation_cleanup.pop(key, None)
+        return first_error
 
     @staticmethod
     def _check_delivery(turn: _DictationTurn, where: str) -> None:

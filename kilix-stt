@@ -1556,8 +1556,15 @@ class Ui:
             try:
                 self._stop_capture()
             finally:
-                for number, handler in previous.items():
-                    signal.signal(number, handler)
+                # Restoring SIGINT can make the next interrupt raise again.
+                # Defer new terminal signals until every disposition is back,
+                # then restore the caller's mask and deliver pending signals.
+                mask = signal.pthread_sigmask(signal.SIG_BLOCK, previous)
+                try:
+                    for number, handler in previous.items():
+                        signal.signal(number, handler)
+                finally:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, mask)
 
     def _handle(self, key: int) -> int | None:
         """Act on one keystroke; return an exit code to leave the screen."""
