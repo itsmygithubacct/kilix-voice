@@ -853,6 +853,10 @@ class VibeVoiceStt(_HeldPayload, _WholeUtterance):
             self._kill()
             self._release()
 
+    def cancel(self) -> None:
+        # Also prevents a decode between its WAV write and child startup.
+        self.close()
+
     def _kill(self) -> None:
         # Only kills: the thread in _decode() owns the process and reaps
         # it, so two threads never communicate() with it at once.
@@ -984,6 +988,19 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
             raise SttError(f"{self.label} failed {what}: {_clean_text(str(reply['error']))[:400]}.")
         return reply
 
+    def check_health(self) -> None:
+        """Notice a dead provider even while PCM is only being buffered."""
+        with self._lifecycle:
+            self._require_live()
+            process = self._process
+            if process is None:
+                raise SttError(f"the {self.label} provider stopped; start a new dictation turn.")
+            code = process.poll()
+            if code is not None:
+                raise SttError(
+                    f"the {self.label} provider exited with status {code} while recording. "
+                    "Start a new dictation turn.")
+
     def _write_all(self, process: subprocess.Popen, data: bytes, deadline: float) -> None:
         fd = process.stdin.fileno()
         view = memoryview(data)
@@ -1051,6 +1068,13 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
             if process.poll() is None:
                 process.kill()
             self._reap(process)
+
+    def cancel(self) -> None:
+        """Interrupt decode; its worker still owns the pipes and reaping."""
+        with self._lifecycle:
+            process = self._process
+            if process is not None and process.poll() is None:
+                process.kill()
 
     @staticmethod
     def _reap(process: subprocess.Popen) -> None:

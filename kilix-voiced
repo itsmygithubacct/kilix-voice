@@ -104,6 +104,7 @@ REFUSAL_LINGER_S = 0.25
 DATAGRAM_TIMEOUT_S = 1.0     # a dictation receiver that stopped reading
 SPEECH_POLL_S = 0.05         # how often a speech turn notices a cancellation
 CAPTURE_POLL_S = 0.2
+RECEIVER_POLL_S = 0.1
 JOIN_TIMEOUT_S = 5.0
 # How long stop-dictation waits for a recogniser feed already in progress
 # before it replies anyway. The same order as REQUEST_TIMEOUT_S: the accept
@@ -691,9 +692,20 @@ class _DictationTurn(_JobTurn):
 
     def __init__(self, turn_id: str, receiver: socket.socket,
                  deadline: float | None = None,
-                 clock=time.monotonic) -> None:
+                 clock=time.monotonic, receiver_path: str = "") -> None:
         self.id = turn_id
         self.receiver = receiver
+        self.receiver_path = receiver_path
+        self.receiver_identity = None
+        if receiver_path:
+            try:
+                info = os.lstat(receiver_path)
+                self.receiver_identity = (info.st_dev, info.st_ino)
+            except OSError:
+                pass  # already unlinked: the worker cancels before capture
+        self.capture_lock = threading.Lock()
+        self.capture = None
+        self.interrupt = None
         # F02: dictation accepted a caller deadline and then read it nowhere.
         # It is the same token type speech uses, so the budget reaches
         # preparation, recogniser construction and recording alike.
@@ -703,6 +715,35 @@ class _DictationTurn(_JobTurn):
         # by stop-dictation before it replies, so a stop that has replied is
         # never followed by either.
         self.progress_lock = threading.Lock()
+
+    def receiver_alive(self) -> bool:
+        """Check both the original path and the listener, without sending.
+
+        A killed datagram client leaves its socket inode behind and produces
+        no POLLHUP. Connecting a temporary datagram socket detects that stale
+        inode without filling a live client's receive queue with heartbeats.
+        A seqpacket connection does report hangup; do not open extra accepted
+        connections on that transport.
+        """
+        if not self.receiver_path:
+            return True
+        try:
+            info = os.lstat(self.receiver_path)
+            if (not stat.S_ISSOCK(info.st_mode)
+                    or (info.st_dev, info.st_ino) != self.receiver_identity):
+                return False
+            if self.receiver.type == socket.SOCK_DGRAM:
+                with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as probe:
+                    probe.setblocking(False)
+                    probe.connect(self.receiver_path)
+            else:
+                poller = select.poll()
+                poller.register(self.receiver, select.POLLHUP | select.POLLERR)
+                if poller.poll(0):
+                    return False
+        except OSError:
+            return False
+        return True
 
     @property
     def deadline(self) -> float | None:
@@ -1914,14 +1955,13 @@ class Daemon(OwnedTurns):
         # failure leaves read-aloud playing.
         self._refuse_own_control_socket(request["sock"], "sock")
         receiver = _connect_dictation(request["sock"])
-        turn = _DictationTurn(self._next_turn_id("listen"), receiver, deadline)
+        turn = _DictationTurn(self._next_turn_id("listen"), receiver, deadline,
+                              receiver_path=request["sock"])
         turn.owner = request.get("owner", "")
         turn.hold = request.get("hold", False)
         turn.silence_ms = request.get("silence_ms")
         turn.lease_until = time.monotonic()+3
         turn.owned_finish = threading.Event()
-        turn.capture_lock = threading.Lock()
-        turn.capture = None
         if turn.expired():
             # Same rule speak already followed: a budget spent before the
             # microphone opens must not open it.
@@ -2014,7 +2054,14 @@ class Daemon(OwnedTurns):
 
     def _run_dictation(self, turn: _DictationTurn) -> None:
         """Record one turn, stream partials, and deliver the final text."""
+        watch_done = threading.Event()
+        watcher = None
         try:
+            if turn.receiver_path:
+                watcher = threading.Thread(
+                    target=self._watch_dictation_receiver, args=(turn, watch_done),
+                    name=f"kilix-voice-receiver-{turn.id}", daemon=True)
+                watcher.start()
             self._dictate(turn)
         # F08: these arms exist because the broad one below flattened every
         # distinguishable failure into `unavailable`. A caller could not tell a
@@ -2061,6 +2108,9 @@ class Daemon(OwnedTurns):
                 f"dictation failed unexpectedly: {error}. Try again; the "
                 "daemon's stderr has the details.", protocol.ERR_INTERNAL))
         finally:
+            watch_done.set()
+            if watcher is not None and watcher.ident is not None:
+                watcher.join()
             if turn.outcome is None:
                 # No terminal was delivered: a worker that returned without
                 # one, or a delivery that itself raised. The job still ends,
@@ -2077,6 +2127,31 @@ class Daemon(OwnedTurns):
             turn.receiver.close()
             self._clear_dictation(turn)
             self._touch()
+
+    @staticmethod
+    def _abort_lost_receiver(turn: _DictationTurn) -> None:
+        # No progress lock: a recogniser may be blocked in feed/decode.
+        # Loss of the return path is an abort, including unlink-then-abort
+        # clients. Never turn that race into a provider failure or a final.
+        with turn._settle_lock:
+            if turn.outcome is not None:
+                return
+            turn.abort = True
+            turn.stop.set()
+        with turn.capture_lock:
+            if turn.capture is not None:
+                turn.capture.request_stop()
+            if turn.interrupt is not None:
+                turn.interrupt()
+
+    def _watch_dictation_receiver(self, turn: _DictationTurn,
+                                  done: threading.Event) -> None:
+        while not done.is_set():
+            if not turn.receiver_alive():
+                self._abort_lost_receiver(turn)
+                return
+            if done.wait(RECEIVER_POLL_S):
+                return
 
     def _deliver_terminal(self, turn: _DictationTurn, message: dict) -> bool:
         """Send a dictation job's one terminal datagram and settle its outcome.
@@ -2187,11 +2262,17 @@ class Daemon(OwnedTurns):
                     return
                 self._send(turn.receiver, {"listening": True})
             engine = stt_lib.make_stt(self._cfg, capture.rate, resolved=resolved)
+            with turn.capture_lock:
+                turn.interrupt = getattr(engine, "cancel", None)
             # The last boundary before the device is opened. Everything above
             # can take real time -- a payload hash and a model load -- and a
             # stop or an expiry during it must still mean the mic stays shut.
             turn.stop.check()
-            if not getattr(turn, "owner", ""): capture.start()
+            if not getattr(turn, "owner", ""):
+                with turn.capture_lock:
+                    turn.stop.check()
+                    capture.start()
+                    turn.capture = capture
             engine.start_utterance()
             heard = self._record(turn, capture, engine)
             # Recording stopping because the budget ran out is not a completed
@@ -2237,7 +2318,17 @@ class Daemon(OwnedTurns):
             # Same segment id as this turn's partials, marked stable: the
             # consumer replaces the running text rather than appending to it.
             self._deliver_terminal(turn, protocol.dictation_final(text, turn.id))
+        except (Cancelled, DeadlineExceeded):
+            raise
+        except Exception:
+            # A cancelled child can surface as a recogniser error while its
+            # pipes unwind. Keep the abort/deadline as the terminal cause.
+            self._check_delivery(turn, "while recognition stopped")
+            raise
         finally:
+            with turn.capture_lock:
+                turn.capture = None
+                turn.interrupt = None
             capture.stop()
             if engine is not None: engine.close()
             if grant is not None:
@@ -2263,6 +2354,8 @@ class Daemon(OwnedTurns):
         if turn.abort and turn.stop.reason() == "cancelled":
             raise Cancelled("the turn was aborted; nothing was transcribed")
         Daemon._raise_if_budget_spent(turn, where)
+        if getattr(turn, "receiver_path", "") and not turn.receiver_alive():
+            raise Cancelled("the dictation receiver went away; nothing was transcribed")
 
     @staticmethod
     def _raise_if_budget_spent(turn: _DictationTurn, where: str) -> None:
@@ -2377,11 +2470,14 @@ class Daemon(OwnedTurns):
         # refuses elsewhere -- so this counts and REFUSES rather than trimming.
         captured_bytes = 0
         dropped_frames = 0
+        check_health = getattr(engine, "check_health", None)
         # R4 finding 1: this read is_set() only, so an accepted deadline_ms
         # bounded nothing here -- recording ran to max_seconds, VAD silence or
         # an explicit stop while the caller's budget had long since elapsed.
         # done() is "stopped OR expired".
         while not turn.stop.done() and not self._stopping.is_set():
+            if check_health is not None:
+                check_health()
             if time.monotonic() >= ceiling:
                 self._debug(f"{turn.id}: hit the {max_seconds:.0f}s ceiling")
                 break
@@ -2444,6 +2540,7 @@ class Daemon(OwnedTurns):
                     # not the turn. One that has gone still ends it.
                     if not self._send(turn.receiver, _Outbound(protocol.dictation_partial(
                             clean_for_injection(text), turn.id), droppable=True)):
+                        self._abort_lost_receiver(turn)
                         break
             if event == events.VAD_SPEECH_START:
                 speaking = True
