@@ -698,14 +698,15 @@ class _SpeechTurn(_JobTurn):
 # The old receiver cannot be reached by this pathname/transport. Apply the
 # same classification to the initial stat and every later probe step.
 # ENAMETOOLONG also covers a parent symlink expanded beyond pathname limits;
-# ENOTSOCK/EPROTOTYPE cover replacement between stat and datagram connect.
+# EPROTOTYPE covers a peer-type replacement between stat and datagram connect.
 _RECEIVER_GONE_ERRNOS = frozenset((
     errno.ENOENT, errno.ECONNREFUSED, errno.ENOTDIR, errno.ELOOP,
-    errno.ENAMETOOLONG, errno.ENOTSOCK, errno.EPROTOTYPE,
+    errno.ENAMETOOLONG, errno.EPROTOTYPE,
 ))
 # All other probe errors are inconclusive. In particular EACCES, EPERM,
 # EMFILE, ENFILE, ENOBUFS, ENOMEM, EINTR and EAGAIN never cancel a live peer.
-# Unknown errors (including I/O or stale-mount failures) also preserve it:
+# Other errors (including ENOTSOCK for the probe's local descriptor, I/O or
+# stale-mount failures) and unknown errnos also preserve it:
 # failing to inspect a pathname is not evidence that its connected peer died.
 # This deliberately favors a healthy dictation over prompt loss detection
 # when observation fails; recording still has its configured duration cap.

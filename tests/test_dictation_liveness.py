@@ -723,8 +723,7 @@ class DictationLivenessBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             receiver, turn = self.receiver_turn(directory)
             for code in (errno.ENOENT, errno.ECONNREFUSED, errno.ENOTDIR,
-                         errno.ELOOP, errno.ENAMETOOLONG, errno.ENOTSOCK,
-                         errno.EPROTOTYPE):
+                         errno.ELOOP, errno.ENAMETOOLONG, errno.EPROTOTYPE):
                 for target, name in ((voiced.os, "lstat"), (voiced.socket, "socket"),
                                      (socket.socket, "connect")):
                     with self.subTest(errno=code, operation=name):
@@ -745,7 +744,7 @@ class DictationLivenessBoundaryTests(unittest.TestCase):
         # peer died. An unrecognized future errno follows the same policy.
         with tempfile.TemporaryDirectory() as directory:
             receiver, turn = self.receiver_turn(directory)
-            for code in (errno.EIO, errno.ESTALE, errno.EINVAL, 123456):
+            for code in (errno.EIO, errno.ESTALE, errno.EINVAL, errno.ENOTSOCK, 123456):
                 for target, name in ((voiced.os, "lstat"), (voiced.socket, "socket"),
                                      (socket.socket, "connect")):
                     with self.subTest(errno=code, operation=name):
