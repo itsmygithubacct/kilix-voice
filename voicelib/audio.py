@@ -27,6 +27,11 @@ that command building stays a pure function of what it was handed.
 Capture commands and their descendants must stay in the private process group.
 A custom command that calls setsid() or setpgid() can escape group cleanup and
 keep a microphone or pipe open. No shipped recorder wrapper does this.
+If the daemon or meter owner is killed with SIGKILL, it cannot run cleanup.
+A recorder stalled without writing can outlive that owner even in its
+original group: it never observes the closed output pipe. There is no
+independent owner-death supervisor. Acoustic silence normally still writes
+PCM; output-dependent pipe failure is not a guarantee for a stalled recorder.
 
 Nothing here opens a device before ``start()``/``play()``: constructing a
 ``MicCapture`` or a ``Player`` is free, which is what lets a curses TUI build

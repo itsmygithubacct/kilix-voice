@@ -1523,8 +1523,8 @@ class Ui:
     # -- main loop ----------------------------------------------------------
 
     def run(self) -> int:
-        # Capture owns a private process group. Terminal hangup/termination
-        # must unwind this owner and run its cleanup, just as Ctrl-C does.
+        # Capture owns a private process group. All terminal interrupts must
+        # unwind this owner once, then let signalling and waiting finish.
         stopping = False
 
         def interrupted(_number, _frame):
@@ -1535,7 +1535,7 @@ class Ui:
 
         previous = {}
         try:
-            for number in (signal.SIGHUP, signal.SIGTERM):
+            for number in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
                 handler = signal.getsignal(number)
                 if handler != signal.SIG_IGN:
                     previous[number] = handler
@@ -1761,9 +1761,11 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        # The screen is already restored by the wrapper, and run()'s finally
-        # has closed the microphone; nothing is left to say.
-        return 0
+        # The wrapper restores the screen, but an interruption alone does
+        # not prove that capture cleanup completed. Never report success
+        # when an interrupted teardown may still own a recorder.
+        print("kilix-stt: interrupted", file=sys.stderr)
+        return 130
 
 
 # -- first-run setup ----------------------------------------------------------

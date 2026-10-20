@@ -1074,15 +1074,21 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
         finally:
             with self._lifecycle:
                 self._busy = False
-                if self._closed:
+                if self._closed and self._process is process:
+                    # close() can fail before signalling. The decode owner
+                    # must still complete that step before releasing the ID.
+                    kill_group(process)
                     self._reap(process)
+                    self._process = None
 
     def _stop_child(self) -> None:
         with self._lifecycle:
-            process, self._process = self._process, None
-        if process is not None:
-            kill_group(process)
-            self._reap(process)
+            process = self._process
+            if process is not None:
+                kill_group(process)
+                self._reap(process)
+                # Keep the retry handle until both operations succeed.
+                self._process = None
 
     def cancel(self) -> None:
         """Interrupt decode; its worker still owns the pipes and reaping."""
@@ -1098,23 +1104,21 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
                 stream.close()
             except OSError:
                 pass
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
+        process.wait(timeout=5)
 
     def close(self) -> None:
         self._open = False
         with self._lifecycle:
             self._closed = True
             self._pcm = bytearray()
-            process, self._process = self._process, None
+            process = self._process
             if process is not None:
                 kill_group(process)
                 # A decode in progress owns the pipes and reaps the child;
                 # otherwise nobody else will.
                 if not self._busy:
                     self._reap(process)
+                    self._process = None
             self._release()
         links, self._links = self._links, None
         if links:

@@ -1,4 +1,6 @@
 """Cleanup boundaries with real synthetic recorders, no audio device."""
+import contextlib
+import io
 import os
 from pathlib import Path
 import signal
@@ -7,6 +9,7 @@ import sys
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from tests.test_stt_tool import tool
@@ -90,8 +93,68 @@ class CleanupTests(unittest.TestCase):
     def test_second_termination_during_meter_cleanup(self):
         self.second_signal(signal.SIGTERM)
 
+    def test_second_ctrl_c_during_meter_cleanup(self):
+        self.second_signal(signal.SIGINT)
+
+    def test_mixed_meter_signals_through_signal_and_wait(self):
+        numbers = (signal.SIGINT, signal.SIGHUP, signal.SIGTERM)
+        for initial in numbers:
+            with self.subTest(initial=initial):
+                capture, process = self.capture()
+                ui, mic = self.ui(capture)
+                previous = {n: signal.getsignal(n) for n in numbers}
+                original_signal, original_wait = audio.kill_group, process.wait
+
+                def interrupt():
+                    signal.raise_signal(initial)
+
+                def boundary(child):
+                    for number in numbers * 2:
+                        signal.raise_signal(number)
+                    original_signal(child)
+
+                def waiting(*args, **kwargs):
+                    for number in tuple(reversed(numbers)) * 2:
+                        signal.raise_signal(number)
+                    return original_wait(*args, **kwargs)
+
+                ui._screen.getch.side_effect = interrupt
+                with mock.patch.object(audio, "kill_group", side_effect=boundary), \
+                        mock.patch.object(process, "wait", side_effect=waiting), \
+                        mock.patch.object(processes.os, "killpg", wraps=os.killpg) as send:
+                    try:
+                        ui.run()
+                    except KeyboardInterrupt:
+                        pass
+                    self.assertEqual(send.call_count, 1, "mixed signals abandoned group cleanup")
+                    self.assertIsNotNone(process.returncode, "mixed signals skipped the wait")
+                self.assertIsNone(mic._capture)
+                self.assertFalse(Path(f"/proc/{process.pid}").exists())
+                self.assertEqual({n: signal.getsignal(n) for n in numbers}, previous)
+
+    def test_main_reports_incomplete_meter_cleanup(self):
+        capture, process = self.capture()
+        ui, mic = self.ui(capture)
+        ui._screen.getch.return_value = ord("q")
+        previous = {n: signal.getsignal(n) for n in
+                    (signal.SIGINT, signal.SIGHUP, signal.SIGTERM)}
+        stderr = io.StringIO()
+        with mock.patch.object(tool.sys.stdin, "isatty", return_value=True), \
+                mock.patch.object(tool.sys.stdout, "isatty", return_value=True), \
+                mock.patch.object(tool.curses, "wrapper", side_effect=lambda *_: ui.run()), \
+                mock.patch.object(audio, "kill_group", side_effect=KeyboardInterrupt), \
+                contextlib.redirect_stderr(stderr):
+            status = tool.main([])
+        self.assertNotEqual(status, 0, "main reported success after abandoning capture cleanup")
+        self.assertTrue(stderr.getvalue().strip(), "interruption was not reported")
+        self.assertIs(mic._capture, capture)
+        self.assertIs(capture._process, process)
+        self.assertEqual({n: signal.getsignal(n) for n in previous}, previous)
+        mic.stop()
+        self.assertFalse(Path(f"/proc/{process.pid}").exists())
+
     def test_normal_meter_exit_survives_signals_during_cleanup(self):
-        for number in (signal.SIGHUP, signal.SIGTERM):
+        for number in (signal.SIGINT, signal.SIGHUP, signal.SIGTERM):
             with self.subTest(signal=number):
                 self.second_signal(number, initial_signal=False)
 
@@ -138,6 +201,166 @@ class CleanupTests(unittest.TestCase):
 
     def test_meter_preserves_inherited_ignored_termination(self):
         self.ignored_signal(signal.SIGTERM)
+
+    def test_meter_preserves_inherited_ignored_interrupt(self):
+        self.ignored_signal(signal.SIGINT)
+
+    def test_meter_restores_custom_dispositions(self):
+        def inherited(*_):
+            self.fail("inherited handler called before cleanup completed")
+        numbers = (signal.SIGINT, signal.SIGHUP, signal.SIGTERM)
+        for number in numbers:
+            prior = signal.signal(number, inherited)
+            self.addCleanup(signal.signal, number, prior)
+        self.test_mixed_meter_signals_through_signal_and_wait()
+        self.assertTrue(all(signal.getsignal(n) is inherited for n in numbers))
+
+    def test_group_signal_failure_can_be_retried_before_sealing(self):
+        process = SimpleNamespace(pid=424242, returncode=None)
+        with mock.patch.object(processes.os, "killpg",
+                               side_effect=[InterruptedError("before signal"), None]) as send:
+            with self.assertRaises(InterruptedError):
+                processes.kill_group(process)
+            self.assertFalse(getattr(process, "_voice_group_signalled", False),
+                             "failed signal sealed off the cleanup retry")
+            processes.kill_group(process)
+            processes.kill_group(process)
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(send.call_args, mock.call(process.pid, signal.SIGKILL))
+
+    def test_overlapping_group_callers_serialize_the_final_signal(self):
+        process = SimpleNamespace(pid=424242, returncode=None)
+        entered, release, second_started = (threading.Event() for _ in range(3))
+        calls, errors = [], []
+
+        def sending(*args):
+            calls.append(args)
+            entered.set()
+            release.wait(2)
+
+        def stop(second=False):
+            if second:
+                second_started.set()
+            try:
+                processes.kill_group(process)
+            except BaseException as error:
+                errors.append(error)
+
+        first = threading.Thread(target=stop)
+        second = threading.Thread(target=stop, args=(True,))
+        with mock.patch.object(processes.os, "killpg", side_effect=sending):
+            try:
+                first.start()
+                self.assertTrue(entered.wait(1), "first caller never entered signal")
+                second.start()
+                self.assertTrue(second_started.wait(1))
+                # Let the second caller overlap the deliberately blocked signal.
+                second.join(.1)
+            finally:
+                release.set()
+                first.join(2)
+                if second.ident is not None:
+                    second.join(2)
+        self.assertFalse(first.is_alive() or second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(calls, [(process.pid, signal.SIGKILL)],
+                         "overlapping callers sent multiple final group signals")
+
+    def test_group_owner_rejects_ignored_and_custom_sigchld(self):
+        for disposition in (signal.SIG_IGN, lambda *_: None):
+            with self.subTest(disposition=disposition), \
+                    mock.patch.object(signal, "getsignal", return_value=disposition):
+                with self.assertRaisesRegex(OSError, "default SIGCHLD"):
+                    processes.require_waitable_children()
+
+    def provider(self, engine_type):
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   start_new_session=True)
+        def cleanup():
+            if process.returncode is None:
+                try:
+                    os.kill(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            process.wait(timeout=3)
+            process.stdin.close()
+            process.stdout.close()
+        self.addCleanup(cleanup)
+        engine = object.__new__(engine_type)
+        engine._process = process
+        engine._lifecycle = threading.Lock()
+        engine._closed = engine._busy = False
+        engine._ready = True
+        engine._rate = 16000
+        engine._links = None
+        engine._held = {}
+        engine._release = mock.Mock()
+        engine._require_unchanged = mock.Mock()
+        return engine, process
+
+    def test_provider_teardown_failure_retains_process_for_retry(self):
+        for engine_type in (stt.WhisperStt, stt.WhistleStt):
+            for method in ("_stop_child", "close"):
+                for operation in ("signal", "wait"):
+                    with self.subTest(engine=engine_type.__name__, method=method,
+                                      operation=operation):
+                        engine, process = self.provider(engine_type)
+                        target, name = ((processes.os, "killpg") if operation == "signal"
+                                        else (process, "wait"))
+                        error = (InterruptedError("injected before signal") if operation == "signal"
+                                 else subprocess.TimeoutExpired(process.args, 5))
+                        caught = None
+                        with mock.patch.object(target, name, side_effect=error):
+                            try:
+                                getattr(engine, method)()
+                            except (InterruptedError, subprocess.TimeoutExpired) as failure:
+                                caught = failure
+                        self.assertIs(engine._process, process,
+                                      "provider lost its retry handle before signal and reap completed")
+                        self.assertIs(caught, error, "teardown failure was hidden")
+                        with mock.patch.object(processes.os, "killpg", wraps=os.killpg) as send:
+                            getattr(engine, method)()
+                        self.assertEqual(send.call_count, int(operation == "signal"))
+                        self.assertIsNotNone(process.returncode, "retry did not reap the provider")
+                        self.assertFalse(Path(f"/proc/{process.pid}").exists())
+                        self.assertIsNone(engine._process)
+
+    def test_busy_provider_close_keeps_process_until_decode_reaps(self):
+        for engine_type in (stt.WhisperStt, stt.WhistleStt):
+            with self.subTest(engine=engine_type.__name__):
+                engine, process = self.provider(engine_type)
+                entered, release = threading.Event(), threading.Event()
+                errors = []
+
+                def writing(*_):
+                    entered.set()
+                    release.wait(2)
+
+                def decode():
+                    try:
+                        engine._decode(b"\0\0")
+                    except BaseException as error:
+                        errors.append(error)
+
+                worker = threading.Thread(target=decode)
+                with mock.patch.object(engine, "_write_all", side_effect=writing), \
+                        mock.patch.object(engine, "_read_reply", return_value={"text": "words"}):
+                    try:
+                        worker.start()
+                        self.assertTrue(entered.wait(1))
+                        engine.close()
+                        self.assertIs(engine._process, process,
+                                      "busy close lost ownership before the decode worker reaped")
+                        self.assertIsNone(process.returncode)
+                    finally:
+                        release.set()
+                        worker.join(3)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(errors, [])
+                self.assertIsNone(engine._process)
+                self.assertIsNotNone(process.returncode)
+                self.assertFalse(Path(f"/proc/{process.pid}").exists())
 
     def test_receiver_loss_stops_capture_before_blocked_provider_cleanup(self):
         capture, process = self.capture()

@@ -295,6 +295,11 @@ beyond that a descriptor is refused `busy` without being inspected.
 only descendants that stay in that group. A custom recorder that daemonises
 with `setsid()` or `setpgid()` can survive and keep the microphone or a pipe
 open; no shipped wrapper does this. These overrides must remain in the group.
+SIGKILL of the daemon or meter owner bypasses cleanup. A recorder stalled
+without writing can outlive that owner even in its original group, because
+it never discovers the closed output pipe. There is no independent
+owner-death supervisor. Acoustic silence normally still produces PCM;
+output-dependent pipe failure does not cover a stalled recorder.
 
 ```python
 def build_capture_cmd(cfg) -> list[str]

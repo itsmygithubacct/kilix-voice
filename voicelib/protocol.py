@@ -600,6 +600,10 @@ def _embedded_audio_length(value: object) -> int | None:
 # can escape, retaining a microphone or pipe. No shipped provider does this,
 # but custom capture commands/provider wrappers must not daemonise. This
 # protocol promises no containment for escaped groups.
+# SIGKILL of a daemon or meter owner bypasses cleanup. A recorder stalled
+# without writing can outlive that owner even in its original group: no
+# independent owner-death supervisor exists, and no write detects the closed
+# pipe. Acoustic silence normally still produces PCM; it is not this stall.
 STOP_MODE_FINISH = "finish"
 STOP_MODE_ABORT = "abort"
 STOP_MODES = (STOP_MODE_FINISH, STOP_MODE_ABORT)
