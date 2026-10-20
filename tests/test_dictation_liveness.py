@@ -3,6 +3,7 @@
 The capture command and recogniser are selected through the daemon's normal
 configuration. No device, downloaded model, or user store is used.
 """
+import errno
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -27,7 +29,18 @@ def log(event):
     with open(os.environ["TEST_PROCESSES"], "a") as out:
         out.write(json.dumps(dict(event, pid=os.getpid())) + "\n")
 signal.signal(signal.SIGUSR1, lambda *_: sys.exit(0))
+def close_output(*_):
+    if os.environ.get("TEST_CLOSE_INPUT"):
+        log({{"input_closed": True}})
+        os.close(0)
+        time.sleep(60)  # keep the process and output alive after losing input
+        return
+    log({{"output_closed": True}})
+    os.close(1)
+signal.signal(signal.SIGUSR2, close_output)
 log({{"provider": True}})
+if os.environ.get("TEST_SLOW_MODEL"):
+    time.sleep(1)
 print('{{"ready": true}}', flush=True)
 while True:
     header = sys.stdin.buffer.readline()
@@ -94,6 +107,10 @@ class DictationLivenessTests(unittest.TestCase):
                    KILIX_VOICE_REQUIRE_CONSENT="0",
                    TEST_PROCESSES=str(self.process_log), TEST_CAPTURE_FILE=str(self.capture_mode),
                    TEST_HANG_DECODE=str(self.hang_decode))
+        if "slow_model" in self._testMethodName:
+            env["TEST_SLOW_MODEL"] = "1"
+        if "closed_input" in self._testMethodName:
+            env["TEST_CLOSE_INPUT"] = "1"
         self.turn_number = 0
         return env
 
@@ -207,6 +224,73 @@ class DictationLivenessTests(unittest.TestCase):
     def test_provider_clean_exit_during_recording(self):
         self.provider_death(signal.SIGUSR1)
 
+    def closed_output(self, *, decoding=False):
+        receiver = self.receiver()
+        job, pids = self.start_turn(receiver)
+        if decoding:
+            self.assertTrue(self._send({"op": "stop-dictation"})["stopped"])
+            self.wait_for(lambda: bool(self.entries("decode")), 3, "decode did not start")
+        started = time.monotonic()
+        os.kill(pids["provider"], signal.SIGUSR2)
+        self.wait_for(lambda: bool(self.entries("output_closed")), .5, "output did not close")
+        self.assert_stopped(started, job, pids, "failed")
+        message = self.terminal(receiver)
+        self.assertIn("error", message)
+        self.assertNotIn("final", message)
+        self.assertEqual(message["code"], "unavailable")
+        self.assert_healthy_again(started)
+
+    def test_closed_pipe_during_silent_capture(self):
+        self.closed_output()
+
+    def test_closed_pipe_without_frames(self):
+        self.closed_output()
+
+    def test_closed_pipe_during_decode(self):
+        self.closed_output(decoding=True)
+
+    def test_closed_input_during_silent_capture(self):
+        receiver = self.receiver()
+        job, pids = self.start_turn(receiver)
+        started = time.monotonic()
+        os.kill(pids["provider"], signal.SIGUSR2)
+        self.wait_for(lambda: bool(self.entries("input_closed")), .5, "input did not close")
+        self.assert_stopped(started, job, pids, "failed")
+        message = self.terminal(receiver)
+        self.assertIn("error", message)
+        self.assertNotIn("final", message)
+        self.assertEqual(message["code"], "unavailable")
+        self.assert_healthy_again(started)
+
+    def test_slow_model_during_silent_capture(self):
+        receiver = self.receiver()
+        job, pids = self.start_turn(receiver)
+        time.sleep(.5)
+        self.assertTrue(self._send({"op": "status"})["status"]["listening"])
+        self._send({"op": "stop-dictation"})
+        self.assertEqual(self.terminal(receiver)["final"], "synthetic words")
+        self.wait_for(lambda: not self._send({"op": "status"})["status"]["listening"],
+                      2, "slow healthy turn did not release its lease")
+        self.assertTrue(all(not Path(f"/proc/{pid}").exists() for pid in pids.values()))
+
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses directory search permissions")
+    def test_directory_search_revoked_during_silent_capture(self):
+        directory = Path(self.session_dir) / "nested"
+        directory.mkdir(mode=0o700)
+        self.addCleanup(directory.chmod, 0o700)
+        receiver = self.receiver("nested/r.sock")
+        job, pids = self.start_turn(receiver)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sender:
+            sender.connect(receiver.getsockname())
+            directory.chmod(0)
+            sender.send(b'{"direct":true}')
+            self.assertEqual(receiver.recv(100), b'{"direct":true}')
+        time.sleep(.4)
+        self.assertTrue(self._send({"op": "status"})["status"]["listening"],
+                        "pathname EACCES cancelled a reachable receiver")
+        self._send({"op": "stop-dictation"})
+        self.assertEqual(self.terminal(receiver)["final"], "synthetic words")
+
     def test_receiver_unlinked_during_silent_capture(self):
         receiver = self.receiver()
         job, pids = self.start_turn(receiver)
@@ -317,6 +401,186 @@ class DictationLivenessTests(unittest.TestCase):
 
 
 class DictationLivenessBoundaryTests(unittest.TestCase):
+    def receiver_turn(self, directory):
+        path = str(Path(directory) / "receiver.sock")
+        receiver = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.addCleanup(receiver.close)
+        receiver.bind(path)
+        receiver.settimeout(.1)
+        sender = voiced._connect_dictation(path)
+        self.addCleanup(sender.close)
+        return receiver, voiced._DictationTurn("boundary", sender, receiver_path=path)
+
+    def test_unlinked_receiver_cannot_get_final_before_watcher_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receiver, turn = self.receiver_turn(directory)
+            sent = []
+            daemon = _worker_daemon(sent)
+            os.unlink(turn.receiver_path)
+            with self.assertRaises(voiced.Cancelled):
+                daemon._deliver_terminal(turn, {"final": "must be discarded", "segment": turn.id})
+            self.assertEqual(sent, [])
+            self.assertIsNone(turn.outcome)
+
+    def test_whistle_dead_child_fails_health(self):
+        engine = object.__new__(stt.WhistleStt)
+        engine._closed = False
+        engine._lifecycle = threading.Lock()
+        with subprocess.Popen([sys.executable, "-c", "pass"]) as process:
+            engine._process = process
+            process.wait(timeout=3)
+            with self.assertRaises(stt.SttError):
+                engine.check_health()
+
+    def test_broken_provider_input_fails_without_waiting_for_exit(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c",
+             "import os,time; os.close(0); print('closed', flush=True); time.sleep(60)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        try:
+            self.assertEqual(process.stdout.readline(), b"closed\n")
+            engine = object.__new__(stt.WhisperStt)
+            started = time.monotonic()
+            with self.assertRaisesRegex(stt.SttError, "being sent audio"):
+                engine._write_all(process, b"audio", started + 3)
+            self.assertLess(time.monotonic() - started, .5)
+            self.assertIsNone(process.poll())
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=3)
+
+    def test_output_eof_interrupts_blocked_provider_input(self):
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import os,signal,time; "
+             "signal.signal(signal.SIGUSR2, lambda *_: os.close(1)); "
+             "print('ready', flush=True); time.sleep(60)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        engine = object.__new__(stt.WhisperStt)
+        engine._closed = False
+        engine._lifecycle = threading.Lock()
+        engine._process = process
+        errors = []
+        def write():
+            try:
+                engine._write_all(process, b"\0" * (1 << 20), time.monotonic() + 10)
+            except Exception as error:
+                errors.append(error)
+        worker = threading.Thread(target=write)
+        try:
+            self.assertEqual(process.stdout.readline(), b"ready\n")
+            os.set_blocking(process.stdin.fileno(), False)
+            worker.start()
+            time.sleep(.1)
+            self.assertTrue(worker.is_alive(), "fixture input pipe did not fill")
+            process.send_signal(signal.SIGUSR2)
+            worker.join(1)
+            self.assertFalse(worker.is_alive(), "output EOF left input delivery blocked")
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], stt.SttError)
+        finally:
+            if process.poll() is None:
+                process.kill()
+            if worker.ident is not None:
+                worker.join(3)
+            process.communicate(timeout=3)
+
+    def test_emfile_does_not_cancel_reachable_receiver(self):
+        import resource
+        with tempfile.TemporaryDirectory() as directory:
+            receiver, turn = self.receiver_turn(directory)
+            self.assertTrue(turn.receiver_alive())
+            limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+            descriptors = []
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (min(64, limit[0]), limit[1]))
+                while True:
+                    try:
+                        descriptors.append(os.open("/dev/null", os.O_RDONLY))
+                    except OSError as error:
+                        self.assertEqual(error.errno, errno.EMFILE)
+                        break
+                alive = turn.receiver_alive()
+                turn.receiver.send(b"existing receiver still reachable")
+                self.assertEqual(receiver.recv(100), b"existing receiver still reachable")
+                self.assertTrue(alive, "EMFILE cancelled a reachable receiver")
+            finally:
+                for fd in descriptors:
+                    os.close(fd)
+                resource.setrlimit(resource.RLIMIT_NOFILE, limit)
+
+    def test_inconclusive_receiver_probes_preserve_delivery(self):
+        errors = (errno.EACCES, errno.EPERM, errno.EMFILE, errno.ENFILE,
+                  errno.ENOBUFS, errno.ENOMEM, errno.EINTR, errno.EAGAIN)
+        with tempfile.TemporaryDirectory() as directory:
+            receiver, turn = self.receiver_turn(directory)
+            for code in errors:
+                for operation in ("stat", "socket", "connect"):
+                    with self.subTest(errno=code, operation=operation):
+                        error = OSError(code, os.strerror(code))
+                        target, name = {
+                            "stat": (voiced.os, "lstat"),
+                            "socket": (voiced.socket, "socket"),
+                            "connect": (socket.socket, "connect"),
+                        }[operation]
+                        with mock.patch.object(target, name, side_effect=error):
+                            self.assertTrue(turn.receiver_alive())
+                            sent = []
+                            delivery = voiced._DictationTurn(
+                                "delivery", turn.receiver, receiver_path=turn.receiver_path)
+                            self.assertTrue(delivery.receiver_alive())
+                            self.assertTrue(_worker_daemon(sent)._deliver_terminal(
+                                delivery, {"final": "healthy words"}))
+                            self.assertEqual(sent, [{"final": "healthy words"}])
+                        turn.receiver.send(b"still reachable")
+                        self.assertEqual(receiver.recv(100), b"still reachable")
+
+    def test_definite_receiver_probe_failures_cancel(self):
+        with tempfile.TemporaryDirectory() as directory:
+            receiver, turn = self.receiver_turn(directory)
+            for code in (errno.ENOENT, errno.ECONNREFUSED):
+                for target, name in ((voiced.os, "lstat"), (socket.socket, "connect")):
+                    with self.subTest(errno=code, operation=name):
+                        with mock.patch.object(target, name, side_effect=OSError(code, os.strerror(code))):
+                            self.assertFalse(turn.receiver_alive())
+            os.unlink(turn.receiver_path)
+            Path(turn.receiver_path).write_text("not a socket")
+            self.assertFalse(turn.receiver_alive())
+
+    def test_seqpacket_hangup_is_seen_even_when_path_is_inaccessible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "receiver.sock")
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as receiver:
+                receiver.bind(path)
+                receiver.listen(1)
+                with voiced._connect_dictation(path) as sender:
+                    peer, _ = receiver.accept()
+                    self.addCleanup(peer.close)
+                    turn = voiced._DictationTurn("boundary", sender, receiver_path=path)
+                    with mock.patch.object(voiced.os, "lstat",
+                                           side_effect=PermissionError(errno.EACCES, "denied")):
+                        self.assertTrue(turn.receiver_alive())
+                        peer.close()
+                        self.assertFalse(turn.receiver_alive())
+
+    def test_connected_datagram_refusal_explains_receiver_requirement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = str(Path(directory) / "receiver.sock")
+            peer_path = str(Path(directory) / "peer.sock")
+            with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as receiver, \
+                    socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as peer:
+                receiver.bind(path)
+                peer.bind(peer_path)
+                receiver.connect(peer_path)
+                receiver.settimeout(.1)
+                peer.sendto(b"healthy chosen peer", path)
+                self.assertEqual(receiver.recv(100), b"healthy chosen peer")
+                with self.assertRaises(voiced.DaemonError) as caught:
+                    voiced._connect_dictation(path)
+                message = str(caught.exception)
+                self.assertIn("unconnected datagram", message)
+                self.assertNotIn("probably gone away", message)
+
     def run_turn(self, *, health_error=False, send_fails=False):
         sent = []
         daemon = _worker_daemon(sent)

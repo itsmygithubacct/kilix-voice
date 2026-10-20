@@ -965,11 +965,9 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
                 continue
             chunk = os.read(fd, 65536)
             if not chunk:
-                # End of output comes a moment before the exit status.
-                try:
-                    code = process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    code = None
+                # EOF is already loss of the provider, even if it keeps
+                # running. Do not spend the teardown budget waiting for exit.
+                code = process.poll()
                 raise SttError(
                     f"the {self.label} provider exited{f' with status {code}' if code is not None else ''} "
                     f"{what}. Reinstall it with `kilix stt --install {self.model_id}`.")
@@ -989,7 +987,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
         return reply
 
     def check_health(self) -> None:
-        """Notice a dead provider even while PCM is only being buffered."""
+        """Notice process or pipe loss even while PCM is only being buffered."""
         with self._lifecycle:
             self._require_live()
             process = self._process
@@ -1000,6 +998,16 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
                 raise SttError(
                     f"the {self.label} provider exited with status {code} while recording. "
                     "Start a new dictation turn.")
+            # Do not read: a ready/reply line belongs to _read_reply. Hangup
+            # is reported even with unread output, and no event is expected
+            # while a slow but healthy model is loading.
+            poller = select.poll()
+            for stream in (process.stdout, process.stdin):
+                poller.register(stream, select.POLLHUP | select.POLLERR | select.POLLNVAL)
+            if poller.poll(0):
+                raise SttError(
+                    f"the {self.label} provider closed a pipe while recording. "
+                    "Start a new dictation turn.")
 
     def _write_all(self, process: subprocess.Popen, data: bytes, deadline: float) -> None:
         fd = process.stdin.fileno()
@@ -1008,8 +1016,12 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
             left = deadline - time.monotonic()
             if left <= 0:
                 raise SttError(f"{self.label} did not take the audio within the time allowed.")
-            _, ready, _ = select.select([], [fd], [], left)
+            # A full input pipe must not hide loss of the output pipe.
+            # Poll health while waiting, without imposing a progress timeout
+            # on a slow but live provider.
+            _, ready, _ = select.select([], [fd], [], min(left, 0.1))
             if not ready:
+                self.check_health()
                 continue
             try:
                 written = os.write(fd, view[:65536])

@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import errno
 import fcntl
 import hashlib
 import json
@@ -697,12 +698,13 @@ class _DictationTurn(_JobTurn):
         self.receiver = receiver
         self.receiver_path = receiver_path
         self.receiver_identity = None
+        self.receiver_missing = False
         if receiver_path:
             try:
                 info = os.lstat(receiver_path)
                 self.receiver_identity = (info.st_dev, info.st_ino)
-            except OSError:
-                pass  # already unlinked: the worker cancels before capture
+            except OSError as error:
+                self.receiver_missing = error.errno in (errno.ENOENT, errno.ECONNREFUSED)
         self.capture_lock = threading.Lock()
         self.capture = None
         self.interrupt = None
@@ -727,11 +729,24 @@ class _DictationTurn(_JobTurn):
         """
         if not self.receiver_path:
             return True
+        if self.receiver_missing:
+            return False
         try:
             info = os.lstat(self.receiver_path)
-            if (not stat.S_ISSOCK(info.st_mode)
-                    or (info.st_dev, info.st_ino) != self.receiver_identity):
+        except OSError as error:
+            if error.errno in (errno.ENOENT, errno.ECONNREFUSED):
                 return False
+            info = None  # permission/resource failures say nothing about the peer
+        if info is not None:
+            if (not stat.S_ISSOCK(info.st_mode)
+                    or (self.receiver_identity is not None
+                        and (info.st_dev, info.st_ino) != self.receiver_identity)):
+                return False
+            # The initial stat can fail after a successful connection. Keep
+            # that receiver alive, and retain the first identity we can read.
+            if self.receiver_identity is None:
+                self.receiver_identity = (info.st_dev, info.st_ino)
+        try:
             if self.receiver.type == socket.SOCK_DGRAM:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as probe:
                     probe.setblocking(False)
@@ -741,8 +756,10 @@ class _DictationTurn(_JobTurn):
                 poller.register(self.receiver, select.POLLHUP | select.POLLERR)
                 if poller.poll(0):
                     return False
-        except OSError:
-            return False
+        except OSError as error:
+            # Only positive evidence of loss cancels a turn. In particular,
+            # EACCES/EPERM and EMFILE do not break the existing connection.
+            return error.errno not in (errno.ENOENT, errno.ECONNREFUSED)
         return True
 
     @property
@@ -804,8 +821,9 @@ def _connect_dictation(path: str) -> socket.socket:
             endpoint.close()
     raise DaemonNotFound(
         f"cannot connect to the dictation socket {path} "
-        f"({'; '.join(failures)}). The pane that asked for dictation has "
-        "probably gone away — start dictation again from a live pane.")
+        f"({'; '.join(failures)}). The receiver must allow a new sender: "
+        "use a bound, unconnected datagram socket or a listening seqpacket "
+        "or stream socket, with permissions that allow the daemon to connect.")
 
 
 class Daemon(OwnedTurns):
