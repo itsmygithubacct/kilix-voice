@@ -41,6 +41,12 @@ The scope is a canonical pathname, not a turn generation: a later turn using
 the same pathname also matches. Callers needing late-stop isolation must use
 distinct receiver paths for overlapping turn lifetimes.
 
+Capture, Whisper and Whistle teardown covers descendants that stay in their
+private process group. A descendant calling setsid() or setpgid() escapes
+that group; a daemonising custom capture command or provider wrapper could
+keep the microphone or a pipe open. No shipped provider does this. There is
+no containment of escaped groups.
+
 Nothing here is configured privately: every knob comes from the shared Kilix
 settings document, re-read before each turn so a change made in ``kilix-tts``
 applies to the next thing spoken.  Point ``GPU_TERMINAL_SETTINGS_FILE`` at
@@ -53,6 +59,10 @@ recognises nothing, on a machine with no audio at all:
                "play_cmd":    ["cat"]},
      "stt":   {"engine": "null"},
      "daemon": {"idle_seconds": 5}}
+
+Custom ``audio.capture_cmd`` and ``KILIX_VOICE_WHISPER`` wrappers must not
+daemonise or move descendants to other groups; the teardown limit above
+applies to these overrides too.
 
 The daemon runs in the foreground and logs to stderr; whoever starts it decides
 whether that is a terminal, a log file, or /dev/null.  Spoken and recognised

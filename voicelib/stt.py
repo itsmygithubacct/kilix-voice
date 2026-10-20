@@ -33,7 +33,7 @@ import wave
 from typing import NamedTuple
 
 from . import consent, models, paths, protocol, resources, settings
-from .processes import kill_group
+from .processes import kill_group, poll_exit, require_waitable_children
 from .util import cfg_get
 
 DEFAULT_RATE = 16000
@@ -877,7 +877,9 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
     re-checked once the model has loaded and after every decode. Requests are
     length-prefixed PCM on its stdin, replies one JSON line on its stdout,
     each under a deadline. Teardown kills the child's private process group,
-    including descendants whose original parent has already exited.
+    including descendants whose original parent has already exited, provided
+    they stay in that group. A custom KILIX_VOICE_WHISPER wrapper must not
+    daemonise: setsid()/setpgid() can escape cleanup and keep a pipe open.
     """
 
     name = ENGINE_WHISPER
@@ -938,6 +940,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
         return self._model_path
 
     def _start(self) -> None:
+        require_waitable_children()
         work = paths.ensure_private_dir(os.path.join(paths.session_dir(), "stt"))
         self._links = tempfile.mkdtemp(prefix=self.name + "-", dir=work)
         for name, (fd, _path) in self._held.items():
@@ -968,7 +971,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
             if not chunk:
                 # EOF is already loss of the provider, even if it keeps
                 # running. Do not spend the teardown budget waiting for exit.
-                code = process.poll()
+                code = poll_exit(process)
                 raise SttError(
                     f"the {self.label} provider exited{f' with status {code}' if code is not None else ''} "
                     f"{what}. Reinstall it with `kilix stt --install {self.model_id}`.")
@@ -994,7 +997,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
             process = self._process
             if process is None:
                 raise SttError(f"the {self.label} provider stopped; start a new dictation turn.")
-            code = process.poll()
+            code = poll_exit(process)
             if code is not None:
                 raise SttError(
                     f"the {self.label} provider exited with status {code} while recording. "

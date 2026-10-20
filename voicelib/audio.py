@@ -24,6 +24,10 @@ executed directly — never through a shell.  The daemon fills the device keys
 from ``KILIX_VOICE_DEVICE_IN``/``_OUT``; this module reads no settings file, so
 that command building stays a pure function of what it was handed.
 
+Capture commands and their descendants must stay in the private process group.
+A custom command that calls setsid() or setpgid() can escape group cleanup and
+keep a microphone or pipe open. No shipped recorder wrapper does this.
+
 Nothing here opens a device before ``start()``/``play()``: constructing a
 ``MicCapture`` or a ``Player`` is free, which is what lets a curses TUI build
 one at import time and only then decide whether to use it.
@@ -38,7 +42,7 @@ import tempfile
 import threading
 from typing import IO
 
-from .processes import kill_group
+from .processes import kill_group, require_waitable_children, wait_exit
 from .util import cfg_get, which
 
 DEFAULT_RATE = 16000
@@ -262,6 +266,7 @@ class MicCapture:
         # only wanted if it dies, and a pipe nobody drains would wedge it.
         stderr = tempfile.TemporaryFile()
         try:
+            require_waitable_children()
             process = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=stderr, start_new_session=True)
@@ -305,8 +310,8 @@ class MicCapture:
     def stop(self) -> None:
         """Stop the recorder and join the reader. Idempotent."""
         self._stopping.set()
-        process, self._process = self._process, None
-        reader, self._reader = self._reader, None
+        process = self._process
+        reader = self._reader
         if process is not None:
             # Capture exchanges raw PCM over pipes, with no terminal or
             # graceful-shutdown protocol. End its whole private group now:
@@ -321,6 +326,10 @@ class MicCapture:
                 process.stdout.close()
             except OSError:
                 pass
+        # Retain both handles until signalling, reaping and joining complete.
+        # If interrupted, a later stop still owns everything needed to retry.
+        self._process = None
+        self._reader = None
         # Guarantees a blocking read() after stop() returns rather than hangs,
         # even if the reader thread outlived its join timeout.
         self._put(_EOF)
@@ -344,7 +353,7 @@ class MicCapture:
         # Whatever is left is a partial frame: dropped, not padded, because a
         # short frame would shift every following sample in the recogniser.
         try:
-            code = process.wait(timeout=self._TERM_TIMEOUT)
+            code = wait_exit(process, timeout=self._TERM_TIMEOUT)
         except subprocess.TimeoutExpired:
             code = None
         if not self._stopping.is_set() and code not in (0, None):

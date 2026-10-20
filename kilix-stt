@@ -725,11 +725,12 @@ class MicTest:
         are kept apart because only the first outranks what the capture
         managed to measure before it stopped.
         """
-        capture, self._capture = self._capture, None
+        capture = self._capture
         if capture is not None:
             self._stopped = time.monotonic()
             self._dropped = capture.overruns
             capture.stop()
+            self._capture = None
             if capture.error and not self._error:
                 self._error = capture.error
         if reason:
@@ -1524,14 +1525,21 @@ class Ui:
     def run(self) -> int:
         # Capture owns a private process group. Terminal hangup/termination
         # must unwind this owner and run its cleanup, just as Ctrl-C does.
+        stopping = False
+
         def interrupted(_number, _frame):
-            raise KeyboardInterrupt
+            nonlocal stopping
+            if not stopping:
+                stopping = True
+                raise KeyboardInterrupt
 
         previous = {}
         try:
             for number in (signal.SIGHUP, signal.SIGTERM):
-                if signal.getsignal(number) != signal.SIG_IGN:
-                    previous[number] = signal.signal(number, interrupted)
+                handler = signal.getsignal(number)
+                if handler != signal.SIG_IGN:
+                    previous[number] = handler
+                    signal.signal(number, interrupted)
             while True:
                 if self._mic is not None:
                     self._mic.poll()
@@ -1544,6 +1552,7 @@ class Ui:
                 if outcome is not None:
                     return outcome
         finally:
+            stopping = True
             try:
                 self._stop_capture()
             finally:

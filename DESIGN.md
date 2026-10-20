@@ -291,6 +291,11 @@ beyond that a descriptor is refused `busy` without being inspected.
 
 ### voicelib/audio.py
 
+`audio.capture_cmd` overrides run in a private process group. Cleanup covers
+only descendants that stay in that group. A custom recorder that daemonises
+with `setsid()` or `setpgid()` can survive and keep the microphone or a pipe
+open; no shipped wrapper does this. These overrides must remain in the group.
+
 ```python
 def build_capture_cmd(cfg) -> list[str]
     # cfg audio.capture_cmd (list, "{rate}"/"{device}" substituted) if set;
@@ -389,6 +394,11 @@ PCM and reads one JSON line, under a bound of 20 s plus 3 s per second of
 audio; the model load is bounded at 60 s. The runtime is
 `$KILIX_DATA_HOME/voice/whisper/current/bin/kilix-whisper-stt` (installed by
 `kilix voice whisper`), or `KILIX_VOICE_WHISPER`; there is no PATH fallback.
+Custom provider wrappers must stay in their original process group.
+Whisper and Whistle cleanup covers descendants in that group, including
+after the leader exits. A wrapper using `setsid()` or `setpgid()` can escape
+and keep a pipe or microphone open. No shipped provider does this; process
+groups provide no containment for daemonising wrappers.
 
 Both whole-utterance engines have `provisional()`, and their class sets
 `transcribes_at_end`. At a VAD speech end the daemon asks for a provisional

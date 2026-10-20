@@ -17,7 +17,7 @@ import unittest
 from unittest import mock
 
 from tests import test_daemon, test_dictation_liveness as live
-from voicelib import audio
+from voicelib import audio, processes
 
 
 FORK = r'''
@@ -216,7 +216,7 @@ class _TreeFixture:
         self.wait_for(lambda: len(self.entries("descendant")) == 2, 2, "no capture descendants")
         process = capture._process
         process.kill()
-        process.wait(timeout=1)
+        processes.wait_exit(process, timeout=1)
         started = time.monotonic()
         # The old stop can block closing a pipe whose reader holds its lock.
         # A thread keeps a failing pre-fix run bounded; cleanup releases it.

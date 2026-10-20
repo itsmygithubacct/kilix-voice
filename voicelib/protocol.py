@@ -595,6 +595,11 @@ def _embedded_audio_length(value: object) -> int | None:
 # use distinct paths when late stops must not affect a successor.
 # A missing path is valid. No turn or a different receiver is an ok reply
 # with stopped:false and the mode echoed. Without `sock`, stop the current turn.
+# Capture/Whisper/Whistle cleanup signals their private process groups. It
+# covers descendants only while they stay in those groups: setsid()/setpgid()
+# can escape, retaining a microphone or pipe. No shipped provider does this,
+# but custom capture commands/provider wrappers must not daemonise. This
+# protocol promises no containment for escaped groups.
 STOP_MODE_FINISH = "finish"
 STOP_MODE_ABORT = "abort"
 STOP_MODES = (STOP_MODE_FINISH, STOP_MODE_ABORT)
