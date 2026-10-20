@@ -1,4 +1,5 @@
 """Teardown of children launched with start_new_session=True."""
+import contextlib
 import os
 import signal
 import subprocess
@@ -77,3 +78,102 @@ def kill_group(process: subprocess.Popen) -> None:
         except ProcessLookupError:
             pass  # no live member remains
         process._voice_group_signalled = True
+
+
+class GroupPopen(subprocess.Popen):
+    """A pipe client whose leader reserves its group until the final signal.
+
+    communicate() also calls wait(), so the ordering must live on the process
+    itself. Observing a normal exit never permits surviving pipe holders to
+    escape the group's final signal. Only this object's owner may reap it.
+    """
+
+    def __init__(self, *args, **kwargs):
+        require_waitable_children()
+        kwargs['start_new_session'] = True
+        super().__init__(*args, **kwargs)
+
+    def poll(self):
+        return poll_exit(self)
+
+    def wait(self, timeout=None):
+        if not getattr(self, '_voice_group_signalled', False):
+            if timeout is None:
+                while poll_exit(self) is None:
+                    time.sleep(.01)
+            else:
+                wait_exit(self, timeout)
+            kill_group(self)
+        return super().wait(timeout=timeout)
+
+    def kill(self):
+        kill_group(self)
+
+
+class SynthesisOwner:
+    """Keep a synthesizer's child through IO and every failed close attempt."""
+
+    def __init__(self):
+        self._process = None
+        self._process_lock = threading.Lock()
+        self._io_lock = threading.Lock()
+        self._cancelled = threading.Event()
+
+    def cancel(self):
+        with self._process_lock:
+            self._cancelled.set()
+            process = self._process
+        if process is not None:
+            process.kill()
+
+    def _finish_process(self, process):
+        process.kill()
+        process.wait(timeout=2)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        with self._process_lock:
+            if self._process is process:
+                self._process = None
+
+    def close(self):
+        self.cancel()
+        # A close blocked on IO remains registered. Daemon escalation uses
+        # _process directly and never needs either of these locks.
+        with self._io_lock:
+            process = self._process
+            if process is not None:
+                self._finish_process(process)
+
+    def _running_process(self, *args, **kwargs):
+        return _running_process(self, *args, **kwargs)
+
+
+@contextlib.contextmanager
+def _running_process(owner, *args, **kwargs):
+    with owner._io_lock:
+        with owner._process_lock:
+            if owner._cancelled.is_set():
+                process = None
+            else:
+                if owner._process is not None:
+                    raise OSError('previous synthesis cleanup is unproven')
+                process = owner._process = GroupPopen(*args, **kwargs)
+        try:
+            yield process
+        finally:
+            if process is not None:
+                owner._finish_process(process)
+
+
+def run_owned(command, *, timeout, owner=None, **kwargs):
+    """A bounded provider inspection with the same child ownership as synth."""
+    owner = owner if owner is not None else SynthesisOwner()
+    kwargs.pop('capture_output', None)
+    kwargs.pop('check', None)
+    with owner._running_process(command, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, **kwargs) as process:
+        if process is None:
+            raise OSError('provider inspection was cancelled')
+        out, err = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(command, process.returncode, out, err)

@@ -243,12 +243,13 @@ class SessionCliTests(unittest.TestCase):
                 process = mock.Mock()
                 process.communicate.side_effect = [KeyboardInterrupt(), (b"", b"")]
                 with mock.patch("voicelib.tts.util.which", return_value="/fixture/synth"), \
-                        mock.patch("voicelib.tts.subprocess.Popen", return_value=process):
+                        mock.patch("voicelib.processes.GroupPopen", return_value=process):
                     engine = interactive.tts.make_tts(model=model)
                     with self.assertRaises(KeyboardInterrupt):
                         engine.synth("Hello")
                     process.kill.assert_called_once()
-                    self.assertEqual(process.communicate.call_count, 2)
+                    process.wait.assert_called_once_with(timeout=2)
+                    self.assertIsNone(engine._process)
                     engine.close()
 
     def test_interactive_dispatch(self):

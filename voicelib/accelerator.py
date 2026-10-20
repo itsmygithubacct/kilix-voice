@@ -26,6 +26,12 @@ from collections.abc import Callable, Iterator
 
 from . import protocol, resources
 
+QUARANTINE_RECOVERY = (
+    "Stop all cooperating providers normally and prove their owned jobs are gone; "
+    "then have the administrator reset the shared lease namespace and its anchor "
+    "together (see kilix-voice README, Accelerator quarantine). Restart alone "
+    "cannot clear it; never delete state while a provider may still own work.")
+
 LEASE_VERSION = "kilix.device-lease/v1"
 LEASE_HOME = "kilix-system-monitor"
 LEASE_DISTRIBUTION = "kilix-device-lease"
@@ -101,6 +107,7 @@ class ExecutionGrant:
         self._lease = lease
         self._refused = refused
         self._reaped = False
+        self.acknowledgement = "pending"
         self._release_lock = threading.Lock()
 
     @property
@@ -117,12 +124,34 @@ class ExecutionGrant:
         release(False) would close the only descriptor allowed to repair it.
         """
         with self._release_lock:
-            if not self._reaped:
-                try:
-                    self._lease.release(cleanup_complete=True)
-                except Exception as error:
-                    raise self._refused(error) from error
-                self._reaped = True
+            if self._reaped:
+                return
+            if self.acknowledgement == "quarantined":
+                raise AcceleratorRefused("accelerator acknowledgement failed; "
+                                         + QUARANTINE_RECOVERY, protocol.ERR_UNAVAILABLE)
+            # release() on a closed Lease is a no-op, never proof. _fd is the
+            # pinned component's descriptor state; guard_fd would run request
+            # cancellation/deadline checks and cannot inspect a stopped grant.
+            fd = getattr(self._lease, "_fd", None)
+            if isinstance(fd, int) and fd < 0:
+                self.acknowledgement = "quarantined"
+                raise AcceleratorRefused("accelerator lease closed without acknowledgement; "
+                                         + QUARANTINE_RECOVERY, protocol.ERR_UNAVAILABLE)
+            try:
+                self._lease.release(cleanup_complete=True)
+            except BaseException as error:
+                # Only the component's acknowledgement-lock deadline retains
+                # its descriptor and permits a retry. Every other failed
+                # release closes it without proof and permanently quarantines.
+                fd = getattr(self._lease, "_fd", None)
+                self.acknowledgement = (
+                    "retryable" if getattr(error, "code", None) == "deadline"
+                    and not (isinstance(fd, int) and fd < 0) else "quarantined")
+                if not isinstance(error, Exception):
+                    raise
+                raise self._refused(error) from error
+            self._reaped = True
+            self.acknowledgement = "acknowledged"
 
     def __del__(self) -> None:
         # No owner remains to prove teardown. Close without acknowledgement;

@@ -110,7 +110,7 @@ for _package_root in (_INSTALLED_LIB, _HERE):
 from voicelib import (
     consent,  # noqa: E402  (the import follows the path bootstrap)
     __version__, accelerator, audio, audio_input, audiofd, daemon_config, events,
-    jobs, models, paths, protocol, settings, stt as stt_lib, tts as tts_lib, util)
+    jobs, models, paths, processes, protocol, settings, stt as stt_lib, tts as tts_lib, util)
 from voicelib.arbiter import Arbiter, ArbiterError  # noqa: E402
 from voicelib.cancel import (  # noqa: E402
     Cancellation, Cancelled, CancellationError, DeadlineExceeded)
@@ -664,7 +664,7 @@ class _JobTurn:
     # nothing measurable and needs no per-turn setup.
     _settle_lock = threading.Lock()
 
-    def settle(self, outcome: jobs.JobOutcome,
+    def settle(self, outcome: jobs.JobOutcome | Callable[[], jobs.JobOutcome],
                precondition: Callable[[], None] | None = None) -> bool:
         with self._settle_lock:
             if self.outcome is not None:
@@ -674,6 +674,8 @@ class _JobTurn:
                 # under, so what it checks cannot change before the outcome
                 # is set.
                 precondition()
+            if callable(outcome):
+                outcome = outcome()
             self.outcome = outcome
             hook = self.on_settle
             if hook is not None:
@@ -880,7 +882,10 @@ class _CleanupState:
         self.since = time.monotonic()
         self.grant = grant
         self.closed = False
+        self.failed = False
         self.running = False
+        self.pending = False
+        self.method = "close"
         self.done = threading.Event()
 
 
@@ -905,6 +910,7 @@ class Daemon(OwnedTurns):
     # Failed teardown must outlive the worker and its settled turn. Only
     # registry updates take this lock; signalling and waiting never do.
     _cleanup_lock = threading.Lock()
+    _cleanup_owners: dict | None = None
     _failed_dictation_cleanup: dict | None = None
     _dictation_cleanup_state: dict | None = None
 
@@ -1157,14 +1163,37 @@ class Daemon(OwnedTurns):
             dictation.stop.set()
         if speech is not None:
             speech.cancel.set()
+        # Closing can block before its first signal. Launch it through the
+        # registry, then spend one shared join budget for all turn workers.
         if player is not None:
-            player.close()
+            self._register_cleanup("playback", "player", player)
+        with self._cleanup_lock:
+            for key, resource in (self._cleanup_owners or {}).items():
+                self._dictation_cleanup_state[key].pending = True
+                if self._failed_dictation_cleanup is None:
+                    self._failed_dictation_cleanup = {}
+                self._failed_dictation_cleanup[key] = resource
+        self._retry_dictation_cleanup(0)
+        join_deadline = time.monotonic() + JOIN_TIMEOUT_S
         for turn in (speech, dictation):
             if turn is not None and turn.thread is not None:
-                turn.thread.join(timeout=JOIN_TIMEOUT_S)
+                turn.thread.join(timeout=max(0.0, join_deadline - time.monotonic()))
+        # No owner lock or teardown call here: a first close may hold it.
+        # The process object retains its unreaped group leader until the
+        # final signal is sealed. Never signal a cached numeric PID.
+        with self._cleanup_lock:
+            owners = list((self._cleanup_owners or {}).items())
+        for key, resource in owners:
+            process = getattr(resource, "_process", None)
+            if isinstance(getattr(process, "pid", None), int):
+                try:
+                    processes.kill_group(process)
+                except Exception as error:
+                    self._warn(f"shutdown: {key[0]}: {key[1]} escalation failed "
+                               f"({type(error).__name__}); ownership retained")
         self._retry_dictation_cleanup(CLEANUP_SHUTDOWN_WAIT_S)
         with self._cleanup_lock:
-            retained = list((self._failed_dictation_cleanup or {}).items())
+            retained = list((self._cleanup_owners or {}).items())
             states = dict(self._dictation_cleanup_state or {})
         for (turn_id, kind), resource in retained:
             process = getattr(resource, "_process", None)
@@ -1172,6 +1201,8 @@ class Daemon(OwnedTurns):
             state = states.get((turn_id, kind))
             lease = "; accelerator ownership unproven; exit leaves quarantine" \
                 if state is not None and state.grant is not None else ""
+            if state is not None and self._ack_failed(state):
+                lease = "; accelerator acknowledgement failed; quarantine requires manual recovery: " + accelerator.QUARANTINE_RECOVERY
             self._warn(f"shutdown: {turn_id}: {kind} cleanup unproven; "
                        f"process group {group if isinstance(group, int) else 'none'}{lease}")
         if self._socket is not None:
@@ -1564,10 +1595,27 @@ class Daemon(OwnedTurns):
         deadline_ms = request.get("deadline_ms")
         deadline = (time.monotonic() + deadline_ms / 1000.0
                     if deadline_ms is not None else None)
+        self._retry_dictation_cleanup(CLEANUP_RETRY_WAIT_S)
+        if self._retained_dictation_cleanup():
+            raise DaemonBusy("read-aloud is blocked by cleanup; run `kilix voice doctor` "
+                             "and inspect normal shutdown diagnostics")
         self._refresh_config()
         engine = tts_lib.make_tts(
             self._cfg, model=request.get("model"), voice=request.get("voice"),
             rate=request.get("rate"))
+        turn_id = self._next_turn_id("speak")
+        key, state = self._register_cleanup(turn_id, "synthesiser", engine)
+        handed_off = False
+        try:
+            reply = self._prepare_speech(request, claim, engine, deadline, deadline_ms, turn_id)
+            handed_off = reply.get("ok") and "turn" in reply
+            return reply
+        finally:
+            if not handed_off:
+                self._prepare_cleanup(key, engine, state)
+                self._retry_dictation_cleanup(CLEANUP_RETRY_WAIT_S)
+
+    def _prepare_speech(self, request, claim, engine, deadline, deadline_ms, turn_id):
         if isinstance(engine, tts_lib.EspeakTts):
             # A PATH lookup that launches nothing: better to answer "no
             # synthesiser, install this" now than to accept the request and
@@ -1614,7 +1662,7 @@ class Daemon(OwnedTurns):
             return protocol.reply_ok(
                 request["id"], chunks=0, model=engine.model,
                 voice=_reply_voice(engine), rate=engine.rate)
-        turn = _SpeechTurn(self._next_turn_id("speak"), chunks, engine, deadline)
+        turn = _SpeechTurn(turn_id, chunks, engine, deadline)
         if request.get("chunk_sock"):
             self._refuse_own_control_socket(request["chunk_sock"], "chunk_sock")
             turn.receiver = _connect_dictation(request["chunk_sock"])
@@ -1658,6 +1706,8 @@ class Daemon(OwnedTurns):
                 else:
                     self._owned_supersede()
                 self._cancel_speech()      # a new read replaces the old one
+                if self._retained_dictation_cleanup():
+                    raise DaemonBusy("read-aloud cleanup is still in flight; run `kilix voice doctor`")
                 self._speech_error = ""
                 self._speech_error_turn = ""
                 self._arbiter.begin_speech(turn.id)
@@ -1699,22 +1749,27 @@ class Daemon(OwnedTurns):
             player = self._player
         if turn is not None:
             turn.cancel.set()
-            turn.engine.cancel()
+            key, state = self._register_cleanup(turn.id, "synthesiser", turn.engine)
+            self._prepare_cleanup(key, turn.engine, state)
             self._arbiter.end_speech(turn.id)
         if player is not None:
-            # Kills the sink outright rather than draining it: barge-in has to
-            # land inside ~100 ms, not at the end of the current sentence.
-            player.stop()
+            key, state = self._register_cleanup("playback", "player", player)
+            self._prepare_cleanup(key, player, state)
+        # Closing includes the prompt group signal but may itself block.
+        # Keep both owners visible before launching either attempt.
+        self._retry_dictation_cleanup(CLEANUP_RETRY_WAIT_S)
 
     def _get_player(self) -> audio.Player:
         with self._lock:
             if self._player is None:
                 self._player = audio.Player(self._cfg)
+                self._register_cleanup("playback", "player", self._player)
             return self._player
 
     def _run_speech(self, turn: _SpeechTurn) -> None:
         """Synthesise and play one turn, one clip ahead of the speakers."""
         player: audio.Player | None = None
+        self._register_cleanup(turn.id, "synthesiser", turn.engine)
         try:
             player = self._get_player()
             # The next clip is synthesised while the current one plays: enough
@@ -1767,6 +1822,16 @@ class Daemon(OwnedTurns):
                 message)
             self._report_speech_failure(turn, message)
         finally:
+            key, state = self._register_cleanup(turn.id, "synthesiser", turn.engine)
+            self._prepare_cleanup(key, turn.engine, state)
+            # The worker owns the first attempt just as dictation does.
+            with self._cleanup_lock:
+                first = not state.running
+                if first:
+                    state.running = True
+                    state.done.clear()
+            if first:
+                self._attempt_dictation_cleanup(key, turn.engine, state)
             with self._lock:
                 mine = self._speech is turn
                 if mine:
@@ -1781,11 +1846,9 @@ class Daemon(OwnedTurns):
             # not silence its successor's audio. Only a turn that still owned
             # the player when it finished may stop it.
             if mine and player is not None and turn.cancel.done():
-                try:
-                    player.stop()
-                except Exception as error:      # never mask the real failure
-                    self._warn(
-                        f"could not stop playback for turn {turn.id}: {error!r}")
+                key, state = self._register_cleanup("playback", "player", player)
+                self._prepare_cleanup(key, player, state)
+                self._retry_dictation_cleanup(CLEANUP_RETRY_WAIT_S)
             # P11: this job's one terminal outcome, decided HERE and nowhere
             # else, the first cause first, and settled before the receiver
             # closes so a 1.2 subscriber's stream can end with it. Cancel and
@@ -1837,6 +1900,7 @@ class Daemon(OwnedTurns):
                     turn.receiver.close()
                 finally:
                     turn.receiver = None
+            self._retry_dictation_cleanup(CLEANUP_RETRY_WAIT_S)
             self._arbiter.end_speech(turn.id)
             self._touch()
 
@@ -2081,7 +2145,10 @@ class Daemon(OwnedTurns):
             turn.on_settle = ledger.record   # before the worker can settle
         try:
             with self._lock:
-                # Taking the microphone cancels read-aloud on the way in.
+                # Finish read-aloud teardown before claiming another device.
+                self._cancel_speech()
+                if self._retained_dictation_cleanup():
+                    raise DaemonBusy("voice cleanup is still in flight; run `kilix voice doctor`")
                 self._arbiter.begin_listen(turn.id)
                 self._dictation = turn
                 self._start(turn.thread, lambda: self._clear_dictation(turn))
@@ -2213,7 +2280,7 @@ class Daemon(OwnedTurns):
         finally:
             watch_done.set()
             if watcher is not None and watcher.ident is not None:
-                watcher.join()
+                watcher.join(timeout=JOIN_TIMEOUT_S)
             if turn.outcome is None:
                 # No terminal was delivered: a worker that returned without
                 # one, or a delivery that itself raised. The job still ends,
@@ -2299,9 +2366,21 @@ class Daemon(OwnedTurns):
         precondition = ((lambda: self._check_delivery(
             turn, "before the transcript was delivered"))
             if "final" in message else None)
-        if not turn.settle(jobs.JobOutcome(job=turn.id, kind=jobs.KIND_DICTATION,
-                                           outcome=outcome, code=code,
-                                           message=prose), precondition):
+        def decide():
+            nonlocal message, outcome, code, prose
+            if "final" not in message:
+                try:
+                    self._check_delivery(turn, "before the error was delivered")
+                except (Cancelled, DeadlineExceeded) as stop:
+                    stopped_code = (protocol.ERR_CANCELLED if isinstance(stop, Cancelled)
+                                    else protocol.ERR_DEADLINE)
+                    if code != stopped_code:
+                        code = stopped_code
+                        outcome, prose = code, f"dictation stopped: {stop}."
+                        message = dict(protocol.dictation_error(prose, code), segment=turn.id)
+            return jobs.JobOutcome(job=turn.id, kind=jobs.KIND_DICTATION,
+                                   outcome=outcome, code=code, message=prose)
+        if not turn.settle(decide, precondition):
             self._warn(f"dictation {turn.id}: a second terminal was suppressed")
             return False
         delivered = self._send(turn.receiver, message)
@@ -2353,6 +2432,7 @@ class Daemon(OwnedTurns):
         """
         capture = audio.MicCapture(self._cfg)
         engine = None
+        self._register_cleanup(turn.id, "capture", capture, grant, "stop")
         try:
             if getattr(turn, "owner", ""):
                 turn.stop.check()
@@ -2365,7 +2445,36 @@ class Daemon(OwnedTurns):
                     self._deliver_terminal(turn, protocol.dictation_final("", turn.id))
                     return
                 self._send(turn.receiver, {"listening": True})
-            engine = stt_lib.make_stt(self._cfg, capture.rate, resolved=resolved)
+            constructing = None
+
+            def own_provider(resource):
+                nonlocal engine, constructing
+                engine = resource
+                key, state = self._register_cleanup(turn.id, "provider", resource, grant)
+                # Construction may launch a child and enter its own close.
+                # Treat it as an in-flight owner; shutdown must signal it but
+                # must never close a half-constructed native resource twice.
+                with self._cleanup_lock:
+                    state.running = True
+                    state.done.clear()
+                    constructing = state
+                    self._dictation_cleanup_state[(turn.id, "capture")].grant = None
+                self._prepare_cleanup(key, resource, state)
+
+            try:
+                engine = stt_lib.make_stt(self._cfg, capture.rate, resolved=resolved,
+                                         on_owner=own_provider)
+            finally:
+                if constructing is not None:
+                    with self._cleanup_lock:
+                        constructing.running = False
+                        constructing.done.set()
+                        if engine is not None and sys.exc_info()[0] is None and not getattr(self, "_stopping", threading.Event()).is_set():
+                            constructing.pending = False
+                            self._failed_dictation_cleanup.pop((turn.id, "provider"), None)
+            self._register_cleanup(turn.id, "provider", engine, grant)
+            with self._cleanup_lock:
+                self._dictation_cleanup_state[(turn.id, "capture")].grant = None
             with turn.capture_lock:
                 turn.interrupt = getattr(engine, "cancel", None)
             # The last boundary before the device is opened. Everything above
@@ -2388,7 +2497,9 @@ class Daemon(OwnedTurns):
             # is recognised or delivered: click-to-talk means the recorder is
             # not still running while the last words are being turned into
             # text. stop() is idempotent, so the guard below repeats it.
-            capture.stop()
+            cleanup_error = self._close_dictation_resources(turn, capture, None)
+            if cleanup_error is not None:
+                raise cleanup_error
             # R6 finding 2: stopping the recorder includes joining its reader.
             # Checked BEFORE the overruns refusal, so a turn
             # whose budget ran out here says deadline rather than unavailable.
@@ -2445,29 +2556,43 @@ class Daemon(OwnedTurns):
                 if primary_error is None:
                     raise cleanup_error
 
+    def _register_cleanup(self, turn_id, kind, resource, grant=None, method="close"):
+        """Own a resource before any launch or teardown can block."""
+        key = (turn_id, kind)
+        with self._cleanup_lock:
+            if self._cleanup_owners is None:
+                self._cleanup_owners = {}
+            if self._dictation_cleanup_state is None:
+                self._dictation_cleanup_state = {}
+            self._cleanup_owners[key] = resource
+            state = self._dictation_cleanup_state.setdefault(key, _CleanupState(grant))
+            if grant is not None:
+                state.grant = grant
+            state.method = method
+        return key, state
+
+    def _prepare_cleanup(self, key, resource, state):
+        with self._cleanup_lock:
+            state.pending = True
+            if self._failed_dictation_cleanup is None:
+                self._failed_dictation_cleanup = {}
+            self._failed_dictation_cleanup[key] = resource
+
     def _close_dictation_resources(self, turn: _DictationTurn, capture, engine,
                                    grant=None) -> Exception | None:
-        """Attempt both cleanups, retaining each failed owner for a later retry.
-
-        The registry belongs to this daemon, not to the turn that the worker
-        removes when it settles. Retrying this method removes only resources
-        whose cleanup succeeds. The provider retains its open accelerator
-        grant until its own close and cleanup acknowledgement succeed.
-        """
-        first_error = None
+        """Publish both first attempts before either teardown can block."""
+        entries = []
         for kind, resource, method in (("capture", capture, "stop"),
                                        ("provider", engine, "close")):
-            if resource is None:
-                continue
-            key = (turn.id, kind)
+            if resource is not None:
+                key, state = self._register_cleanup(
+                    turn.id, kind, resource,
+                    grant if kind == "provider" or engine is None else None, method)
+                self._prepare_cleanup(key, resource, state)
+                entries.append((key, resource, state))
+        first_error = None
+        for key, resource, state in entries:
             with self._cleanup_lock:
-                if self._dictation_cleanup_state is None:
-                    self._dictation_cleanup_state = {}
-                # If construction failed before returning a provider, the
-                # capture owner completes this unused grant's cleanup. That
-                # proof must precede a stop accepted during capture teardown.
-                state = self._dictation_cleanup_state.setdefault(
-                    key, _CleanupState(grant if kind == "provider" or engine is None else None))
                 if state.running:
                     error = RuntimeError("dictation cleanup is still running")
                     if first_error is None:
@@ -2480,17 +2605,25 @@ class Daemon(OwnedTurns):
                 first_error = error
         return first_error
 
+    @staticmethod
+    def _ack_failed(state):
+        return (state.grant is not None
+                and getattr(state.grant, "acknowledgement", None) == "quarantined")
+
     def _attempt_dictation_cleanup(self, key, resource, state) -> Exception | None:
         turn_id, kind = key
         try:
             try:
                 if not state.closed:
-                    getattr(resource, "stop" if kind == "capture" else "close")()
+                    getattr(resource, state.method)()
+                    if getattr(resource, "cleanup_complete", True) is False:
+                        raise RuntimeError("resource teardown is still in flight")
                     state.closed = True
                 if state.grant is not None:
                     state.grant.reaped()
             except Exception as error:
                 with self._cleanup_lock:
+                    state.failed = True
                     if self._failed_dictation_cleanup is None:
                         self._failed_dictation_cleanup = {}
                     self._failed_dictation_cleanup[key] = resource
@@ -2503,6 +2636,9 @@ class Daemon(OwnedTurns):
                     if self._failed_dictation_cleanup is not None:
                         self._failed_dictation_cleanup.pop(key, None)
                     self._dictation_cleanup_state.pop(key, None)
+                    self._cleanup_owners.pop(key, None)
+                    if kind == "player" and getattr(self, "_player", None) is resource:
+                        self._player = None
                 return None
         finally:
             with self._cleanup_lock:
@@ -2521,6 +2657,8 @@ class Daemon(OwnedTurns):
         with self._cleanup_lock:
             for key, resource in (self._failed_dictation_cleanup or {}).items():
                 state = self._dictation_cleanup_state[key]
+                if self._ack_failed(state):
+                    continue
                 if not state.running:
                     state.running = True
                     state.done.clear()
@@ -2538,13 +2676,27 @@ class Daemon(OwnedTurns):
             done.wait(max(0.0, deadline - time.monotonic()))
 
     def _retained_dictation_cleanup(self) -> list[dict]:
-        """Read-only public state: no commands, error messages or heard text."""
+        """Read-only pending/retained state; never commands or error text."""
         now = time.monotonic()
         with self._cleanup_lock:
-            return [{"turn": turn_id, "kind": kind,
-                     "age_seconds": round(max(0.0, now - self._dictation_cleanup_state[
-                         (turn_id, kind)].since), 1)}
-                    for turn_id, kind in (self._failed_dictation_cleanup or {})]
+            rows = []
+            for turn_id, kind in (self._failed_dictation_cleanup or {}):
+                state = self._dictation_cleanup_state[(turn_id, kind)]
+                row = {"turn": turn_id, "kind": kind,
+                       "age_seconds": round(max(0.0, now - state.since), 1)}
+                if self._ack_failed(state):
+                    row.update(state="quarantined", reason="acknowledgement-failed",
+                               recovery=accelerator.QUARANTINE_RECOVERY)
+                elif state.running:
+                    row["state"] = "in_flight"
+                rows.append(row)
+            return rows
+
+    def _resource_owners(self) -> list[dict]:
+        with self._cleanup_lock:
+            return [{"turn": key[0], "kind": key[1],
+                     "state": "cleanup" if self._dictation_cleanup_state[key].pending else "active"}
+                    for key in (self._cleanup_owners or {})]
 
     @staticmethod
     def _check_delivery(turn: _DictationTurn, where: str) -> None:
@@ -2866,6 +3018,7 @@ class Daemon(OwnedTurns):
             "speaking": self._arbiter.speaking,
             "listening": self._arbiter.listening,
             "retained_cleanup": self._retained_dictation_cleanup(),
+            "resource_owners": self._resource_owners(),
             "speech_error": speech_error,
             "speech_error_serial": speech_error_serial,
             # P11: the job behind that error, so the failure can be joined to
@@ -2908,7 +3061,21 @@ class Daemon(OwnedTurns):
                 f"{settings.KEY_TTS_ENGINE}=espeak to enable it.")}
         if engine == models.TTS_ENGINE_PIPER:
             budget = None if deadline is None else deadline - time.monotonic()
-            available, detail = tts_lib.piper_probe(budget=budget)
+            owner = processes.SynthesisOwner()
+            key, state = self._register_cleanup(self._next_turn_id("probe"), "synthesiser", owner)
+            try:
+                available, detail = tts_lib.piper_probe(budget=budget, owner=owner)
+            finally:
+                self._prepare_cleanup(key, owner, state)
+                # Status completes only its own inspection; it never retries
+                # another owner's cleanup or touches an audio device.
+                with self._cleanup_lock:
+                    first = not state.running
+                    if first:
+                        state.running = True
+                        state.done.clear()
+                if first:
+                    self._attempt_dictation_cleanup(key, owner, state)
             return {
                 "engine": engine,
                 "model": models.PIPER_KRISTIN_MODEL,
@@ -2987,7 +3154,7 @@ class Daemon(OwnedTurns):
             command = build(self._cfg)
         except audio.AudioError as error:
             return {"available": False, "detail": str(error)}
-        return {"available": True, "detail": " ".join(command)}
+        return {"available": True, "detail": command[0]}
 
 
 def main(argv: list[str] | None = None) -> int:

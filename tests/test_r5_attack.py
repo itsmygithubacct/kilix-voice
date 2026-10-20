@@ -36,6 +36,8 @@ class _Clock:
 class VerifyFinding3ConsentDenied(unittest.TestCase):
     def test_the_real_gate_raises_ConsentDenied_carrying_ERR_DENIED(self) -> None:
         d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._turns = 0
         d._cfg = {"stt": {"engine": "vosk", "model_path": "/nonexistent"}}
         with mock.patch.dict(os.environ, {"KILIX_VOICE_REQUIRE_CONSENT": "1"}), \
              mock.patch.object(voiced.consent, "granted",
@@ -48,6 +50,8 @@ class VerifyFinding3ConsentDenied(unittest.TestCase):
     def test_the_worker_adapter_maps_a_carried_code(self) -> None:
         sent = []
         d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._turns = 0
         d._warn = lambda *a, **k: None
         d._send = lambda receiver, msg: sent.append(msg) or True
         d._clear_dictation = lambda turn: None
@@ -68,6 +72,8 @@ class VerifyFinding1MidRecordingExpiry(unittest.TestCase):
         clock.advance(1.0)                       # spent, not explicitly stopped
         sent = []
         d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._turns = 0
         d._cfg = {"stt": {"engine": "vosk", "model_path": "/nonexistent"},
                   "vad": {"silence_ms": 1}}
         d._stopping = threading.Event()
@@ -113,6 +119,8 @@ class AttackPiperDeadlineMiscoded(unittest.TestCase):
         engine = tts_lib.PiperTts(rate=170)
         engine.check_available = mock.Mock(side_effect=probe_error)
         d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._turns = 0
         d._session_dir = "/tmp"
         d._cfg = {}
         d._refresh_config = lambda: None
@@ -171,6 +179,8 @@ class AttackBroadArmForwardsInvalidCode(unittest.TestCase):
             code = "not-a-real-code"
         sent = []
         d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._turns = 0
         d._warn = lambda *a, **k: None
         d._send = lambda receiver, msg: sent.append(msg) or True
         d._clear_dictation = lambda t: None

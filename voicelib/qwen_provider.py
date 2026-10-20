@@ -16,7 +16,7 @@ import subprocess
 import threading
 import time
 
-from . import models, paths, protocol, util
+from . import models, paths, processes, protocol, util
 from .tts import (SynthesisProvenance, TtsDeadlineExceeded, TtsError,
                   TtsUnsupported, _as_text, _bounded, _budget_cut)
 
@@ -41,7 +41,7 @@ def provider_binary() -> str | None:
     return util.which(installed) or util.which("kilix-qwen-tts")
 
 
-class QwenProviderTts:
+class QwenProviderTts(processes.SynthesisOwner):
     """Use only the 0.6B CustomVoice model, never an implicit fallback."""
 
     name = models.TTS_ENGINE_QWEN
@@ -57,9 +57,7 @@ class QwenProviderTts:
                 or not self.voice.isascii() or not all(
                     char.isalnum() or char in "._:+-" for char in self.voice)):
             raise TtsUnsupported("Qwen voice must be a bounded provider voice ID")
-        self._cancelled = threading.Event()
-        self._lock = threading.Lock()
-        self._process: subprocess.Popen[bytes] | None = None
+        super().__init__()
 
     def _run(self, arguments: list[str], payload: bytes, *, cap: float,
              budget: float | None, maximum: int) -> tuple[bytes, bytes, int]:
@@ -71,71 +69,59 @@ class QwenProviderTts:
         if self._cancelled.is_set():
             return b"", b"", -9
         deadline = time.monotonic() + timeout
-        try:
-            process = subprocess.Popen([binary, *arguments], stdin=subprocess.PIPE,
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        except OSError as error:
-            raise TtsError(f"cannot start kilix-qwen-tts: {error}") from error
-        with self._lock:
-            self._process = process
-            if self._cancelled.is_set():
-                process.kill()
+        with self._running_process([binary, *arguments], stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+            if process is None:
+                return b"", b"", -9
+            return self._exchange(process, payload, deadline, cap, budget, maximum)
+
+    def _exchange(self, process, payload, deadline, cap, budget, maximum):
         buffers = (bytearray(), bytearray())
-        try:
-            with selectors.DefaultSelector() as ready:
-                for channel in (process.stdin, process.stdout, process.stderr):
-                    os.set_blocking(channel.fileno(), False)
-                ready.register(process.stdout, selectors.EVENT_READ, 0)
-                ready.register(process.stderr, selectors.EVENT_READ, 1)
-                if payload:
-                    ready.register(process.stdin, selectors.EVENT_WRITE, 2)
-                else:
-                    process.stdin.close()
-                pending = memoryview(payload)
-                while ready.get_map():
-                    if self._cancelled.is_set():
-                        return b"", b"", -9
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        failure = TtsDeadlineExceeded if _budget_cut(cap, budget) else TtsError
-                        raise failure("Qwen client exceeded the speech deadline")
-                    for key, _ in ready.select(min(0.05, remaining)):
-                        channel, index = key.fileobj, key.data
-                        try:
-                            if index == 2:
-                                pending = pending[os.write(channel.fileno(), pending[:4096]):]
-                                if not pending:
-                                    ready.unregister(channel)
-                                    channel.close()
-                                continue
-                            block = os.read(channel.fileno(), 65536)
-                        except BlockingIOError:
-                            continue
-                        except BrokenPipeError:
-                            ready.unregister(channel)
-                            channel.close()
-                            continue
-                        if not block:
-                            ready.unregister(channel)
-                            continue
-                        buffers[index].extend(block)
-                        if len(buffers[index]) > (maximum if index == 0 else 65536):
-                            raise TtsError("Qwen client returned more data than permitted")
-            try:
-                process.wait(timeout=max(0.001, deadline - time.monotonic()))
-            except subprocess.TimeoutExpired as error:
-                failure = TtsDeadlineExceeded if _budget_cut(cap, budget) else TtsError
-                raise failure("Qwen client exceeded the speech deadline") from error
-            return bytes(buffers[0]), bytes(buffers[1]), process.returncode
-        finally:
-            if process.poll() is None:
-                process.kill()
-            process.wait()
+        with selectors.DefaultSelector() as ready:
             for channel in (process.stdin, process.stdout, process.stderr):
-                channel.close()
-            with self._lock:
-                if self._process is process:
-                    self._process = None
+                os.set_blocking(channel.fileno(), False)
+            ready.register(process.stdout, selectors.EVENT_READ, 0)
+            ready.register(process.stderr, selectors.EVENT_READ, 1)
+            if payload:
+                ready.register(process.stdin, selectors.EVENT_WRITE, 2)
+            else:
+                process.stdin.close()
+            pending = memoryview(payload)
+            while ready.get_map():
+                if self._cancelled.is_set():
+                    return b"", b"", -9
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    failure = TtsDeadlineExceeded if _budget_cut(cap, budget) else TtsError
+                    raise failure("Qwen client exceeded the speech deadline")
+                for key, _ in ready.select(min(0.05, remaining)):
+                    channel, index = key.fileobj, key.data
+                    try:
+                        if index == 2:
+                            pending = pending[os.write(channel.fileno(), pending[:4096]):]
+                            if not pending:
+                                ready.unregister(channel)
+                                channel.close()
+                            continue
+                        block = os.read(channel.fileno(), 65536)
+                    except BlockingIOError:
+                        continue
+                    except BrokenPipeError:
+                        ready.unregister(channel)
+                        channel.close()
+                        continue
+                    if not block:
+                        ready.unregister(channel)
+                        continue
+                    buffers[index].extend(block)
+                    if len(buffers[index]) > (maximum if index == 0 else 65536):
+                        raise TtsError("Qwen client returned more data than permitted")
+        try:
+            process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired as error:
+            failure = TtsDeadlineExceeded if _budget_cut(cap, budget) else TtsError
+            raise failure("Qwen client exceeded the speech deadline") from error
+        return bytes(buffers[0]), bytes(buffers[1]), process.returncode
 
     def check_available(self, *, budget: float | None = None) -> None:
         out, _err, code = self._run(["models"], b"", cap=PROBE_TIMEOUT_S,
@@ -199,15 +185,3 @@ class QwenProviderTts:
             self.model, self.voice, seed=0, seed_consumed=True,
             reproducible=False, rate_wpm=0)
         return pcm, sample_rate
-
-    def cancel(self) -> None:
-        self._cancelled.set()
-        with self._lock:
-            process = self._process
-        if process is not None and process.poll() is None:
-            try:
-                process.kill()
-            except OSError:
-                pass
-
-    close = cancel

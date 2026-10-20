@@ -47,7 +47,7 @@ import tempfile
 import threading
 from typing import IO
 
-from .processes import kill_group, require_waitable_children, wait_exit
+from .processes import GroupPopen, kill_group, require_waitable_children, wait_exit
 from .util import cfg_get, which
 
 DEFAULT_RATE = 16000
@@ -326,6 +326,8 @@ class MicCapture:
             process.wait(timeout=self._TERM_TIMEOUT)
         if reader is not None:
             reader.join(timeout=self._JOIN_TIMEOUT)
+            if reader.is_alive():
+                raise TimeoutError("capture reader cleanup is still running")
         if process is not None and process.stdout is not None:
             try:
                 process.stdout.close()
@@ -468,7 +470,7 @@ class Player:
                 # buffer it has already been handed, and keep talking over the
                 # microphone we just opened.
                 try:
-                    self._process.kill()
+                    kill_group(self._process)
                 except OSError:
                     pass
 
@@ -479,12 +481,25 @@ class Player:
     def close(self) -> None:
         """Cancel playback and shut the worker down. Idempotent."""
         with self._lock:
+            first = not self._closed
             self._closed = True
-            worker, self._worker = self._worker, None
+            worker = self._worker
         self.stop()
         if worker is not None:
-            self._queue.put(None)
+            if first:
+                self._queue.put(None)
             worker.join(timeout=self._JOIN_TIMEOUT)
+            if worker.is_alive():
+                raise TimeoutError("playback worker cleanup is still running")
+        process = self._process
+        if process is not None:
+            kill_group(process)
+            process.wait(timeout=self._JOIN_TIMEOUT)
+            if process.stdin is not None:
+                process.stdin.close()
+        with self._lock:
+            self._worker = None
+            self._process = None
 
     def _start_worker_locked(self) -> None:
         if self._worker is None:
@@ -508,7 +523,8 @@ class Player:
                 self._play_clip(generation, pcm, rate)
             finally:
                 with self._lock:
-                    self._process = None
+                    if self._process is not None and self._process.returncode is not None:
+                        self._process = None
                     self._clip_done_locked()
 
     def _play_clip(self, generation: int, pcm: bytes, rate: int) -> None:
@@ -526,7 +542,7 @@ class Player:
                 if generation != self._generation:
                     return  # stopped while this clip waited in the queue
                 try:
-                    process = subprocess.Popen(
+                    process = GroupPopen(
                         cmd, stdin=subprocess.PIPE,
                         stdout=subprocess.DEVNULL, stderr=stderr)
                 except OSError as error:

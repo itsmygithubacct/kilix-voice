@@ -57,6 +57,8 @@ class _ProviderFixture(unittest.TestCase):
     def speak(self, provider, deadline_ms):
         engine = tts_lib.PiperTts(rate=170)
         d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._turns = 0
         d._session_dir = self.dir
         d._cfg = {}
         d._refresh_config = lambda: None
@@ -105,7 +107,7 @@ class PiperProbeAttributionTestCase(_ProviderFixture):
 
         with mock.patch.object(voiced.time, "monotonic", clock), \
              mock.patch.object(tts_lib, "piper_binary", lambda: "/fixed/piper"), \
-             mock.patch.object(tts_lib.subprocess, "run", run):
+             mock.patch.object(tts_lib.processes, "run_owned", run):
             reply, _elapsed = self.speak("/fixed/piper", 300)
         self.assertEqual(reply["code"], protocol.ERR_UNAVAILABLE, reply)
         self.assertIn("exited 3", reply["error"])
@@ -188,6 +190,8 @@ class SynthesisAttributionTestCase(_ProviderFixture):
         turn = voiced._SpeechTurn("speak-1", ["one"], engine)
         d = object.__new__(voiced.Daemon)
         d._lock = threading.RLock()
+        d._turns = 0
+        d._lock = threading.RLock()
         d._speech = turn
         d._warn = lambda *a, **k: None
         d._touch = lambda: None
@@ -205,6 +209,8 @@ class StatusDeadlineTestCase(_ProviderFixture):
     def status(self, deadline_ms=None, *, engine="piper", refresh=lambda: None,
                provider=None):
         d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._turns = 0
         d._session_dir = self.dir
         d._socket_path = os.path.join(self.dir, "control.sock")
         d._cfg = {}

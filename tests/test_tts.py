@@ -378,6 +378,14 @@ class _FakeProcess:
         self.returncode = code
         self.stdin_text = b""
 
+    stdin = stdout = stderr = None
+
+    def kill(self):
+        pass
+
+    def wait(self, timeout=None):
+        return self.returncode
+
     def communicate(self, data: bytes | None = None,
                     timeout: float | None = None) -> tuple[bytes, bytes]:
         self.stdin_text = data or b""
@@ -414,7 +422,7 @@ class Synthesis(unittest.TestCase):
 
     def engine(self, **kwargs: object) -> _FakeEngine:
         fake = _FakeEngine(pcm=self.PCM, rate=16000, **kwargs)
-        patcher = mock.patch.object(tts.subprocess, "Popen", fake)
+        patcher = mock.patch.object(tts.processes, "GroupPopen", fake)
         patcher.start()
         self.addCleanup(patcher.stop)
         return fake
@@ -715,7 +723,11 @@ class EngineSelection(unittest.TestCase):
 
     def test_piper_runs_only_the_fixed_provider_argv(self) -> None:
         class Process:
+            stdin = stdout = stderr = None
             returncode = 0
+
+            def wait(self, timeout=None):
+                return self.returncode
 
             def communicate(self, data, timeout):
                 self.data = data
@@ -723,14 +735,15 @@ class EngineSelection(unittest.TestCase):
                 return b"\x01\x00\x02\x00", b""
 
             def kill(self):
-                self.returncode = -9
+                if self.returncode is None:
+                    self.returncode = -9
 
             def poll(self):
                 return self.returncode
 
         process = Process()
         with mock.patch.object(tts, "piper_binary", return_value="/fixed/piper"), \
-                mock.patch.object(tts.subprocess, "Popen", return_value=process) as popen:
+                mock.patch.object(tts.processes, "GroupPopen", return_value=process) as popen:
             engine = tts.PiperTts(rate=200)
             pcm, rate = engine.synth("Hello Kristin")
         self.assertEqual((pcm, rate), (b"\x01\x00\x02\x00", 22050))
@@ -747,7 +760,7 @@ class EngineSelection(unittest.TestCase):
             f'"model":"{models.PIPER_KRISTIN_MODEL}",'
             '"voice":"en_US-kristin-medium"}', "")
         with mock.patch.object(tts, "piper_binary", return_value="/fixed/piper"), \
-                mock.patch.object(tts.subprocess, "run", return_value=completed) as run:
+                mock.patch.object(tts.processes, "run_owned", return_value=completed) as run:
             available, detail = tts.piper_status()
         self.assertTrue(available)
         self.assertIn("en_US-kristin-medium", detail)
@@ -758,7 +771,7 @@ class EngineSelection(unittest.TestCase):
             ["provider"], 0,
             '{"installed":true,"model":"other","voice":"other"}', "")
         with mock.patch.object(tts, "piper_binary", return_value="/fixed/piper"), \
-                mock.patch.object(tts.subprocess, "run", return_value=completed):
+                mock.patch.object(tts.processes, "run_owned", return_value=completed):
             available, detail = tts.piper_status()
         self.assertFalse(available)
         self.assertIn("incompatible", detail)

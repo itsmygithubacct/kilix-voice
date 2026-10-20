@@ -150,6 +150,8 @@ class ScriptedTts:
         pass
 
 
+    close = cancel
+
 class ScriptedStt:
     name = "scripted"
     supports_partials = True

@@ -182,6 +182,11 @@ class CancelledPiperClipClaimsNoSeedTestCase(unittest.TestCase):
         engine = tts_lib.PiperTts(rate=170)
 
         class Process:
+            stdin = stdout = stderr = None
+
+            def wait(self, timeout=None):
+                return self.returncode
+
             returncode = None
 
             def communicate(self, data, timeout):
@@ -196,7 +201,7 @@ class CancelledPiperClipClaimsNoSeedTestCase(unittest.TestCase):
                 return self.returncode
 
         with mock.patch.object(tts_lib, "piper_binary", return_value="/fixed/piper"), \
-                mock.patch.object(tts_lib.subprocess, "Popen", return_value=Process()):
+                mock.patch.object(tts_lib.processes, "GroupPopen", return_value=Process()):
             pcm, _rate = engine.synth("Hello Kristin")
         self.assertEqual(pcm, b"")
         provenance = tts_lib.clip_provenance(engine)

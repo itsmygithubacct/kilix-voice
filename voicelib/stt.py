@@ -313,7 +313,7 @@ class VoskStt:
     def __init__(self, rate: int = DEFAULT_RATE, *, model_id: str | None = None,
                  model_path: str | None = None, lib_path: str | None = None,
                  settings_path: str | None = None,
-                 log_level: int = LOG_LEVEL_SILENT) -> None:
+                 log_level: int = LOG_LEVEL_SILENT, on_owner=None) -> None:
         try:
             self._rate = int(rate)
         except (TypeError, ValueError) as error:
@@ -338,6 +338,8 @@ class VoskStt:
         self._partial = ""
         self._last = ""
 
+        if on_owner is not None:
+            on_owner(self)
         self._lib.vosk_set_log_level(int(log_level))
         # os.fsencode, not .encode("utf-8"): the model lives under a path the
         # user chose, which need not be valid UTF-8.
@@ -596,6 +598,12 @@ class _HeldPayload:
     name = ""
     label = ""
 
+    @property
+    def cleanup_complete(self) -> bool:
+        # A busy close may only signal and hand reaping to the decode owner.
+        # Returning from that close alone cannot acknowledge an accelerator.
+        return self._process is None and not self._held
+
     def _hold(self, consented_payload: str | None) -> None:
         self._held: dict[str, tuple[int, str]] = {}
         try:
@@ -757,7 +765,7 @@ class VibeVoiceStt(_HeldPayload, _WholeUtterance):
 
     def __init__(self, rate: int = DEFAULT_RATE, *, model_path: str | None = None,
                  threads: int | None = None,
-                 consented_payload: str | None = None) -> None:
+                 consented_payload: str | None = None, on_owner=None) -> None:
         self._rate = _checked_rate(rate)
         # Checked before the generic directory resolution, whose message is
         # about vosk: say everything VibeVoice lacks, runtime included.
@@ -777,6 +785,8 @@ class VibeVoiceStt(_HeldPayload, _WholeUtterance):
         # descriptors and starting the child that inherits them.
         self._lifecycle = threading.Lock()
         self._held = {}
+        if on_owner is not None:
+            on_owner(self)
         self._hold(consented_payload)
 
     @property
@@ -898,7 +908,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
 
     def __init__(self, rate: int = DEFAULT_RATE, *, model_path: str | None = None,
                  threads: int | None = None, beam: int | None = None,
-                 consented_payload: str | None = None) -> None:
+                 consented_payload: str | None = None, on_owner=None) -> None:
         self._rate = _checked_rate(rate)
         if self._rate != DEFAULT_RATE:
             raise SttError(
@@ -924,6 +934,8 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
         self._links: str | None = None
         self._lifecycle = threading.Lock()
         self._held = {}
+        if on_owner is not None:
+            on_owner(self)
         self._hold(consented_payload)
         try:
             self._start()
@@ -1260,7 +1272,7 @@ def consent_identity(resolved: ResolvedStt) -> ConsentIdentity:
 
 
 def make_stt(cfg: dict | None = None, rate: int | None = None, *,
-             resolved: ResolvedStt | None = None
+             resolved: ResolvedStt | None = None, on_owner=None
              ) -> NullStt | VoskStt | VibeVoiceStt | WhisperStt | WhistleStt:
     """Return the recogniser the shared settings select.
 
@@ -1275,6 +1287,7 @@ def make_stt(cfg: dict | None = None, rate: int | None = None, *,
     # it in, so construction cannot pick a different one. Resolving again here
     # is what F03 was.
     target = resolved if resolved is not None else resolve_stt(config)
+    owner_args = {} if on_owner is None else {"on_owner": on_owner}
     if target.engine not in (ENGINE_VOSK, *_SINGLE_MODEL):
         return NullStt()
     if rate is None:
@@ -1282,14 +1295,14 @@ def make_stt(cfg: dict | None = None, rate: int | None = None, *,
     if target.engine == ENGINE_VIBEVOICE:
         return VibeVoiceStt(rate, model_path=target.model_dir,
                             threads=cfg_get(config, "stt.threads"),
-                            consented_payload=target.consented_payload)
+                            consented_payload=target.consented_payload, **owner_args)
     if target.engine == ENGINE_WHISTLE:
         return WhistleStt(rate, model_path=target.model_dir,
-                          consented_payload=target.consented_payload)
+                          consented_payload=target.consented_payload, **owner_args)
     if target.engine == ENGINE_WHISPER:
         return WhisperStt(rate, model_path=target.model_dir,
                           threads=cfg_get(config, "stt.threads"),
-                          consented_payload=target.consented_payload)
+                          consented_payload=target.consented_payload, **owner_args)
     return VoskStt(
         rate,
         # model_path, not model_id: the directory is already resolved, so the
@@ -1298,5 +1311,5 @@ def make_stt(cfg: dict | None = None, rate: int | None = None, *,
         # re-runs the full resolution and raises its own specific message.
         model_path=target.model_dir,
         lib_path=target.lib_path,
-        settings_path=target.settings_path,
+        settings_path=target.settings_path, **owner_args,
     )

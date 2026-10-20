@@ -43,6 +43,7 @@ class _Clock:
 
 def _speech_daemon(turn, player):
     d = object.__new__(voiced.Daemon)
+    d._speech = d._player = None
     d._lock = threading.RLock()
     d._speech = turn
     d._warn = lambda *a, **k: None
@@ -80,7 +81,7 @@ class F01SpeechExpiryTestCase(unittest.TestCase):
         player.play.side_effect = lambda *a, **k: clock.advance(10.0)
         voiced.Daemon._run_speech(_speech_daemon(turn, player), turn)
         player.play.assert_called_once()          # it really did start playing
-        player.stop.assert_called_once()          # and it really was stopped
+        player.close.assert_called_once()          # and it really was stopped
 
     def test_a_replaced_turn_does_not_stop_its_successors_audio(self) -> None:
         # The identity guard. An old worker finishing late must not silence
@@ -95,7 +96,7 @@ class F01SpeechExpiryTestCase(unittest.TestCase):
         daemon = _speech_daemon(turn, player)
         daemon._speech = voiced._SpeechTurn("s-new", ["x"], _engine())  # replaced
         voiced.Daemon._run_speech(daemon, turn)
-        player.stop.assert_not_called()
+        player.close.assert_not_called()
 
     def test_a_completed_turn_is_not_cut_off(self) -> None:      # control
         turn = voiced._SpeechTurn("s-ok", ["one"], _engine())    # no deadline
@@ -104,7 +105,7 @@ class F01SpeechExpiryTestCase(unittest.TestCase):
         player.playing = False
         player.error = ""
         voiced.Daemon._run_speech(_speech_daemon(turn, player), turn)
-        player.stop.assert_not_called()
+        player.close.assert_not_called()
 
     def test_the_engine_is_given_the_remaining_budget(self) -> None:
         clock = _Clock()
@@ -196,6 +197,9 @@ class F02DispatchTestCase(unittest.TestCase):
     def test_a_spent_budget_is_refused_at_dispatch(self) -> None:
         sock = mock.Mock()
         d = object.__new__(voiced.Daemon)
+        d._speech = d._player = None
+        d._lock = threading.RLock()
+        d._turns = 0
         d._lock = threading.RLock()
         d._cfg = {"stt": {"engine": "vosk"}}
         d._refresh_config = lambda: None
@@ -215,6 +219,9 @@ class F02DispatchTestCase(unittest.TestCase):
     def test_a_live_budget_still_dispatches(self) -> None:          # control
         sock = mock.Mock()
         d = object.__new__(voiced.Daemon)
+        d._speech = d._player = None
+        d._lock = threading.RLock()
+        d._turns = 0
         d._lock = threading.RLock()
         d._cfg = {"stt": {"engine": "vosk"}}
         d._refresh_config = lambda: None
@@ -303,6 +310,9 @@ class F07ChunkSocketOwnershipTestCase(unittest.TestCase):
 
     def _daemon(self):
         d = object.__new__(voiced.Daemon)
+        d._speech = d._player = None
+        d._lock = threading.RLock()
+        d._turns = 0
         d._lock = threading.RLock()
         d._speech = None
         d._speech_error = ""
@@ -371,6 +381,9 @@ class F08WorkerErrorCodeTestCase(unittest.TestCase):
     def _run_with(self, error):
         sent = []
         d = object.__new__(voiced.Daemon)
+        d._speech = d._player = None
+        d._lock = threading.RLock()
+        d._turns = 0
         d._warn = lambda *a, **k: None
         d._send = lambda receiver, msg: sent.append(msg) or True
         d._clear_dictation = lambda turn: None
@@ -442,6 +455,9 @@ class R4SurvivorCoverageTestCase(unittest.TestCase):
         capture.error = ""
         capture.read.side_effect = lambda *a, **k: b"\x00" * 320
         d = object.__new__(voiced.Daemon)
+        d._speech = d._player = None
+        d._lock = threading.RLock()
+        d._turns = 0
         d._cfg = {"stt": {"max_seconds": 120}, "vad": {"silence_ms": 1}}
         d._stopping = threading.Event()
         d._stopping.set()                     # daemon is going down
@@ -501,6 +517,9 @@ class R4SurvivorCoverageTestCase(unittest.TestCase):
         engine.supports_partials = False
         engine.end_utterance.return_value = ""
         d = object.__new__(voiced.Daemon)
+        d._speech = d._player = None
+        d._lock = threading.RLock()
+        d._turns = 0
         d._cfg = {"stt": {"engine": "vosk", "model_path": "/nonexistent",
                           "max_seconds": 120},
                   "vad": {"silence_ms": 1}}
@@ -530,6 +549,9 @@ class R4SurvivorCoverageTestCase(unittest.TestCase):
         engine = tts_lib.PiperTts(rate=170)
         engine.check_available = mock.Mock()
         d = object.__new__(voiced.Daemon)
+        d._speech = d._player = None
+        d._lock = threading.RLock()
+        d._turns = 0
         d._session_dir = "/tmp"
         d._cfg = {}
         # deadline_ms=0 is refused by validation ("must be greater than
@@ -561,6 +583,9 @@ class R4SurvivorCoverageTestCase(unittest.TestCase):
         capture.error = ""
         capture.read.side_effect = lambda *a, **k: b"\x00" * 320
         d = object.__new__(voiced.Daemon)
+        d._speech = d._player = None
+        d._lock = threading.RLock()
+        d._turns = 0
         d._cfg = {"stt": {"max_seconds": 120}, "vad": {"silence_ms": 1}}
         d._stopping = threading.Event()
         d._warn = d._debug = lambda *a, **k: None
@@ -601,6 +626,9 @@ class R4SurvivorCoverageTestCase(unittest.TestCase):
         engine.end_utterance.return_value = "hello there"
         sent = []
         d = object.__new__(voiced.Daemon)
+        d._speech = d._player = None
+        d._lock = threading.RLock()
+        d._turns = 0
         d._cfg = {"stt": {"engine": "vosk", "model_path": "/nonexistent",
                           "max_seconds": 120},
                   "vad": {"silence_ms": 1}}

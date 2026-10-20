@@ -18,6 +18,7 @@ import os
 import re
 import subprocess
 import threading
+from . import processes
 import time
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -685,7 +686,7 @@ def _failure_hint(binary: str, voice: str) -> str:
     return f"Check that the voice {voice!r} exists: {binary} --voices"
 
 
-class EspeakTts:
+class EspeakTts(processes.SynthesisOwner):
     """espeak-ng synthesis: one process per clip, WAV parsed in memory.
 
     Reading the WAV from stdout rather than writing a file keeps synthesis free
@@ -701,6 +702,7 @@ class EspeakTts:
     def __init__(self, cfg: dict | None = None, *, voice: str | None = None,
                  rate: int | None = None, mbrola: bool = False,
                  mbrola_fallback: bool = True) -> None:
+        super().__init__()
         self._cfg = cfg or {}
         self.voice = self._checked_voice(
             settings.tts_voice() if voice is None else voice)
@@ -796,33 +798,27 @@ class EspeakTts:
         cap = SYNTH_TIMEOUT_BASE_S + len(text) * SYNTH_TIMEOUT_PER_CHAR_S
         timeout = _bounded(cap, budget)
         try:
-            process = subprocess.Popen(
-                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE)
+            with self._running_process(
+                    command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE) as process:
+                if process is None:
+                    return b"", ESPEAK_SAMPLE_RATE
+                out, err = process.communicate(
+                    text.encode("utf-8", "replace"), timeout=timeout)
         except OSError as error:
             raise TtsError(
                 f"cannot run {command[0]!r}: {error}. Check that it exists and "
-                f"is executable; if this is the stock engine, (re)install "
-                f"espeak-ng.") from error
-        try:
-            out, err = process.communicate(
-                text.encode("utf-8", "replace"), timeout=timeout)
-        except KeyboardInterrupt:
-            # Foreground auditions can be interrupted while communicate is
-            # waiting. Reap the child before returning to the next prompt.
-            process.kill()
-            process.communicate()
-            raise
+                "is executable; if this is the stock engine, (re)install espeak-ng.") from error
         except subprocess.TimeoutExpired as error:
-            process.kill()
-            process.communicate()
             failure = TtsDeadlineExceeded if _budget_cut(cap, budget) else TtsError
             raise failure(
                 f"{command[0]} did not finish within {timeout:.1f}s for "
                 f"{len(text)} characters of text. Read a smaller extent by "
                 f"lowering {settings.KEY_TTS_MAX_CHARS}, or check whether the "
-                f"engine is blocked on an audio device.") from error
+                "engine is blocked on an audio device.") from error
 
+        if self._cancelled.is_set():
+            return b"", ESPEAK_SAMPLE_RATE
         if process.returncode != 0:
             raise TtsError(
                 f"{command[0]} exited {process.returncode}"
@@ -849,11 +845,6 @@ class EspeakTts:
             seed=0, seed_consumed=False, reproducible=True, rate_wpm=self.rate)
         return clip
 
-    def cancel(self) -> None:
-        """eSpeak clips are short and have no persistent process to close."""
-
-    close = cancel
-
 
 def piper_binary() -> str | None:
     """Return the fixed provider command selected by the trusted environment."""
@@ -865,7 +856,7 @@ def piper_binary() -> str | None:
     return util.which(managed) or util.which("kilix-piper-tts")
 
 
-def piper_probe(*, budget: float | None = None) -> tuple[bool, str]:
+def piper_probe(*, budget: float | None = None, owner=None) -> tuple[bool, str]:
     """Inspect the provider and pinned model without starting it or networking.
 
     Returns (available, detail) for every provider state, and raises
@@ -892,8 +883,8 @@ def piper_probe(*, budget: float | None = None) -> tuple[bool, str]:
         )
     status_timeout = _bounded(PIPER_STATUS_TIMEOUT_S, budget)
     try:
-        result = subprocess.run(
-            [binary, "status", "--json"],
+        result = processes.run_owned(
+            [binary, "status", "--json"], owner=owner,
             capture_output=True,
             check=False,
             timeout=status_timeout,
@@ -946,7 +937,7 @@ def piper_status(*, budget: float | None = None) -> tuple[bool, str]:
         return False, str(error)
 
 
-class PiperTts:
+class PiperTts(processes.SynthesisOwner):
     """Pinned Kristin synthesis through the isolated persistent provider."""
 
     name = models.TTS_ENGINE_PIPER
@@ -967,9 +958,7 @@ class PiperTts:
         if self.rate not in (120, 150, 170, 200, 240):
             raise TtsUnsupported(
                 "Piper rate must be one of: 120, 150, 170, 200, 240 wpm")
-        self._lock = threading.Lock()
-        self._process: subprocess.Popen[bytes] | None = None
-        self._cancelled = False
+        super().__init__()
 
     def _provenance(self) -> SynthesisProvenance:
         """A13/A14 for a Piper clip.
@@ -991,7 +980,7 @@ class PiperTts:
         TtsDeadlineExceeded propagates from the probe unchanged, so a caller
         can tell a budget that cut the check from a provider that failed it.
         """
-        available, detail = piper_probe(budget=budget)
+        available, detail = piper_probe(budget=budget, owner=self)
         if not available:
             raise TtsError(detail)
 
@@ -1012,41 +1001,22 @@ class PiperTts:
             "--rate", str(self.rate),
         ]
         try:
-            process = subprocess.Popen(
-                command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE)
+            with self._running_process(
+                    command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE) as process:
+                if process is None:
+                    return b"", PIPER_SAMPLE_RATE
+                out, err = process.communicate(
+                    clean.encode("utf-8", "replace"), timeout=timeout)
         except OSError as error:
             raise TtsError(f"cannot run {binary!r}: {error}") from error
-        with self._lock:
-            self._process = process
-            cancelled = self._cancelled
-        if cancelled:
-            try:
-                process.kill()
-            except OSError:
-                pass
-        try:
-            out, err = process.communicate(
-                clean.encode("utf-8", "replace"), timeout=timeout)
-        except KeyboardInterrupt:
-            process.kill()
-            process.communicate()
-            raise
         except subprocess.TimeoutExpired as error:
-            process.kill()
-            process.communicate()
             failure = (TtsDeadlineExceeded
                        if _budget_cut(PIPER_SYNTH_TIMEOUT_S, budget) else TtsError)
             raise failure(
                 f"{binary} did not finish within {timeout:.0f} "
-                "seconds; run its status command and retry."
-            ) from error
-        finally:
-            with self._lock:
-                if self._process is process:
-                    self._process = None
-        with self._lock:
-            cancelled = self._cancelled
+                "seconds; run its status command and retry.") from error
+        cancelled = self._cancelled.is_set()
         if cancelled:
             # The fixed model and voice were what ran; the clip is empty.
             self.last_provenance = self._provenance()
@@ -1060,19 +1030,6 @@ class PiperTts:
             raise TtsError(f"{binary} returned an odd-length s16le PCM stream")
         self.last_provenance = self._provenance()
         return out, PIPER_SAMPLE_RATE
-
-    def cancel(self) -> None:
-        """Kill the client; the provider observes EOF and drops its worker."""
-        with self._lock:
-            self._cancelled = True
-            process = self._process
-        if process is not None and process.poll() is None:
-            try:
-                process.kill()
-            except OSError:
-                pass
-
-    close = cancel
 
 
 def make_tts(cfg: dict | None = None, *, model: str | None = None,

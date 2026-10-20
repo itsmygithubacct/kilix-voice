@@ -59,6 +59,8 @@ class P2RecordingDeadlineTestCase(unittest.TestCase):
         engine.feed.return_value = None
 
         d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._turns = 0
         d._cfg = {"stt": {"max_seconds": 120}, "vad": {"silence_ms": 1}}
         d._stopping = threading.Event()
         d._warn = lambda *a, **k: None
@@ -88,6 +90,8 @@ class P2PiperPrepDeadlineTestCase(unittest.TestCase):
         engine.check_available = mock.Mock()
 
         d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._turns = 0
         d._cfg = {}
         d._refresh_config = lambda: None
         d._speech_chunks = lambda text: []       # short-circuit after the probe
@@ -115,6 +119,8 @@ class P5ConsentDenialCodeTestCase(unittest.TestCase):
     def test_a_consent_denial_carries_a_distinct_code(self) -> None:
         sent = []
         d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._turns = 0
         d._warn = lambda *a, **k: None
         d._send = lambda receiver, msg: sent.append(msg) or True
         d._clear_dictation = lambda turn: None
@@ -146,6 +152,8 @@ class P5ConsentDenialCodeTestCase(unittest.TestCase):
         # so the mapping cannot drift away from what production raises.
         sent = []
         d = object.__new__(voiced.Daemon)
+        d._lock = threading.RLock()
+        d._turns = 0
         d._warn = lambda *a, **k: None
         d._send = lambda receiver, msg: sent.append(msg) or True
         d._clear_dictation = lambda turn: None

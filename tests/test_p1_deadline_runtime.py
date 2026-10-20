@@ -419,7 +419,7 @@ class R2Finding1TestCase(unittest.TestCase):
     def test_the_budget_starts_before_preparation(self) -> None:
         source = open(os.path.join(ROOT, "kilix-voiced")).read()
         body = source[source.index("def _op_speak(self, request: dict"):]
-        body = body[:body.index("def ", 10)]
+        body = body[:body.index("    def _speech_chunks(")]
         start = body.index("deadline_ms = request.get")
         # preparation must come AFTER the clock starts, not before it
         for later in ("self._refresh_config()", "tts_lib.make_tts",
@@ -1056,7 +1056,7 @@ class R3SurvivorTestCase(unittest.TestCase):
     def test_dispatch_connects_the_requested_chunk_receiver(self) -> None:
         source = open(os.path.join(ROOT, "kilix-voiced")).read()
         body = source[source.index("def _op_speak(self, request: dict"):]
-        body = body[:body.index("\n    def ", 10)]
+        body = body[:body.index("\n    def _speech_chunks(")]
         self.assertIn('request.get("chunk_sock")', body)
         self.assertIn("_connect_dictation(request[\"chunk_sock\"])", body)
 

@@ -65,6 +65,9 @@ def _script(directory, name, body):
 
 def _speak_daemon():
     d = object.__new__(voiced.Daemon)
+    d._speech = d._player = None
+    d._lock = threading.RLock()
+    d._turns = 0
     d._session_dir = "/tmp"
     d._cfg = {}
     d._refresh_config = lambda: None
@@ -158,6 +161,9 @@ class ATTACK_StatusIgnoresItsDeadline(unittest.TestCase):
 
     def test_a_150_ms_status_is_not_answered_ok_after_3_s(self):
         d = object.__new__(voiced.Daemon)
+        d._speech = d._player = None
+        d._lock = threading.RLock()
+        d._turns = 0
         d._session_dir = "/tmp"
         d._socket_path = "/tmp/control.sock"
         d._cfg = {}
@@ -192,6 +198,7 @@ class ATTACK_StatusIgnoresItsDeadline(unittest.TestCase):
 
 def _dictation_daemon(sent, cfg=None):
     d = object.__new__(voiced.Daemon)
+    d._speech = d._player = None
     d._cfg = cfg or {"stt": {"engine": "vosk", "model_path": "/nonexistent",
                              "max_seconds": 120}, "vad": {"silence_ms": 900}}
     d._stopping = threading.Event()
@@ -311,6 +318,9 @@ class ATTACK_ControlPathRefusalsCodedInternal(unittest.TestCase):
 
     def _daemon(self):
         d = object.__new__(voiced.Daemon)
+        d._speech = d._player = None
+        d._lock = threading.RLock()
+        d._turns = 0
         d._session_dir = self.tmp.name
         d._lock = threading.RLock()
         d._cfg = {"stt": {"engine": "vosk"}}
@@ -441,6 +451,9 @@ class ATTACK_GrantCannotSatisfyTheGateUnderAModelOverride(unittest.TestCase):
                     os.environ[stt_lib.ENV_MODEL] = target
                 stt_tool._consent_command(argparse.Namespace(revoke_consent=False))
                 d = object.__new__(voiced.Daemon)
+                d._speech = d._player = None
+                d._lock = threading.RLock()
+                d._turns = 0
                 d._cfg = {"stt": {"engine": settings.stt_engine(), "model": model_id}}
                 resolved = stt_lib.resolve_stt(d._cfg)
                 self.assertEqual(resolved.model_dir, target)
@@ -544,6 +557,9 @@ class COVER_StopOperationsActuallyStop(unittest.TestCase):
 
     def test_stop_dictation_sets_the_current_turns_token(self):         # M20
         d = object.__new__(voiced.Daemon)
+        d._speech = d._player = None
+        d._lock = threading.RLock()
+        d._turns = 0
         d._lock = threading.RLock()
         turn = voiced._DictationTurn("listen-1", mock.Mock())
         d._dictation = turn
@@ -553,6 +569,9 @@ class COVER_StopOperationsActuallyStop(unittest.TestCase):
 
     def test_stop_speech_cancels_the_engine_in_flight(self):            # M22
         d = object.__new__(voiced.Daemon)
+        d._speech = d._player = None
+        d._lock = threading.RLock()
+        d._turns = 0
         d._lock = threading.RLock()
         d._player = None
         d._arbiter = mock.Mock()
@@ -561,7 +580,7 @@ class COVER_StopOperationsActuallyStop(unittest.TestCase):
         d._speech = turn
         voiced.Daemon._op_stop_speech(d, {"id": "r"})
         self.assertTrue(turn.cancel.is_set())
-        engine.cancel.assert_called_once()
+        engine.close.assert_called_once()
 
 
 class COVER_BudgetsReachTheProcessesTheyBound(unittest.TestCase):
@@ -606,6 +625,9 @@ class COVER_DictationSocketUnwoundOnDispatchRefusal(unittest.TestCase):
     def _refused(self, configure):
         sock = mock.Mock()
         d = object.__new__(voiced.Daemon)
+        d._speech = d._player = None
+        d._lock = threading.RLock()
+        d._turns = 0
         d._lock = threading.RLock()
         d._cfg = {"stt": {"engine": "vosk"}}
         d._refresh_config = lambda: None
