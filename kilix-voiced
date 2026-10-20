@@ -37,6 +37,9 @@ On stop-dictation, optional ``sock`` is normalised like dictate's receiver,
 without requiring it to exist. No current turn or a different receiver replies
 ``{"ok":true,"id":"","stopped":false,"mode":"finish"}`` (or ``"abort"``).
 Omitting ``sock`` still stops whichever turn is current.
+The scope is a canonical pathname, not a turn generation: a later turn using
+the same pathname also matches. Callers needing late-stop isolation must use
+distinct receiver paths for overlapping turn lifetimes.
 
 Nothing here is configured privately: every knob comes from the shared Kilix
 settings document, re-read before each turn so a change made in ``kilix-tts``
@@ -692,6 +695,22 @@ class _SpeechTurn(_JobTurn):
         return self.cancel.expired()
 
 
+# The old receiver cannot be reached by this pathname/transport. Apply the
+# same classification to the initial stat and every later probe step.
+# ENAMETOOLONG also covers a parent symlink expanded beyond pathname limits;
+# ENOTSOCK/EPROTOTYPE cover replacement between stat and datagram connect.
+_RECEIVER_GONE_ERRNOS = frozenset((
+    errno.ENOENT, errno.ECONNREFUSED, errno.ENOTDIR, errno.ELOOP,
+    errno.ENAMETOOLONG, errno.ENOTSOCK, errno.EPROTOTYPE,
+))
+# All other probe errors are inconclusive. In particular EACCES, EPERM,
+# EMFILE, ENFILE, ENOBUFS, ENOMEM, EINTR and EAGAIN never cancel a live peer.
+# Unknown errors (including I/O or stale-mount failures) also preserve it:
+# failing to inspect a pathname is not evidence that its connected peer died.
+# This deliberately favors a healthy dictation over prompt loss detection
+# when observation fails; recording still has its configured duration cap.
+
+
 class _DictationTurn(_JobTurn):
     """One dictation turn: the socket it delivers to, and its stop token."""
 
@@ -712,7 +731,7 @@ class _DictationTurn(_JobTurn):
                 info = os.lstat(receiver_path)
                 self.receiver_identity = (info.st_dev, info.st_ino)
             except OSError as error:
-                self.receiver_missing = error.errno in (errno.ENOENT, errno.ECONNREFUSED)
+                self.receiver_missing = error.errno in _RECEIVER_GONE_ERRNOS
         self.capture_lock = threading.Lock()
         self.capture = None
         self.interrupt = None
@@ -742,7 +761,7 @@ class _DictationTurn(_JobTurn):
         try:
             info = os.lstat(self.receiver_path)
         except OSError as error:
-            if error.errno in (errno.ENOENT, errno.ECONNREFUSED):
+            if error.errno in _RECEIVER_GONE_ERRNOS:
                 return False
             info = None  # permission/resource failures say nothing about the peer
         if info is not None:
@@ -767,7 +786,7 @@ class _DictationTurn(_JobTurn):
         except OSError as error:
             # Only positive evidence of loss cancels a turn. In particular,
             # EACCES/EPERM and EMFILE do not break the existing connection.
-            return error.errno not in (errno.ENOENT, errno.ECONNREFUSED)
+            return error.errno not in _RECEIVER_GONE_ERRNOS
         return True
 
     @property
@@ -2313,8 +2332,8 @@ class Daemon(OwnedTurns):
             # not still running while the last words are being turned into
             # text. stop() is idempotent, so the guard below repeats it.
             capture.stop()
-            # R6 finding 2: stopping the recorder is terminate plus join and
-            # can take seconds. Checked BEFORE the overruns refusal, so a turn
+            # R6 finding 2: stopping the recorder includes joining its reader.
+            # Checked BEFORE the overruns refusal, so a turn
             # whose budget ran out here says deadline rather than unavailable.
             self._check_delivery(turn, "while the recorder shut down")
             if capture.overruns:

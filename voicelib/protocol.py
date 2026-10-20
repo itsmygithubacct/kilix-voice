@@ -591,7 +591,9 @@ def _embedded_audio_length(value: object) -> int | None:
 # P09: how stop-dictation ends a turn. `finish` delivers the words heard so
 # far, as every existing caller expects; `abort` discards them.
 # Optional `sock` scopes either mode to the current turn's normalised receiver
-# path. A missing path is valid. No turn or a different receiver is an ok reply
+# pathname, not its generation. A later turn reusing that pathname matches;
+# use distinct paths when late stops must not affect a successor.
+# A missing path is valid. No turn or a different receiver is an ok reply
 # with stopped:false and the mode echoed. Without `sock`, stop the current turn.
 STOP_MODE_FINISH = "finish"
 STOP_MODE_ABORT = "abort"

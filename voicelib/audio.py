@@ -38,6 +38,7 @@ import tempfile
 import threading
 from typing import IO
 
+from .processes import kill_group
 from .util import cfg_get, which
 
 DEFAULT_RATE = 16000
@@ -263,7 +264,7 @@ class MicCapture:
         try:
             process = subprocess.Popen(
                 cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=stderr)
+                stderr=stderr, start_new_session=True)
         except OSError as error:
             stderr.close()
             raise AudioError(
@@ -299,10 +300,7 @@ class MicCapture:
         self._stopping.set()
         process = self._process
         if process is not None:
-            try:
-                process.terminate()
-            except OSError:
-                pass
+            kill_group(process)
 
     def stop(self) -> None:
         """Stop the recorder and join the reader. Idempotent."""
@@ -310,16 +308,12 @@ class MicCapture:
         process, self._process = self._process, None
         reader, self._reader = self._reader, None
         if process is not None:
-            try:
-                if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=self._TERM_TIMEOUT)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait()
-            except OSError:
-                pass
+            # Capture exchanges raw PCM over pipes, with no terminal or
+            # graceful-shutdown protocol. End its whole private group now:
+            # waiting for SIGTERM can keep a descendant recording, or leave
+            # the reader blocked after the original recorder already exited.
+            kill_group(process)
+            process.wait(timeout=self._TERM_TIMEOUT)
         if reader is not None:
             reader.join(timeout=self._JOIN_TIMEOUT)
         if process is not None and process.stdout is not None:

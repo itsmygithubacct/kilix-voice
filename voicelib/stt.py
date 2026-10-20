@@ -33,6 +33,7 @@ import wave
 from typing import NamedTuple
 
 from . import consent, models, paths, protocol, resources, settings
+from .processes import kill_group
 from .util import cfg_get
 
 DEFAULT_RATE = 16000
@@ -875,8 +876,8 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
     bytes consent verified (:class:`_HeldPayload`); the held files are
     re-checked once the model has loaded and after every decode. Requests are
     length-prefixed PCM on its stdin, replies one JSON line on its stdout,
-    each under a deadline. ``close()`` kills the child; nothing outlives the
-    recogniser.
+    each under a deadline. Teardown kills the child's private process group,
+    including descendants whose original parent has already exited.
     """
 
     name = ENGINE_WHISPER
@@ -1077,16 +1078,15 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
         with self._lifecycle:
             process, self._process = self._process, None
         if process is not None:
-            if process.poll() is None:
-                process.kill()
+            kill_group(process)
             self._reap(process)
 
     def cancel(self) -> None:
         """Interrupt decode; its worker still owns the pipes and reaping."""
         with self._lifecycle:
             process = self._process
-            if process is not None and process.poll() is None:
-                process.kill()
+            if process is not None:
+                kill_group(process)
 
     @staticmethod
     def _reap(process: subprocess.Popen) -> None:
@@ -1107,8 +1107,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
             self._pcm = bytearray()
             process, self._process = self._process, None
             if process is not None:
-                if process.poll() is None:
-                    process.kill()
+                kill_group(process)
                 # A decode in progress owns the pipes and reaps the child;
                 # otherwise nobody else will.
                 if not self._busy:

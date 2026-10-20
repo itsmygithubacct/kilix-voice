@@ -312,6 +312,30 @@ class DictationLivenessTests(unittest.TestCase):
         self.assert_stopped(started, job, pids, "cancelled")
         self.assert_healthy_again(started)
 
+    def replaced_receiver_parent(self, *, loop=False):
+        directory = Path(self.session_dir) / "nested"
+        directory.mkdir()
+        receiver = self.receiver("nested/r.sock")
+        job, pids = self.start_turn(receiver)
+        directory.rename(directory.with_name("moved"))
+        if loop:
+            directory.symlink_to(directory.name)
+        else:
+            directory.write_text("not a directory")
+        receiver.close()
+        started = time.monotonic()
+        with self.assertRaises(OSError) as caught:
+            os.lstat(directory / "r.sock")
+        self.assertEqual(caught.exception.errno, errno.ELOOP if loop else errno.ENOTDIR)
+        self.assert_stopped(started, job, pids, "cancelled")
+        self.assert_healthy_again(started)
+
+    def test_parent_replaced_file_during_silent_capture(self):
+        self.replaced_receiver_parent()
+
+    def test_symlink_loop_parent_during_silent_capture(self):
+        self.replaced_receiver_parent(loop=True)
+
     def test_receiver_replaced_at_same_path(self):
         receiver = self.receiver()
         job, pids = self.start_turn(receiver)
@@ -476,6 +500,22 @@ class DictationLivenessTests(unittest.TestCase):
 
     def test_scoped_late_abort_leaves_successor_recording(self):
         self.late_scoped_stop(mode="abort")
+
+    def test_scoped_stop_distinguishes_same_basename_receivers(self):
+        for name in ("caller-a", "caller-b"):
+            (Path(self.session_dir) / name).mkdir()
+        earlier = self.receiver("caller-a/r.sock")
+        receiver = self.receiver("caller-b/r.sock")
+        job, pids = self.start_turn(receiver)
+        for mode in ("finish", "abort"):
+            with self.subTest(mode=mode):
+                reply = self._send(dict(op="stop-dictation", mode=mode,
+                                        sock=earlier.getsockname()))
+                self.assertEqual(reply, dict(ok=True, id="", stopped=False, mode=mode))
+                time.sleep(.15)
+                self.assertTrue(self._send({"op": "status"})["status"]["listening"])
+                self.assertTrue(all(Path(f"/proc/{pid}").exists() for pid in pids.values()))
+        self.finish_scoped_turn(receiver, job, pids)
 
     def test_scoped_stop_without_current_turn_is_noop(self):
         path = str(Path(self.session_dir) / "removed.sock")
@@ -682,14 +722,37 @@ class DictationLivenessBoundaryTests(unittest.TestCase):
     def test_definite_receiver_probe_failures_cancel(self):
         with tempfile.TemporaryDirectory() as directory:
             receiver, turn = self.receiver_turn(directory)
-            for code in (errno.ENOENT, errno.ECONNREFUSED):
-                for target, name in ((voiced.os, "lstat"), (socket.socket, "connect")):
+            for code in (errno.ENOENT, errno.ECONNREFUSED, errno.ENOTDIR,
+                         errno.ELOOP, errno.ENAMETOOLONG, errno.ENOTSOCK,
+                         errno.EPROTOTYPE):
+                for target, name in ((voiced.os, "lstat"), (voiced.socket, "socket"),
+                                     (socket.socket, "connect")):
                     with self.subTest(errno=code, operation=name):
                         with mock.patch.object(target, name, side_effect=OSError(code, os.strerror(code))):
                             self.assertFalse(turn.receiver_alive())
+                            if name == "lstat":
+                                initial = voiced._DictationTurn(
+                                    "initial", turn.receiver, receiver_path=turn.receiver_path)
+                        if name == "lstat":
+                            self.assertFalse(initial.receiver_alive(),
+                                             "initial definite loss must remain recorded")
             os.unlink(turn.receiver_path)
             Path(turn.receiver_path).write_text("not a socket")
             self.assertFalse(turn.receiver_alive())
+
+    def test_unknown_receiver_probe_errors_preserve_delivery(self):
+        # Filesystem I/O and stale mount errors need not mean the connected
+        # peer died. An unrecognized future errno follows the same policy.
+        with tempfile.TemporaryDirectory() as directory:
+            receiver, turn = self.receiver_turn(directory)
+            for code in (errno.EIO, errno.ESTALE, errno.EINVAL, 123456):
+                for target, name in ((voiced.os, "lstat"), (voiced.socket, "socket"),
+                                     (socket.socket, "connect")):
+                    with self.subTest(errno=code, operation=name):
+                        with mock.patch.object(target, name, side_effect=OSError(code, "probe failed")):
+                            self.assertTrue(turn.receiver_alive())
+                        turn.receiver.send(b"still reachable")
+                        self.assertEqual(receiver.recv(100), b"still reachable")
 
     def test_seqpacket_hangup_is_seen_even_when_path_is_inaccessible(self):
         with tempfile.TemporaryDirectory() as directory:
