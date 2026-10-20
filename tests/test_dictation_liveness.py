@@ -49,8 +49,8 @@ while True:
     size = json.loads(header)["pcm_bytes"]
     pcm = sys.stdin.buffer.read(size)
     log({{"decode": True}})
-    if os.path.exists(os.environ["TEST_HANG_DECODE"]):
-        time.sleep(60)
+    while os.path.exists(os.environ["TEST_HANG_DECODE"]):
+        time.sleep(.02)
     print('{{"text": "synthetic words"}}', flush=True)
 """
 
@@ -398,6 +398,150 @@ class DictationLivenessTests(unittest.TestCase):
         receiver.settimeout(3)
         self._send({"op": "stop-dictation"})
         self.assertEqual(self.terminal(receiver)["final"], "synthetic words")
+
+    def finish_scoped_turn(self, receiver, job, pids, **fields):
+        started = time.monotonic()
+        reply = self._send(dict(op="stop-dictation", sock=receiver.getsockname(), **fields))
+        self.assertEqual((reply.get("ok"), reply.get("stopped"), reply.get("mode")),
+                         (True, True, "finish"), reply)
+        message = self.terminal(receiver)
+        self.assertEqual(message.get("final"), "synthetic words", message)
+        self.assertNotIn("error", message)
+        self.assert_stopped(started, job, pids, "completed")
+
+    def test_scoped_finish_uses_the_existing_finish_path(self):
+        for fields in ({}, {"mode": "finish"}):
+            with self.subTest(fields=fields):
+                receiver = self.receiver()
+                job, pids = self.start_turn(receiver)
+                self.finish_scoped_turn(receiver, job, pids, **fields)
+        self.assertEqual(len(self.entries("decode")), 2)
+
+    def test_scoped_abort_uses_the_existing_abort_path(self):
+        receiver = self.receiver()
+        job, pids = self.start_turn(receiver)
+        started = time.monotonic()
+        reply = self._send(dict(op="stop-dictation", mode="abort",
+                                sock=receiver.getsockname()))
+        self.assertEqual((reply.get("ok"), reply.get("stopped"), reply.get("mode")),
+                         (True, True, "abort"), reply)
+        self.assert_stopped(started, job, pids, "cancelled")
+        message = self.terminal(receiver)
+        self.assertEqual(message.get("code"), "cancelled", message)
+        self.assertNotIn("final", message)
+        self.assertEqual(self.entries("decode"), [])
+
+    def test_scoped_abort_during_decode_suppresses_final(self):
+        receiver = self.receiver()
+        job, pids = self.start_turn(receiver)
+        path = receiver.getsockname()
+        self.assertTrue(self._send(dict(op="stop-dictation", sock=path))["stopped"])
+        self.wait_for(lambda: bool(self.entries("decode")), 3, "decode did not start")
+        started = time.monotonic()
+        reply = self._send(dict(op="stop-dictation", sock=path, mode="abort"))
+        self.assertEqual((reply.get("ok"), reply.get("stopped"), reply.get("mode")),
+                         (True, True, "abort"), reply)
+        # Existing abort suppresses the final when decode returns. Release the
+        # fixture so this checks that delivery boundary, not a decode timeout.
+        self.hang_decode.unlink()
+        self.assert_stopped(started, job, pids, "cancelled")
+        message = self.terminal(receiver)
+        self.assertEqual(message.get("code"), "cancelled", message)
+        self.assertNotIn("final", message)
+
+    def late_scoped_stop(self, **fields):
+        earlier = self.receiver()
+        old_job, old_pids = self.start_turn(earlier)
+        self.finish_scoped_turn(earlier, old_job, old_pids)
+        os.unlink(earlier.getsockname())
+        receiver = self.receiver()
+        job, pids = self.start_turn(receiver)
+        reply = self._send(dict(op="stop-dictation", sock=earlier.getsockname(),
+                                id="late", **fields))
+        self.assertEqual(reply, dict(ok=True, id="late", stopped=False,
+                                     mode=fields.get("mode", "finish")))
+        # Give both the worker and its receiver watcher a chance to run.
+        receiver.settimeout(.25)
+        with self.assertRaises(socket.timeout):
+            receiver.recv(65536)
+        receiver.settimeout(3)
+        self.assertTrue(self._send({"op": "status"})["status"]["listening"])
+        self.assertTrue(all(Path(f"/proc/{pid}").exists() for pid in pids.values()))
+        self.finish_scoped_turn(receiver, job, pids)
+
+    def test_scoped_late_finish_leaves_successor_recording(self):
+        for fields in ({}, {"mode": "finish"}):
+            with self.subTest(fields=fields):
+                self.late_scoped_stop(**fields)
+
+    def test_scoped_late_abort_leaves_successor_recording(self):
+        self.late_scoped_stop(mode="abort")
+
+    def test_scoped_stop_without_current_turn_is_noop(self):
+        path = str(Path(self.session_dir) / "removed.sock")
+        for fields in ({}, {"mode": "finish"}, {"mode": "abort"}):
+            with self.subTest(fields=fields):
+                reply = self._send(dict(op="stop-dictation", sock=path, **fields))
+                self.assertEqual(reply, dict(ok=True, id="", stopped=False,
+                                             mode=fields.get("mode", "finish")))
+
+    def test_unscoped_stop_still_stops_the_current_turn(self):
+        receiver = self.receiver()
+        job, pids = self.start_turn(receiver)
+        started = time.monotonic()
+        reply = self._send({"op": "stop-dictation"})
+        self.assertEqual((reply.get("ok"), reply.get("stopped"), reply.get("mode")),
+                         (True, True, "finish"), reply)
+        self.assertEqual(self.terminal(receiver).get("final"), "synthetic words")
+        self.assert_stopped(started, job, pids, "completed")
+
+    def test_scoped_abort_after_unlink_stays_cancelled_with_watcher(self):
+        for delay in (0, .25):
+            with self.subTest(delay=delay):
+                receiver = self.receiver()
+                job, pids = self.start_turn(receiver)
+                started = time.monotonic()
+                os.unlink(receiver.getsockname())
+                time.sleep(delay)
+                reply = self._send(dict(op="stop-dictation", mode="abort",
+                                        sock=receiver.getsockname()))
+                self.assertTrue(reply["ok"], reply)
+                self.assertEqual(reply["mode"], "abort")
+                self.assert_stopped(started, job, pids, "cancelled")
+                message = self.terminal(receiver)
+                self.assertEqual(message.get("code"), "cancelled", message)
+                self.assertNotIn("final", message)
+        self.assertEqual(self.entries("decode"), [])
+
+    def test_scoped_stop_normalises_the_dictate_receiver(self):
+        receiver = self.receiver()
+        alias = str(Path(self.session_dir) / "alias.sock")
+        os.symlink(receiver.getsockname(), alias)
+
+        class Alias:
+            def getsockname(self):
+                return alias
+
+        # Dictate records the resolved receiver; stop receives the alias again.
+        job, pids = self.start_turn(Alias())
+        started = time.monotonic()
+        reply = self._send(dict(op="stop-dictation", sock=alias))
+        self.assertEqual((reply.get("ok"), reply.get("stopped")), (True, True), reply)
+        self.assertEqual(self.terminal(receiver).get("final"), "synthetic words")
+        self.assert_stopped(started, job, pids, "completed")
+
+    def test_malformed_scoped_stop_is_refused_without_stopping(self):
+        receiver = self.receiver()
+        job, pids = self.start_turn(receiver)
+        for raw in (None, "", False, [], str(Path(self.root) / "outside.sock"),
+                    str(Path(self.session_dir) / ("x" * 4096))):
+            for mode in ("finish", "abort"):
+                with self.subTest(raw=raw, mode=mode):
+                    reply = self._send(dict(op="stop-dictation", sock=raw, mode=mode))
+                    self.assertFalse(reply["ok"], reply)
+                    self.assertEqual(reply.get("code"), "malformed")
+                    self.assertTrue(self._send({"op": "status"})["status"]["listening"])
+        self.finish_scoped_turn(receiver, job, pids)
 
 
 class DictationLivenessBoundaryTests(unittest.TestCase):

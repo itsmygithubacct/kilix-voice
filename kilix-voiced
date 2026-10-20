@@ -21,6 +21,9 @@ accepted connection is checked with ``SO_PEERCRED``.
     {"op":"stop-dictation","mode":"abort"}
                                      -> {"ok":true,"id":"","stopped":true,
                                          "quiesced":true,"mode":"abort"}
+    {"op":"stop-dictation","sock":"…"}  -> same finish reply, only for that receiver
+    {"op":"stop-dictation","mode":"abort","sock":"…"}
+                                     -> same abort reply, only for that receiver
     {"op":"status"}                  -> {"ok":true,"id":"","status":{…}}
     {"op":"ingest-audio"} + 1 fd     -> {"ok":true,"id":"","job":"ingest-1",
                                          "audio_fd":0,"pcm_bytes":…} + 1 fd
@@ -29,6 +32,11 @@ Dictation results go to the caller's socket as datagrams — ``{"partial":…}``
 while the person is still speaking, one ``{"final":…}`` at the end, or
 ``{"error":…}`` — never back down the control connection, which has already
 been answered and closed.
+
+On stop-dictation, optional ``sock`` is normalised like dictate's receiver,
+without requiring it to exist. No current turn or a different receiver replies
+``{"ok":true,"id":"","stopped":false,"mode":"finish"}`` (or ``"abort"``).
+Omitting ``sock`` still stops whichever turn is current.
 
 Nothing here is configured privately: every knob comes from the shared Kilix
 settings document, re-read before each turn so a change made in ``kilix-tts``
@@ -2041,7 +2049,9 @@ class Daemon(OwnedTurns):
         mode = request.get("mode", protocol.STOP_MODE_FINISH)
         with self._lock:
             turn = self._dictation
-        if turn is None:
+        # Compare the same normalised path that dictate recorded. Keep the
+        # captured turn: a late stop must never act on a successor's receiver.
+        if turn is None or ("sock" in request and request["sock"] != turn.receiver_path):
             return protocol.reply_ok(request["id"], stopped=False, mode=mode)
         # TERM-04: wait -- bounded, and NOT holding self._lock -- for a feed
         # already in progress, so that once this replies quiesced no feed

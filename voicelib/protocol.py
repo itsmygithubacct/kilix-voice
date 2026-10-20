@@ -437,7 +437,11 @@ def _request_id(raw: object) -> str:
 
 
 def _validated_socket(raw: object, session_dir: str) -> str:
-    """Resolve a caller-supplied dictation socket inside the session directory.
+    """Resolve a caller-supplied receiver path inside the session directory.
+
+    Used by dictate and scoped stop-dictation alike. realpath's non-strict
+    resolution accepts missing paths, including a receiver unlinked before
+    its caller aborts, while keeping both requests in the same canonical form.
 
     This is a security boundary, not a tidiness check.  The daemon runs as the
     user and will connect to whatever path a request names, so an unchecked
@@ -586,6 +590,9 @@ def _embedded_audio_length(value: object) -> int | None:
 
 # P09: how stop-dictation ends a turn. `finish` delivers the words heard so
 # far, as every existing caller expects; `abort` discards them.
+# Optional `sock` scopes either mode to the current turn's normalised receiver
+# path. A missing path is valid. No turn or a different receiver is an ok reply
+# with stopped:false and the mode echoed. Without `sock`, stop the current turn.
 STOP_MODE_FINISH = "finish"
 STOP_MODE_ABORT = "abort"
 STOP_MODES = (STOP_MODE_FINISH, STOP_MODE_ABORT)
@@ -738,15 +745,17 @@ def validate_request(msg: dict, session_dir: str) -> dict:
                         f"{key!r} is {_echo(value)}; this daemon takes "
                         f"{low}-{high} {unit}.", code=code)
                 request[key] = value
-    elif op == OP_STOP_DICTATION and "mode" in msg:
-        # P09. Inserted only when sent, so a stop that names no mode is the
-        # same normalised request it always was.
-        mode = msg.get("mode")
-        if not isinstance(mode, str) or mode not in STOP_MODES:
-            raise ProtocolError(
-                f"'mode' must be one of: {', '.join(STOP_MODES)}, got "
-                f"{_echo(mode)}. Omit it to finish and deliver the words so far.")
-        request["mode"] = mode
+    elif op == OP_STOP_DICTATION:
+        # Insert optional fields only when sent, preserving unscoped callers.
+        if "sock" in msg:
+            request["sock"] = _validated_socket(msg["sock"], session_dir)
+        if "mode" in msg:
+            mode = msg.get("mode")
+            if not isinstance(mode, str) or mode not in STOP_MODES:
+                raise ProtocolError(
+                    f"'mode' must be one of: {', '.join(STOP_MODES)}, got "
+                    f"{_echo(mode)}. Omit it to finish and deliver the words so far.")
+            request["mode"] = mode
     elif op == OP_STATUS and "job" in msg:
         # P07/P11: ask for one job's terminal outcome by the id its request
         # was answered with. Optional, and absent from the normalised request
