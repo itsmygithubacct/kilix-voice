@@ -20,6 +20,7 @@ import contextlib
 import importlib
 import os
 import re
+import threading
 import time
 from collections.abc import Callable, Iterator
 
@@ -100,6 +101,7 @@ class ExecutionGrant:
         self._lease = lease
         self._refused = refused
         self._reaped = False
+        self._release_lock = threading.Lock()
 
     @property
     def guard_fd(self) -> int:
@@ -109,8 +111,28 @@ class ExecutionGrant:
             raise self._refused(error) from error
 
     def reaped(self) -> None:
-        """Record that the engine closed and every process it started is gone."""
-        self._reaped = True
+        """Acknowledge proven teardown, including after execution() has exited.
+
+        Keep the original open Lease until this acknowledgement succeeds: a
+        release(False) would close the only descriptor allowed to repair it.
+        """
+        with self._release_lock:
+            if not self._reaped:
+                try:
+                    self._lease.release(cleanup_complete=True)
+                except Exception as error:
+                    raise self._refused(error) from error
+                self._reaped = True
+
+    def __del__(self) -> None:
+        # No owner remains to prove teardown. Close without acknowledgement;
+        # the lease home then quarantines this exact grant. Process exit also
+        # closes the descriptor, including when retained owners remain live.
+        if not self._reaped:
+            try:
+                self._lease.release(cleanup_complete=False)
+            except Exception:
+                pass
 
 
 @contextlib.contextmanager
@@ -129,9 +151,10 @@ def execution(*, device_class: str, task: str, job_id: str,
     ``namespace`` is for isolated tests only; the daemon never passes one, so
     it always uses the one namespace every provider shares.
 
-    On exit the grant is released. It is released as cleaned up only when
-    reaped() was called; otherwise the lease quarantines the accelerator,
-    because an engine whose teardown was not proven may still hold it.
+    reaped() releases a proven grant. An unproven grant stays open while its
+    teardown owner retains it, so a later successful retry can acknowledge
+    cleanup. Losing that owner or exiting the process closes the descriptor
+    without proof and leaves the lease quarantined.
     Raises AcceleratorRefused with a closed code.
     """
     if device_class == resources.DEVICE_CPU:
@@ -174,15 +197,4 @@ def execution(*, device_class: str, task: str, job_id: str,
     except module.LeaseError as error:
         raise refused(error) from error
     grant = ExecutionGrant(lease, refused)
-    failed = False
-    try:
-        yield grant
-    except BaseException:
-        failed = True
-        raise
-    finally:
-        try:
-            lease.release(cleanup_complete=grant._reaped)
-        except module.LeaseError as error:
-            if not failed:
-                raise refused(error) from error
+    yield grant

@@ -163,6 +163,51 @@ Read-aloud works without any recognition support, and dictation works without
 any synthesis support. A missing piece disables that one feature and says so;
 it never blocks startup.
 
+## Recovering incomplete dictation cleanup
+
+A cancelled or failed turn can still own a recorder or recogniser whose
+teardown could not be proven. The daemon keeps that owner, retries once after
+settlement and before each new dictation, and refuses new microphone claims
+until all retained cleanup succeeds. Each retry pass waits at most 250 ms;
+an operation still running keeps its owner and does not spawn duplicate
+cleanup threads. Successful resources are removed independently. There is
+no eviction to make room for another turn: at most the current turn's two
+resource owners can accumulate through admission. Read-aloud uses its existing
+policy and does not trigger these retries.
+
+`kilix voice doctor` and the launcher's voice summary show `cleanup retained`
+with the turn, resource kind and age. The daemon's `status.retained_cleanup`
+contains `{turn, kind, age_seconds}` records only, never command arguments or
+heard text. Status and doctor are read-only; they do not retry cleanup or open
+an audio device. `listening: false` describes the active turn, and does not
+mean a retained recorder has stopped.
+
+Retry dictation to request another bounded teardown attempt. If cleanup still
+fails, stop the daemon normally (SIGTERM to its verified PID from status) and
+inspect its stderr. After the existing worker joins (up to 5 seconds per
+active speech/dictation worker), shutdown attempts every retained owner with
+one shared 1-second wait budget. It uses the same final SIGKILL of owned
+process groups and reap operations as normal cleanup, and logs each remaining
+unproven resource by turn, kind and process group before exiting. A blocked
+cleanup continues in its one daemon thread until it finishes or the process
+exits; shutdown does not wait indefinitely for it.
+
+Do not start another recorder while an earlier recorder is still alive. A
+kernel-uninterruptible child may not exit even after SIGKILL: resolve its
+device/kernel problem and verify its exit, or reboot the system if it cannot
+be recovered. A logged process-group number is diagnostic, not permission to
+signal that number later after it may have been reused. Restarting the daemon
+does not itself prove the old recorder exited.
+
+An accelerator provider retains its original open lease until its own
+teardown succeeds; a successful retry acknowledges exactly that grant. If
+the daemon exits before proof, closing the descriptor leaves the accelerator
+quarantined. Neither doctor nor daemon restart clears quarantine. Follow the
+system-monitor lease component's recovery procedure: establish complete
+owned teardown before administering a fresh, coordinated namespace. Never
+delete lease state merely to bypass an unproven owner. No lease component is
+copied or changed here.
+
 ## Run from source
 
 ```bash

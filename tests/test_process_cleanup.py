@@ -515,17 +515,52 @@ class CleanupTests(unittest.TestCase):
                         mock.patch.object(voiced.stt_lib, "make_stt", return_value=engine):
                     daemon._run_dictation(turn)
                 self.assertEqual(ledger.get(turn.id)["outcome"], "cancelled")
-                capture.stop.assert_called_once()
-                engine.close.assert_called_once()
-                grant.reaped.assert_not_called()
+                self.assertEqual(capture.stop.call_count, 2)  # initial + settlement retry
+                self.assertEqual(engine.close.call_count, 2 if provider_fails else 1)
+                if provider_fails:
+                    grant.reaped.assert_not_called()
+                else:
+                    grant.reaped.assert_called_once()
                 expected = {(turn.id, "capture"): capture}
                 if provider_fails:
                     expected[(turn.id, "provider")] = engine
                 self.assertEqual(daemon._failed_dictation_cleanup, expected)
-                self.assertEqual(daemon._warn.call_count, len(expected))
+                self.assertEqual(daemon._warn.call_count, 2 * len(expected))
                 capture.stop.side_effect = engine.close.side_effect = None
                 self.assertIsNone(daemon._close_dictation_resources(turn, capture, engine))
                 self.assertEqual(daemon._failed_dictation_cleanup, {})
+
+    def test_primary_decoder_error_survives_provider_reap_failure(self):
+        for engine_type in (stt.WhisperStt, stt.WhistleStt):
+            with self.subTest(provider=engine_type.__name__):
+                engine, process = self.provider(engine_type)
+                sent, ledger = [], jobs.JobLedger()
+                daemon = _worker_daemon(sent, ledger)
+                daemon._cfg = {}
+                daemon._warn = mock.Mock()
+                capture = mock.Mock()
+                turn = voiced._DictationTurn("decoder-error", mock.Mock())
+                turn.on_settle = ledger.record
+                daemon._record = mock.Mock(side_effect=stt.SttError("primary decoder error"))
+                daemon._dictate = lambda t: daemon._record_turn(t, SimpleNamespace(), None)
+                with mock.patch.object(voiced.audio, "MicCapture", return_value=capture), \
+                        mock.patch.object(voiced.stt_lib, "make_stt", return_value=engine), \
+                        mock.patch.object(process, "wait", side_effect=
+                                          subprocess.TimeoutExpired("private args", 5)):
+                    daemon._run_dictation(turn)
+                self.assertEqual(ledger.get(turn.id)["code"], "unavailable")
+                self.assertEqual(len(sent), 1)
+                self.assertEqual(sent[0]["code"], "unavailable")
+                self.assertIn("primary decoder error", sent[0]["error"])
+                self.assertIs(daemon._failed_dictation_cleanup[(turn.id, "provider")], engine)
+                self.assertIs(engine._process, process)
+                messages = [c.args[0] for c in daemon._warn.call_args_list]
+                self.assertTrue(any(turn.id in m and "provider" in m and "TimeoutExpired" in m
+                                    for m in messages), messages)
+                self.assertNotIn("private args", str(messages))
+                self.assertIsNone(daemon._close_dictation_resources(turn, None, engine))
+                self.assertEqual(daemon._failed_dictation_cleanup, {})
+                self.assertIsNone(engine._process)
 
     def test_provider_teardown_methods_contend_on_lifecycle_lock(self):
         for engine_type in (stt.WhisperStt, stt.WhistleStt):

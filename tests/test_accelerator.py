@@ -239,6 +239,7 @@ class GrantTestCase(_LeaseFixture):
     def test_unproven_teardown_quarantines_next_grant(self) -> None:
         with self.execution() as grant:
             self.assertIsNotNone(grant)             # never marked reaped
+        del grant  # Losing the last recovery owner closes without proof.
         with self.assertRaises(accelerator.AcceleratorRefused) as caught:
             with self.execution(job_id="listen-2"):
                 self.fail("granted after an unproven teardown")
@@ -431,12 +432,12 @@ class DaemonTestCase(_LeaseFixture):
         self.assertIn(accelerator.DEVICE_KEY, self.sent[0]["error"])
         self.assertEqual(os.listdir(self.parent), [])
 
-    def test_an_engine_whose_close_fails_leaves_the_accelerator_quarantined(self) -> None:
+    def test_an_engine_whose_close_fails_keeps_the_accelerator_held(self) -> None:
         self.close_error = stt_lib.SttError("the recogniser would not close")
         _turn, worker = self.dictate()
         worker.join(15)
         self.assertEqual(len(self.built), 1)
-        self.assertEqual(self.next_grant(), protocol.ERR_UNAVAILABLE)
+        self.assertEqual(self.next_grant(), protocol.ERR_DEADLINE)
 
     def test_a_cpu_engine_dictates_without_the_lease(self) -> None:
         self.device_class = resources.DEVICE_CPU
