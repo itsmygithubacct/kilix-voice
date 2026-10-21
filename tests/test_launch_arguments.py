@@ -1,4 +1,5 @@
 import contextlib,json,os,subprocess,sys,tempfile,unittest
+from unittest import mock
 from pathlib import Path
 from voicelib import processes
 class Arguments(unittest.TestCase):
@@ -44,4 +45,20 @@ class Arguments(unittest.TestCase):
      self.assertEqual(a.exception.errno,b.exception.errno)
    with self.assertRaises(PermissionError):
     processes.GroupPopen(['denied'],env={'PATH':str(root)+':/nonexistent'})
+
+ def test_all_falsy_close_fds_are_refused_before_spawning(self):
+  for value in (False, 0, None, 0.0, '', (), []):
+   for positional in (False, True):
+    with self.subTest(value=value, positional=positional):
+     args = (['/bin/true'], -1, None, None, None, None, None, value) if positional else (['/bin/true'],)
+     kwargs = {} if positional else {'close_fds': value}
+     with mock.patch.object(subprocess.Popen, '__init__', return_value=None) as spawn:
+      error = None
+      try:
+       processes.GroupPopen(*args, **kwargs)
+      except Exception as caught:
+       error = caught
+      self.assertIsInstance(error, ValueError)
+      self.assertIn('close_fds', str(error))
+      spawn.assert_not_called()
 if __name__=='__main__':unittest.main(verbosity=2)

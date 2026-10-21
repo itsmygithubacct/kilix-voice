@@ -316,6 +316,61 @@ def kill_group(process: subprocess.Popen) -> None:
         process._voice_group_signalled = True
 
 
+def _dispose_failed_launch(process):
+    kill_group(process)
+    process.wait(timeout=2)
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
+
+
+class _FailedLaunches:
+    """Own constructor failures that cannot yet prove group cleanup.
+
+    A caller cannot publish an allocation whose constructor raised. Retain
+    it here until the normal signal, reap and descriptor disposal succeeds.
+    The worker uses the same conservative proof as every other owner.
+    """
+
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.pending = set()
+        self.worker = None
+
+    def retain(self, process):
+        with self.condition:
+            self.pending.add(process)
+            if self.worker is None:
+                worker = threading.Thread(target=self._run, daemon=True,
+                                          name='failed-launch-cleanup')
+                worker.start()
+                self.worker = worker
+            self.condition.notify_all()
+        logging.getLogger(__name__).warning(
+            'process group %s: failed launch retained for cleanup retry', process.pid)
+
+    def _run(self):
+        while True:
+            with self.condition:
+                if not self.pending:
+                    self.worker = None
+                    return
+                pending = tuple(self.pending)
+            for process in pending:
+                try:
+                    _dispose_failed_launch(process)
+                except Exception:
+                    continue  # no disposal proof: retain every handle and retry
+                with self.condition:
+                    self.pending.remove(process)
+            with self.condition:
+                if self.pending:
+                    self.condition.wait(.05)
+
+
+_failed_launches = _FailedLaunches()
+
+
 class GroupPopen(subprocess.Popen):
     """A pipe client whose leader reserves its group until the final signal.
 
@@ -327,7 +382,7 @@ class GroupPopen(subprocess.Popen):
     def __init__(self, *args, **kwargs):
         global _pidfd_available
         require_waitable_children()
-        if kwargs.get('close_fds') is False or (len(args) > 7 and args[7] is False):
+        if not kwargs.get('close_fds', True) or (len(args) > 7 and not args[7]):
             raise ValueError('GroupPopen does not support close_fds=False; use pass_fds')
         self._voice_pidfd = None
         self._voice_identity_unproven = False
@@ -391,22 +446,23 @@ class GroupPopen(subprocess.Popen):
             while part := parent.recv(65536):
                 reply.extend(part)
             if reply != b'X':
-                kill_group(self)
-                self.wait(timeout=2)
-                for stream in (self.stdin, self.stdout, self.stderr):
-                    if stream is not None:
-                        stream.close()
-                failure = bytes(reply).removeprefix(b'X')
-                if failure.startswith(b'F'):
-                    kind, code, message = marshal.loads(failure[1:])
-                    if kind == 'ValueError':
-                        raise ValueError(message)
-                    if kind == 'TypeError':
-                        raise TypeError(message)
-                    if isinstance(code, int):
-                        raise OSError(code, message, executable)
-                    raise RuntimeError('process launcher failed: ' + message)
-                raise RuntimeError('process launcher failed before exec')
+                try:
+                    failure = bytes(reply).removeprefix(b'X')
+                    if failure.startswith(b'F'):
+                        kind, code, message = marshal.loads(failure[1:])
+                        if kind == 'ValueError':
+                            raise ValueError(message)
+                        if kind == 'TypeError':
+                            raise TypeError(message)
+                        if isinstance(code, int):
+                            raise OSError(code, message, executable)
+                        raise RuntimeError('process launcher failed: ' + message)
+                    raise RuntimeError('process launcher failed before exec')
+                finally:
+                    try:
+                        _dispose_failed_launch(self)
+                    except Exception:
+                        _failed_launches.retain(self)
         finally:
             parent.close()
             child.close()

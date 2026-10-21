@@ -580,8 +580,15 @@ variants, so a concrete factory result cannot bypass the inventory.
   the nonce at exec by replacing the environment. It reports typed argument,
   protocol and exec failures over the close-on-exec socket; the parent requires
   an exec-attempt marker before accepting EOF. Embedded NUL arguments are
-  rejected before spawning. `close_fds=False` is explicitly unsupported and
-  raises ValueError; callers may select inherited descriptors with `pass_fds`.
+  rejected before spawning. Every falsy `close_fds` value, including positional
+  forms, is explicitly unsupported and raises ValueError; callers may select
+  inherited descriptors with `pass_fds`.
+  A failed exec still reports its original typed exception when cleanup
+  cannot finish. The module's failed-launch owner retains the unpublished
+  process, pidfd and streams and retries the ordinary group proof, wait and
+  disposal on one background worker. An inconclusive scan never seals the
+  group or drops ownership. The owner releases the process only after all
+  disposal steps succeed; it does not rely on `subprocess._active` to reap it.
   The isolated helper uses built-in modules and a length-prefixed marshal
   request from its trusted parent to avoid importing JSON, socket and signal
   wrappers on every spawn. Short-lived commands cannot exit before their
