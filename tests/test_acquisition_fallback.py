@@ -8,6 +8,7 @@ import subprocess
 import unittest
 from unittest import mock
 from voicelib import processes
+from tests.test_process_identity import finish_group
 
 
 class Acquisition(unittest.TestCase):
@@ -47,7 +48,7 @@ class Acquisition(unittest.TestCase):
             child = processes.GroupPopen(['/bin/sleep', '30'])
             try:
                 with mock.patch.object(os, 'killpg') as numeric:
-                    processes.kill_group(child)
+                    finish_group(self, child)
                     numeric.assert_not_called()
             finally:
                 self.contain(child)

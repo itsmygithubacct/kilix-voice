@@ -13,6 +13,24 @@ from unittest import mock
 from voicelib import processes
 
 
+def finish_group(test, child):
+    """A bounded backend may retain ownership when a loaded scan expires.
+
+    Retry that valid unproven outcome; assert it never seals or drops proof.
+    The test still requires eventual cleanup of its finite, non-forking child.
+    """
+    for _ in range(3):
+        try:
+            processes.kill_group(child)
+            return
+        except TimeoutError:
+            test.assertFalse(getattr(child, '_voice_group_signalled', False),
+                             'an incomplete scan was sealed as cleanup')
+            test.assertIsNotNone(child._voice_pidfd, 'timeout discarded identity')
+            test.assertIsNone(child.returncode, 'timeout fabricated a reap')
+    test.fail('finite fixture group did not complete across bounded retries')
+
+
 class IdentityTests(unittest.TestCase):
     def test_outside_reap_never_authorizes_numeric_signal(self):
         for fallback, disposition in ((f, d) for f in (False, True) for d in ('waitpid', 'ignore')):
@@ -142,14 +160,14 @@ class IdentityTests(unittest.TestCase):
                         mock.patch.object(processes, '_scan_group_members', side_effect=scanned), \
                         mock.patch.object(signal, 'pidfd_send_signal', side_effect=signalled), \
                         mock.patch.object(os, 'killpg') as numeric:
-                    processes.kill_group(child)
+                    finish_group(self, child)
                     numeric.assert_not_called()
                 self.assertIn('signal', order)
                 for index, event in enumerate(order):
                     if event == 'scan':
                         self.assertEqual(order[index-1:index+2], ['check', 'scan', 'check'])
             finally:
-                processes.kill_group(child)
+                finish_group(self, child)
                 child.wait(timeout=2)
 
     def test_fallback_refuses_sigchld_ignore_while_child_is_alive(self):
@@ -179,7 +197,7 @@ class IdentityTests(unittest.TestCase):
                 mock.patch.object(os, 'killpg', wraps=os.killpg) as numeric:
             for _ in range(2):
                 child = processes.GroupPopen(['/bin/sleep', '30'])
-                processes.kill_group(child)
+                finish_group(self, child)
                 child.wait(timeout=2)
             self.assertEqual(sum(call.args[3] == 1 << 2 for call in send.call_args_list), 1)
             self.assertGreaterEqual(sum(call.args[3] == 0 for call in send.call_args_list), 2)
