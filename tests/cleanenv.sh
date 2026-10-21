@@ -11,6 +11,8 @@
 #
 #     make test-clean
 #     tests/cleanenv.sh /usr/bin/python3 -m unittest discover -s tests -t .
+# A login's group-writable umask must not alter private fixture directories.
+umask 077
 T=$(mktemp -d) || exit 1
 mkdir -p "$T/home" "$T/data" "$T/config" "$T/runtime" "$T/state" "$T/cache"
 chmod 700 "$T/runtime"

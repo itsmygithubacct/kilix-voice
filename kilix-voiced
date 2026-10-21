@@ -2561,16 +2561,33 @@ class Daemon(OwnedTurns):
     def _register_cleanup(self, turn_id, kind, resource, grant=None, method="close"):
         """Own a resource before any launch or teardown can block."""
         key = (turn_id, kind)
+        late = False
         with self._cleanup_lock:
             if self._cleanup_owners is None:
                 self._cleanup_owners = {}
             if self._dictation_cleanup_state is None:
                 self._dictation_cleanup_state = {}
+            new_owner = self._cleanup_owners.get(key) is not resource
             self._cleanup_owners[key] = resource
             state = self._dictation_cleanup_state.setdefault(key, _CleanupState(grant))
             if grant is not None:
                 state.grant = grant
             state.method = method
+            stopping = getattr(self, "_stopping", None)
+            if stopping is not None and stopping.is_set():
+                # Construction can resume after shutdown's last owner snapshot.
+                # Close admission at the same registry boundary as publication,
+                # before the constructor can allocate or hand off a resource.
+                if isinstance(resource, processes.Resource):
+                    resource.request_close()
+                state.pending = True
+                if self._failed_dictation_cleanup is None:
+                    self._failed_dictation_cleanup = {}
+                self._failed_dictation_cleanup[key] = resource
+                late = new_owner
+        if late:
+            self._warn(f"shutdown: {turn_id}: {kind} registered while stopping; "
+                       "allocation refused; cleanup ownership retained")
         return key, state
 
     def _prepare_cleanup(self, key, resource, state):

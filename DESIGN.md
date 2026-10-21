@@ -619,7 +619,11 @@ joined only to the shared deadline; shutdown can release its session without
 proving that initializer complete. Resolution, settings, consent/digest checks
 and TTS configuration before registration can likewise block in filesystem or
 extension code. They allocate no owned recorder/provider child before the
-callback, but are not cancellable native initializers. Whisper/Whistle and
+callback, but are not cancellable native initializers.
+Any callback that resumes after shutdown starts is registered with close
+already requested under the registry lock. Its constructor cannot allocate
+new resources, including after shutdown's last cleanup pass; ownership stays
+retained until disposal is proven. Whisper/Whistle and
 VibeVoice native runtime/model loading happens in their registered child
 processes. External Piper/Qwen service processes belong to their respective
 providers; this daemon owns and tests only its client/status processes.
