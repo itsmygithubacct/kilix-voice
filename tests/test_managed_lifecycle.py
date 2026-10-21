@@ -8,7 +8,7 @@ from tests.test_lifecycle_matrix import MATRIX
 from tests import test_cleanup_recovery as recovery
 class ManagedRequirements(unittest.TestCase):
  def make(self,root):
-  return audio.MicCapture({'audio':{'capture_cmd':[sys.executable,'-I','-c','import os,pathlib,sys,time;pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));time.sleep(20)',str(Path(root)/'recorder.pid')]}},control=microphone.CaptureControl(time.monotonic()+15,locked=lambda:False,namespace=str(Path(root)/'leases')))
+  return audio.MicCapture({'audio':{'capture_cmd':[sys.executable,'-I','-c','import os,pathlib,sys,time;p=pathlib.Path(sys.argv[1]);t=p.with_suffix(".ready");t.write_text(str(os.getpid()));t.replace(p);time.sleep(20)',str(Path(root)/'recorder.pid')]}},control=microphone.CaptureControl(time.monotonic()+15,locked=lambda:False,namespace=str(Path(root)/'leases')))
  def test_managed_kind_has_independent_matrix_row(self):
   print('REGISTRY',json.dumps({k:v.__name__ for k,v in lifecycle.RESOURCE_KINDS.items()}), 'MATRIX',[(k,c.__name__) for k,(c,_) in MATRIX.items()],flush=True)
   self.assertIn(ManagedMicCapture,lifecycle.RESOURCE_KINDS.values())
@@ -69,7 +69,7 @@ class RequestStop(unittest.TestCase):
  def test_request_stop_retires_managed_recorder(self):
   with tempfile.TemporaryDirectory() as root:
    marker=Path(root)/'recorder.pid';fd=None
-   code='import os,pathlib,sys,time;pathlib.Path(sys.argv[1]).write_text(str(os.getpid()));time.sleep(15)'
+   code='import os,pathlib,sys,time;p=pathlib.Path(sys.argv[1]);t=p.with_suffix(".ready");t.write_text(str(os.getpid()));t.replace(p);time.sleep(15)'
    capture=audio.MicCapture({'audio':{'capture_cmd':[sys.executable,'-I','-c',code,str(marker)]}},control=microphone.CaptureControl(time.monotonic()+10,locked=lambda:False,namespace=str(Path(root)/'leases')))
    try:
     capture.start();deadline=time.monotonic()+3
