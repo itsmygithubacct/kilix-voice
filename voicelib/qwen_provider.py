@@ -44,6 +44,7 @@ def provider_binary() -> str | None:
 class QwenProviderTts(processes.SynthesisOwner):
     """Use only the 0.6B CustomVoice model, never an implicit fallback."""
 
+    resource_kinds = ("qwen",)
     name = models.TTS_ENGINE_QWEN
     model = models.QWEN_CUSTOMVOICE_MODEL
     rate = 0  # The provider has no words-per-minute control.

@@ -47,6 +47,7 @@ import tempfile
 import threading
 from typing import IO
 
+from .lifecycle import Resource, starting, using, closing
 from .processes import GroupPopen, kill_group, require_waitable_children, wait_exit
 from .util import cfg_get, which
 
@@ -196,7 +197,7 @@ def _exit_message(what: str, cmd: list[str], code: int | None,
             f"{': ' + detail if detail else ''}. {hint}")
 
 
-class MicCapture:
+class MicCapture(Resource):
     """One recorder subprocess plus one reader thread, in whole frames.
 
     The reader rebuffers the pipe — which delivers arbitrary chunk sizes — into
@@ -209,6 +210,10 @@ class MicCapture:
     There is no pre-roll: nothing is recorded until ``start()``, which is the
     click-to-talk guarantee in DESIGN.md rather than an implementation detail.
     """
+
+    resource_kinds = ("capture",)
+    lifecycle_error = AudioError
+    cleanup_method = "stop"
 
     _QUEUE_FRAMES = 512     # ~10 s at 20 ms
     _JOIN_TIMEOUT = 2.0
@@ -255,6 +260,7 @@ class MicCapture:
         """Why capture ended badly, or None. Consult this when read() ends."""
         return self._error
 
+    @starting
     def start(self) -> None:
         """Launch the recorder and begin buffering frames."""
         if self._process is not None:
@@ -269,12 +275,12 @@ class MicCapture:
         self._overruns = 0
         # A temporary file rather than a pipe: the recorder's diagnostics are
         # only wanted if it dies, and a pipe nobody drains would wedge it.
-        stderr = tempfile.TemporaryFile()
+        stderr = self._publish("_stderr", tempfile.TemporaryFile)
         try:
             require_waitable_children()
-            process = subprocess.Popen(
+            process = self._publish("_process", lambda: GroupPopen(
                 cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=stderr, start_new_session=True)
+                stderr=stderr, start_new_session=True))
         except OSError as error:
             stderr.close()
             raise AudioError(
@@ -283,13 +289,27 @@ class MicCapture:
                 "raw s16le mono audio to stdout.") from error
         self._process = process
         self._started = True
-        self._reader = threading.Thread(
+        self._reader = self._publish("_reader", lambda: threading.Thread(
             target=self._read_stream, args=(process, stderr, cmd),
-            name="kilix-voice-mic", daemon=True)
+            name="kilix-voice-mic", daemon=True))
         self._reader.start()
 
     def read(self, timeout: float | None = None) -> bytes | None:
         """Return exactly one frame, or None on timeout or end of stream."""
+        try:
+            return self._read_active(timeout)
+        except AudioError:
+            if not self.lifecycle.requested:
+                raise
+            # Finishing an owned recording drains buffered Python bytes after
+            # the recorder has closed. This touches no child or native handle.
+            return self._read_buffered(0)
+
+    @using
+    def _read_active(self, timeout):
+        return self._read_buffered(timeout)
+
+    def _read_buffered(self, timeout):
         if not self._started:
             raise AudioError(
                 "MicCapture.read() was called before start(). Call start() to "
@@ -312,6 +332,15 @@ class MicCapture:
         if process is not None:
             kill_group(process)
 
+    def _on_close_requested(self):
+        self._stopping.set()
+        self._put(_EOF)
+        if self.lifecycle.starting or self.lifecycle.users:
+            process = self._process
+            if process is not None:
+                kill_group(process)
+
+    @closing
     def stop(self) -> None:
         """Stop the recorder and join the reader. Idempotent."""
         self._stopping.set()
@@ -324,7 +353,7 @@ class MicCapture:
             # the reader blocked after the original recorder already exited.
             kill_group(process)
             process.wait(timeout=self._TERM_TIMEOUT)
-        if reader is not None:
+        if reader is not None and reader.ident is not None:
             reader.join(timeout=self._JOIN_TIMEOUT)
             if reader.is_alive():
                 raise TimeoutError("capture reader cleanup is still running")
@@ -337,6 +366,10 @@ class MicCapture:
         # If interrupted, a later stop still owns everything needed to retry.
         self._process = None
         self._reader = None
+        stderr = getattr(self, "_stderr", None)
+        if stderr is not None:
+            stderr.close()
+            self._stderr = None
         # Guarantees a blocking read() after stop() returns rather than hangs,
         # even if the reader thread outlived its join timeout.
         self._put(_EOF)
@@ -390,7 +423,7 @@ class MicCapture:
                 return
 
 
-class Player:
+class Player(Resource):
     """Queued playback of PCM clips, one sink subprocess per clip.
 
     One worker thread, started on the first ``play()`` so that constructing a
@@ -399,6 +432,10 @@ class Player:
     opening the microphone must silence the machine inside about 100 ms rather
     than at the end of the sentence it happens to be reading.
     """
+
+    resource_kinds = ("player", "sink")
+    lifecycle_error = AudioError
+    closed_message = "Player is closing or closed. Construct a new Player."
 
     _JOIN_TIMEOUT = 2.0
 
@@ -426,6 +463,7 @@ class Player:
         """Why the last clip failed, or None. A new play() clears it."""
         return self._error
 
+    @using
     def play(self, pcm: bytes, rate: int) -> None:
         """Queue one s16le mono clip for playback and return immediately."""
         if self._closed:
@@ -478,6 +516,13 @@ class Player:
         """Block until nothing is playing; True when idle, False on timeout."""
         return self._idle.wait(timeout)
 
+    def _on_close_requested(self):
+        if self.lifecycle.starting or self.lifecycle.users:
+            process = self._process
+            if process is not None:
+                kill_group(process)
+
+    @closing
     def close(self) -> None:
         """Cancel playback and shut the worker down. Idempotent."""
         with self._lock:
@@ -485,7 +530,7 @@ class Player:
             self._closed = True
             worker = self._worker
         self.stop()
-        if worker is not None:
+        if worker is not None and worker.ident is not None:
             if first:
                 self._queue.put(None)
             worker.join(timeout=self._JOIN_TIMEOUT)
@@ -500,11 +545,15 @@ class Player:
         with self._lock:
             self._worker = None
             self._process = None
+        stderr = getattr(self, "_sink_stderr", None)
+        if stderr is not None:
+            stderr.close()
+            self._sink_stderr = None
 
     def _start_worker_locked(self) -> None:
         if self._worker is None:
-            self._worker = threading.Thread(
-                target=self._run, name="kilix-voice-player", daemon=True)
+            self._worker = self._publish("_worker", lambda: threading.Thread(
+                target=self._run, name="kilix-voice-player", daemon=True))
             self._worker.start()
 
     def _clip_done_locked(self) -> None:
@@ -521,12 +570,16 @@ class Player:
             generation, pcm, rate = item
             try:
                 self._play_clip(generation, pcm, rate)
+            except AudioError as error:
+                if not self.lifecycle.requested:
+                    self._error = str(error)
             finally:
                 with self._lock:
                     if self._process is not None and self._process.returncode is not None:
                         self._process = None
                     self._clip_done_locked()
 
+    @using
     def _play_clip(self, generation: int, pcm: bytes, rate: int) -> None:
         """Run one sink process to completion, or until stop() kills it."""
         try:
@@ -536,15 +589,15 @@ class Player:
             # with it: the failure is reported and the next clip still tries.
             self._error = str(error)
             return
-        stderr = tempfile.TemporaryFile()
+        stderr = self._publish("_sink_stderr", tempfile.TemporaryFile)
         try:
             with self._lock:
                 if generation != self._generation:
                     return  # stopped while this clip waited in the queue
                 try:
-                    process = GroupPopen(
+                    process = self._publish("_process", lambda: GroupPopen(
                         cmd, stdin=subprocess.PIPE,
-                        stdout=subprocess.DEVNULL, stderr=stderr)
+                        stdout=subprocess.DEVNULL, stderr=stderr))
                 except OSError as error:
                     self._error = (
                         f"cannot run the playback command {cmd[0]!r}: {error}. "
@@ -564,9 +617,19 @@ class Player:
                     process.stdin.close()
                 except (OSError, ValueError):
                     pass
-            code = process.wait()
+            code = process.wait(timeout=300)
             if code != 0 and generation == self._generation:
                 self._error = _exit_message("playback", cmd, code, stderr,
                                             _PLAYBACK_HINT)
         finally:
-            stderr.close()
+            try:
+                # A launch cancelled inside its allocator publishes its child
+                # and raises before assigning the caller's local variable.
+                process = self._process
+                if process is not None:
+                    kill_group(process)
+                    process.wait(timeout=self._JOIN_TIMEOUT)
+                    if process.stdin is not None:
+                        process.stdin.close()
+            finally:
+                stderr.close()

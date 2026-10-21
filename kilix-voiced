@@ -1169,6 +1169,8 @@ class Daemon(OwnedTurns):
             self._register_cleanup("playback", "player", player)
         with self._cleanup_lock:
             for key, resource in (self._cleanup_owners or {}).items():
+                if isinstance(resource, processes.Resource):
+                    resource.request_close()
                 self._dictation_cleanup_state[key].pending = True
                 if self._failed_dictation_cleanup is None:
                     self._failed_dictation_cleanup = {}

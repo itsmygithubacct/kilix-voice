@@ -140,6 +140,17 @@ class Boundaries8(unittest.TestCase):
 
 class LeaseAcknowledgement(_LeaseFixture):
 
+    def test_quarantine_refuses_acknowledgement_even_if_descriptor_is_open(self):
+        # Quarantine is authoritative even if a provider's release failed
+        # before closing its descriptor. Never turn a later no-op into proof.
+        grant = accelerator.ExecutionGrant(None, lambda error: error)
+        grant._lease = mock.Mock(_fd=71)
+        grant.acknowledgement = 'quarantined'
+        with self.assertRaises(accelerator.AcceleratorRefused):
+            grant.reaped()
+        grant._lease.release.assert_not_called()
+        self.assertFalse(grant._reaped)
+
     def test_failed_acknowledgement_cannot_be_silently_acknowledged_by_retry(self):
         d = _worker_daemon([], jobs.JobLedger())
         d._warn = mock.Mock()
@@ -365,12 +376,12 @@ class RealSpeechChildren(unittest.TestCase):
                     player = mock.Mock()
                     player.error = None
                     d._get_player = lambda: player
-                    turn = voiced._SpeechTurn('real-' + kind, ['fixture'], engine, deadline=time.monotonic() + 0.05)
+                    turn = voiced._SpeechTurn('real-' + kind, ['fixture'], engine, deadline=0.05, clock=lambda: 0.0)
                     d._speech = turn
                     turn.thread = threading.Thread(target=d._run_speech, args=(turn,), daemon=True)
                     try:
                         turn.thread.start()
-                        self.assertTrue(entered.wait(2), 'first cleanup not reached')
+                        self.assertTrue(entered.wait(15), 'first cleanup not reached')
                         child = captured[0]
                         self.assertEqual(os.getpgid(child.pid), child.pid)
                         self.assertIs(engine._process, child)
@@ -406,13 +417,13 @@ class RealSpeechChildren(unittest.TestCase):
         with mock.patch.object(voiced.audio, 'Player', return_value=player):
             self.assertIs(d._get_player(), player)
         entered, release = (threading.Event(), threading.Event())
-        stop = player.stop
+        close_hook = player._on_close_requested
 
         def blocked():
             entered.set()
-            release.wait(10)
-            stop()
-        player.stop = blocked
+            release.wait(15)
+            close_hook()
+        player._on_close_requested = blocked
         try:
             player.play(b'\x00\x00', 16000)
             end = time.monotonic() + 2
@@ -421,6 +432,12 @@ class RealSpeechChildren(unittest.TestCase):
             child = player._process
             self.assertIsNotNone(child)
             self.assertEqual(os.getpgid(child.pid), child.pid)
+            # Establish the blocked first close before measuring shutdown.
+            # Under load its worker need not start within shutdown's budget.
+            key, state = d._register_cleanup('playback', 'player', player)
+            d._prepare_cleanup(key, player, state)
+            d._retry_dictation_cleanup(0)
+            self.assertTrue(entered.wait(15), 'first player cleanup not reached')
             with mock.patch.object(voiced, 'JOIN_TIMEOUT_S', 0.1), mock.patch.object(voiced, 'CLEANUP_SHUTDOWN_WAIT_S', 0.1):
                 start = time.monotonic()
                 d._shutdown()
@@ -431,9 +448,10 @@ class RealSpeechChildren(unittest.TestCase):
             self.assertIn('cleanup unproven', str(d._warn.call_args_list))
         finally:
             release.set()
-            player.stop = stop
+            player._on_close_requested = close_hook
             d._retry_dictation_cleanup(2)
             player.close()
+            d._retry_dictation_cleanup(2)
         self.assertFalse(Path('/proc', str(child.pid)).exists())
         self.assertEqual(d._retained_dictation_cleanup(), [])
 
@@ -471,6 +489,7 @@ class ConstructorOwnership(unittest.TestCase):
         d._wake_w = -1
         entered, release = threading.Event(), threading.Event()
         children = []
+        calls = []
         original_close = stt.WhisperStt.close
         def starting(engine):
             engine._process = subprocess.Popen([sys.executable, '-c', 'import time;time.sleep(60)'],
@@ -478,6 +497,7 @@ class ConstructorOwnership(unittest.TestCase):
             children.append(engine._process)
             raise OSError('construction failed after launch')
         def closing(engine):
+            calls.append(threading.get_ident())
             entered.set()
             release.wait(10)
             original_close(engine)
@@ -502,6 +522,7 @@ class ConstructorOwnership(unittest.TestCase):
                 with mock.patch.object(voiced, 'JOIN_TIMEOUT_S', .1), \
                         mock.patch.object(voiced, 'CLEANUP_SHUTDOWN_WAIT_S', .1):
                     d._shutdown()
+                self.assertEqual(len(calls), 1, 'shutdown starts a second close during constructor cleanup')
                 self.assertTrue(wait_until(lambda: processes.poll_exit(children[0]) is not None, .5))
                 self.assertIn('provider cleanup unproven', str(d._warn.call_args_list))
             finally:

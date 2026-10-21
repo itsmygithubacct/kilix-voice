@@ -33,7 +33,8 @@ import wave
 from typing import NamedTuple
 
 from . import consent, models, paths, protocol, resources, settings
-from .processes import kill_group, poll_exit, require_waitable_children
+from .lifecycle import Resource, constructing, starting, using, closing
+from .processes import GroupPopen, kill_group, poll_exit, require_waitable_children
 from .util import cfg_get
 
 DEFAULT_RATE = 16000
@@ -145,7 +146,7 @@ def _frame_bytes(frame: bytes) -> bytes:
     return data[:len(data) - (len(data) % 2)]
 
 
-class NullStt:
+class NullStt(Resource):
     """The recogniser used when dictation is off, and in tests.
 
     It consumes audio and recognises nothing, so a caller never needs a branch
@@ -154,6 +155,8 @@ class NullStt:
     change the control flow around it.
     """
 
+    resource_kinds = ("null-stt",)
+    lifecycle_error = SttError
     name = "null"
     supports_partials = True
 
@@ -161,21 +164,25 @@ class NullStt:
         self._open = False
         self._closed = False
 
+    @using
     def start_utterance(self) -> None:
         self._require_live()
         self._open = True
 
+    @using
     def feed(self, frame: bytes) -> str | None:
         self._require_live()
         self._require_open()
         _frame_bytes(frame)
         return None
 
+    @using
     def end_utterance(self) -> str:
         self._require_live()
         self._open = False
         return ""
 
+    @closing
     def close(self) -> None:
         self._open = False
         self._closed = True
@@ -294,7 +301,7 @@ def _resolve_model(model_id: str | None = None, model_path: str | None = None,
     return target
 
 
-class VoskStt:
+class VoskStt(Resource):
     """Offline recognition through libvosk, bound directly with ctypes.
 
     One instance owns one model and one recogniser and is not thread-safe: the
@@ -310,6 +317,10 @@ class VoskStt:
     # closes a VAD segment before anyone speaks, ending the turn empty.
     ends_on_words = True
 
+    resource_kinds = ("vosk",)
+    lifecycle_error = SttError
+
+    @constructing
     def __init__(self, rate: int = DEFAULT_RATE, *, model_id: str | None = None,
                  model_path: str | None = None, lib_path: str | None = None,
                  settings_path: str | None = None,
@@ -338,12 +349,13 @@ class VoskStt:
         self._partial = ""
         self._last = ""
 
+        self._owner_ready = True
         if on_owner is not None:
             on_owner(self)
         self._lib.vosk_set_log_level(int(log_level))
         # os.fsencode, not .encode("utf-8"): the model lives under a path the
         # user chose, which need not be valid UTF-8.
-        model = self._lib.vosk_model_new(os.fsencode(self._model_path))
+        model = self._publish("_model", lambda: self._lib.vosk_model_new(os.fsencode(self._model_path)))
         if not model:
             raise SttError(
                 f"libvosk could not open the model at {self._model_path}. The "
@@ -353,19 +365,20 @@ class VoskStt:
                 f"Kilix's voice installer, or point {ENV_MODEL} at the "
                 "directory that directly contains am/ and conf/.")
         self._model = model
-        recogniser = self._lib.vosk_recognizer_new(
-            model, ctypes.c_float(float(self._rate)))
+        recogniser = self._publish("_rec", lambda: self._lib.vosk_recognizer_new(
+            model, ctypes.c_float(float(self._rate))))
         if not recogniser:
             # Nothing else has been handed out yet, so the model is ours to
             # free before the exception leaves the constructor.
-            self._lib.vosk_model_free(model)
-            self._model = None
             raise SttError(
                 f"libvosk could not create a recogniser at {self._rate} Hz for "
                 f"the model at {self._model_path}. Check that the model "
                 "matches the capture rate — the English models Kilix ships are "
                 f"{DEFAULT_RATE} Hz — and that the machine has memory free.")
         self._rec = recogniser
+
+    def _dispose_complete(self):
+        return not self._rec and not self._model
 
     @property
     def rate(self) -> int:
@@ -382,6 +395,7 @@ class VoskStt:
         """Return the model directory that was opened."""
         return self._model_path
 
+    @using
     def start_utterance(self) -> None:
         """Begin a turn, discarding anything an abandoned turn left behind."""
         self._require_live()
@@ -397,6 +411,7 @@ class VoskStt:
         self._last = ""
         self._open = True
 
+    @using
     def feed(self, frame: bytes) -> str | None:
         """Feed one frame; return the turn's text when it changed, else None."""
         self._require_live()
@@ -432,6 +447,7 @@ class VoskStt:
         self._last = rolling
         return rolling
 
+    @using
     def end_utterance(self) -> str:
         """Close the turn and return its full text (never newline-terminated)."""
         self._require_live()
@@ -450,19 +466,20 @@ class VoskStt:
         self._open = False
         return text
 
+    @closing
     def close(self) -> None:
         """Free the recogniser and the model. Safe to call more than once."""
         self._open = False
         self._closed = True
-        # Each handle is cleared before its free() runs, so a second close — or
-        # a close racing a constructor that failed halfway — can never hand a
-        # freed pointer back to the library.  Order mirrors construction.
-        recogniser, self._rec = self._rec, None
-        model, self._model = self._model, None
-        if recogniser is not None:
+        # The shared use count is zero and disposal is exclusive. Keep each
+        # handle until its free returns; a stuck native free remains unproven.
+        recogniser, model = self._rec, self._model
+        if recogniser:
             self._lib.vosk_recognizer_free(recogniser)
-        if model is not None:
+            self._rec = None
+        if model:
             self._lib.vosk_model_free(model)
+            self._model = None
 
     def _require_live(self) -> None:
         if self._closed or self._rec is None:
@@ -583,7 +600,7 @@ def _checked_threads(threads, ceiling: int) -> int:
         raise SttError(f"stt.threads must be an integer, got {threads!r}.") from error
 
 
-class _HeldPayload:
+class _HeldPayload(Resource):
     """Consent bound to held model files, for engines that load them later.
 
     Consent binds bytes, and a child process opens the model after the gate,
@@ -597,12 +614,23 @@ class _HeldPayload:
 
     name = ""
     label = ""
+    lifecycle_error = SttError
+
+    def _on_close_requested(self):
+        self._closed = True
+        if self.lifecycle.starting or self.lifecycle.users:
+            process = self._process
+            if process is not None:
+                kill_group(process)
+
+    def _dispose_complete(self):
+        return self._process is None and not self._held
 
     @property
     def cleanup_complete(self) -> bool:
         # A busy close may only signal and hand reaping to the decode owner.
         # Returning from that close alone cannot acknowledge an accelerator.
-        return self._process is None and not self._held
+        return super().cleanup_complete and self._dispose_complete()
 
     def _hold(self, consented_payload: str | None) -> None:
         self._held: dict[str, tuple[int, str]] = {}
@@ -610,7 +638,12 @@ class _HeldPayload:
             for name in models.REQUIRED_FILES[self.name]:
                 path = os.path.join(self._model_path, name)
                 try:
-                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                    def opened():
+                        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                        self._held[name] = (fd, path)
+                        return self._held
+                    self._publish("_held", opened)
+                    fd = self._held[name][0]
                 except OSError as error:
                     raise SttError(f"cannot open {path}: {error.strerror}.") from error
                 self._held[name] = (fd, path)
@@ -675,7 +708,7 @@ class _HeldPayload:
                 pass
 
 
-class _WholeUtterance:
+class _WholeUtterance(Resource):
     """A turn buffered in full and transcribed at once, with no partials.
 
     ``provisional()`` lets the daemon ask, at a VAD speech end, whether the
@@ -689,16 +722,19 @@ class _WholeUtterance:
     # Read off the class by the daemon, so a stand-in engine never opts in by
     # accident.
     transcribes_at_end = True
+    lifecycle_error = SttError
 
     def _reset_turn(self) -> None:
         self._pcm = bytearray()
         self._provisional: tuple[int, str] | None = None
 
+    @using
     def start_utterance(self) -> None:
         self._require_live()
         self._reset_turn()
         self._open = True
 
+    @using
     def feed(self, frame: bytes) -> str | None:
         self._require_live()
         if not self._open:
@@ -714,6 +750,7 @@ class _WholeUtterance:
         self._pcm += data
         return None
 
+    @using
     def provisional(self) -> str:
         """Transcribe the turn so far; an empty result drops that audio."""
         self._require_live()
@@ -727,6 +764,7 @@ class _WholeUtterance:
             self._reset_turn()
         return text
 
+    @using
     def end_utterance(self) -> str:
         self._require_live()
         if not self._open:
@@ -760,9 +798,16 @@ class VibeVoiceStt(_HeldPayload, _WholeUtterance):
     (:class:`_HeldPayload`).
     """
 
+    resource_kinds = ("vibevoice",)
     name = ENGINE_VIBEVOICE
     label = "VibeVoice"
 
+    def _on_close_requested(self):
+        self._closed = True
+        if self.lifecycle.starting or self.lifecycle.users:
+            self._kill()
+
+    @constructing
     def __init__(self, rate: int = DEFAULT_RATE, *, model_path: str | None = None,
                  threads: int | None = None,
                  consented_payload: str | None = None, on_owner=None) -> None:
@@ -785,6 +830,7 @@ class VibeVoiceStt(_HeldPayload, _WholeUtterance):
         # descriptors and starting the child that inherits them.
         self._lifecycle = threading.Lock()
         self._held = {}
+        self._owner_ready = True
         if on_owner is not None:
             on_owner(self)
         self._hold(consented_payload)
@@ -797,12 +843,22 @@ class VibeVoiceStt(_HeldPayload, _WholeUtterance):
     def model_path(self) -> str:
         return self._model_path
 
+    @using
     def _decode(self, pcm: bytes) -> str:
         seconds = len(pcm) / 2 / self._rate
         work = paths.ensure_private_dir(os.path.join(paths.session_dir(), "stt"))
-        handle, audio_path = tempfile.mkstemp(prefix="vibevoice-", suffix=".wav", dir=work)
+        def allocate_wav():
+            fd, path = tempfile.mkstemp(prefix="vibevoice-", suffix=".wav", dir=work)
+            return os.fdopen(fd, "wb"), path
         try:
-            with os.fdopen(handle, "wb") as raw, wave.open(raw, "wb") as wav:
+            raw, audio_path = self._publish("_wav", allocate_wav)
+        except SttError:
+            if self.lifecycle.requested:
+                return ""
+            raise
+        process = None
+        try:
+            with raw, wave.open(raw, "wb") as wav:
                 wav.setnchannels(1)
                 wav.setsampwidth(2)
                 wav.setframerate(self._rate)
@@ -810,69 +866,80 @@ class VibeVoiceStt(_HeldPayload, _WholeUtterance):
             timeout = VIBEASR_BASE_TIMEOUT_S + VIBEASR_TIMEOUT_PER_AUDIO_S * seconds
             with self._lifecycle:
                 if self._closed:
-                    return ""             # closed before the child started
+                    return ""
                 vae_fd = self._held[VIBEASR_VAE][0]
                 lm_fd = self._held[VIBEASR_LM][0]
-                # The child opens the very files consent verified: the held
-                # descriptors are passed down and named through /proc/self/fd.
                 command = [self._binary,
                            "--vae-model", f"/proc/self/fd/{vae_fd}",
                            "--lm-model", f"/proc/self/fd/{lm_fd}",
                            "--audio", audio_path, "-t", str(self._threads), "--greedy"]
                 self._require_unchanged("since dictation consent was checked")
-                # A local handle: close() on another thread clears
-                # self._process and kills the child, and this thread still
-                # reaps it and closes its pipes through communicate().
-                process = self._process = subprocess.Popen(
+                process = self._publish("_process", lambda: GroupPopen(
                     command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE, start_new_session=True,
-                    pass_fds=(vae_fd, lm_fd))
+                    stderr=subprocess.PIPE, pass_fds=(vae_fd, lm_fd)))
             try:
                 stdout, stderr = process.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
-                process.kill()
-                process.communicate()     # reap it and close both pipes
-                self._process = None
                 raise SttError(
                     f"VibeVoice did not finish transcribing {seconds:.1f} s of "
                     f"audio within {timeout:.0f} s. The machine may be busy; try "
                     "again, or choose a lighter model.") from None
-            returncode = process.returncode
-            with self._lifecycle:
-                self._process = None
-                if self._closed:
-                    return ""
-                self._require_unchanged("while it was being transcribed")
-            if returncode != 0:
+            if self._closed:
+                return ""
+            self._require_unchanged("while it was being transcribed")
+            if process.returncode != 0:
                 detail = _clean_text(stderr.decode("utf-8", "replace"))[-400:]
                 raise SttError(
-                    f"VibeVoice's asr_infer exited with status {returncode}: "
+                    f"VibeVoice's asr_infer exited with status {process.returncode}: "
                     f"{detail or 'no diagnostic'}. Rebuild the runtime with "
                     f"`kilix stt --install {models.VIBEVOICE_MODEL}`.")
             return _clean_text(stdout.decode("utf-8", "replace"))
         finally:
             try:
-                os.unlink(audio_path)
-            except FileNotFoundError:
-                pass
+                if process is None and self.lifecycle.requested:
+                    process = self._process
+                if process is not None:
+                    kill_group(process)
+                    process.wait(timeout=5)
+                    for stream in (process.stdout, process.stderr):
+                        stream.close()
+                    self._process = None
+            finally:
+                try:
+                    os.unlink(audio_path)
+                except FileNotFoundError:
+                    pass
+                self._wav = None
 
+    @closing
     def close(self) -> None:
         self._open = False
         with self._lifecycle:
             self._closed = True
             self._pcm = bytearray()
             self._kill()
+            process = self._process
+            if process is not None:
+                process.wait(timeout=5)
+                for stream in (process.stdout, process.stderr):
+                    stream.close()
+                self._process = None
             self._release()
+            wav = getattr(self, "_wav", None)
+            if wav is not None:
+                wav[0].close()
+                try:
+                    os.unlink(wav[1])
+                except FileNotFoundError:
+                    pass
+                self._wav = None
 
     def cancel(self) -> None:
-        # Also prevents a decode between its WAV write and child startup.
         self.close()
 
     def _kill(self) -> None:
-        # Only kills: the thread in _decode() owns the process and reaps
-        # it, so two threads never communicate() with it at once.
-        process, self._process = self._process, None
-        if process is not None and process.poll() is None:
+        process = self._process
+        if process is not None:
             process.kill()
 
 
@@ -892,6 +959,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
     daemonise: setsid()/setpgid() can escape cleanup and keep a pipe open.
     """
 
+    resource_kinds = ("whisper",)
     name = ENGINE_WHISPER
     label = "Whisper"
     model_id = models.WHISPER_MODEL
@@ -906,6 +974,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
         return [self._binary, "serve", "--model", self._links,
                 "--threads", str(self._threads), "--beam", str(self._beam)]
 
+    @constructing
     def __init__(self, rate: int = DEFAULT_RATE, *, model_path: str | None = None,
                  threads: int | None = None, beam: int | None = None,
                  consented_payload: str | None = None, on_owner=None) -> None:
@@ -934,14 +1003,11 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
         self._links: str | None = None
         self._lifecycle = threading.Lock()
         self._held = {}
+        self._owner_ready = True
         if on_owner is not None:
             on_owner(self)
         self._hold(consented_payload)
-        try:
-            self._start()
-        except BaseException:
-            self.close()
-            raise
+        self._start()
 
     @property
     def rate(self) -> int:
@@ -951,21 +1017,22 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
     def model_path(self) -> str:
         return self._model_path
 
+    @starting
     def _start(self) -> None:
         require_waitable_children()
         work = paths.ensure_private_dir(os.path.join(paths.session_dir(), "stt"))
-        self._links = tempfile.mkdtemp(prefix=self.name + "-", dir=work)
+        self._links = self._publish("_links", lambda: tempfile.mkdtemp(prefix=self.name + "-", dir=work))
         for name, (fd, _path) in self._held.items():
             os.symlink(f"/proc/self/fd/{fd}", os.path.join(self._links, name))
         with self._lifecycle:
             if self._closed:
                 return
             self._require_unchanged("since dictation consent was checked")
-            self._process = subprocess.Popen(
+            self._process = self._publish("_process", lambda: GroupPopen(
                 self._command(),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, start_new_session=True,
-                pass_fds=tuple(fd for fd, _path in self._held.values()))
+                pass_fds=tuple(fd for fd, _path in self._held.values())))
             self._stdout = bytearray()
 
     def _read_reply(self, process: subprocess.Popen, deadline: float, what: str) -> dict:
@@ -1002,6 +1069,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
             raise SttError(f"{self.label} failed {what}: {_clean_text(str(reply['error']))[:400]}.")
         return reply
 
+    @using
     def check_health(self) -> None:
         """Notice process or pipe loss even while PCM is only being buffered."""
         with self._lifecycle:
@@ -1047,6 +1115,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
                     f"Reinstall it with `kilix stt --install {self.model_id}`.") from None
             view = view[written:]
 
+    @using
     def _decode(self, pcm: bytes) -> str:
         seconds = len(pcm) / 2 / self._rate
         with self._lifecycle:
@@ -1118,6 +1187,7 @@ class WhisperStt(_HeldPayload, _WholeUtterance):
                 pass
         process.wait(timeout=5)
 
+    @closing
     def close(self) -> None:
         self._open = False
         with self._lifecycle:
@@ -1157,6 +1227,7 @@ def whistle_missing(model_dir: str | None) -> list[str]:
 
 class WhistleStt(WhisperStt):
     """Whistle uses the same bounded child protocol and held-weight lifecycle."""
+    resource_kinds = ("whistle",)
     name = ENGINE_WHISTLE
     label = "Whistle"
     model_id = models.WHISTLE_MODEL

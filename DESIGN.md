@@ -532,3 +532,94 @@ control that the two orderings differ), that the TUI's `i` key is gated as
 well as the CLI flag (with a covering-receipt control through the same
 keypress), that importing the module creates nothing and imports no authority,
 and that every command the refusal names is one these tools accept.
+
+## Registered resource lifecycle
+
+Every daemon-owned resource implements `voicelib.lifecycle.Resource`. The
+shared `Lifecycle` implements the states **starting**, **ready**, **in use**,
+**closing**, **closed**, and **unproven**. This includes MicCapture, NullStt,
+Vosk, Whisper, Whistle, VibeVoice, eSpeak/MBROLA, Piper, Qwen, the Piper status
+owner, NullTts, and the Player with its worker and sinks. `resource_kinds`
+registers concrete kinds; `tests/test_lifecycle_matrix.py` compares its
+independent matrix with that registry, so a new kind needs a test row.
+
+- A starting operation holds a count before it can allocate. `_publish`
+  retains each allocated handle before dropping its own startup count. If
+  close won while the allocator ran, publication refuses the handoff and
+  signals a late child through its retained group owner. The
+  condition lock is never held across an allocator. Close permanently refuses
+  new operations; shutdown sets this request even for a constructor already
+  doing its own cleanup. A starter that resumes after that request gives up
+  and cleanup covers all published handles. A tagged lifecycle refusal lets
+  synthesis preserve a cancelled turn's outcome while retaining any late
+  child for final close; an unrelated launch error remains a failure.
+  Capture is a one-shot owner: a
+  later turn constructs a new capture.
+- A use count covers every native Vosk call, decoder, synthesis exchange,
+  capture read, and playback operation. Close can signal a private child to
+  interrupt IO, but never frees handles or disposes an active user's state.
+  It waits at most `CLOSE_WAIT_S` (0.1 seconds) for counts to drain. At the
+  deadline it returns **unproven**, with `cleanup_complete == False`, leaving
+  all handles and the registry entry intact. A later retry can prove cleanup.
+- Only one disposal is in flight. This guard also wraps constructor failure
+  cleanup. The daemon's constructor marker prevents even a second public
+  close call during that cleanup; the matrix asserts this separately from
+  the resource's disposal guard.
+- Every child uses `processes.GroupPopen`: a private group, WNOWAIT exit
+  observation, the group's final signal under the group seal, then reaping.
+  The process object remains on the resource until reaping completes.
+  VibeVoice's decoder owns communicate/reap while busy; close signals it and
+  remains pending. Passing work to that decoder never counts as proof.
+- `cleanup_complete` is true only after the shared state reaches closed.
+  The daemon checks that proof before marking its owner closed, acknowledging
+  an ExecutionGrant, or removing an entry. Acknowledgement failures keep the
+  existing retry/quarantine rules. Shutdown starts asynchronous cleanup,
+  spends one shared five-second turn-join budget, independently escalates
+  still-owned groups, then spends one shared additional one-second cleanup
+  budget. It logs every remaining owner as unproven. No close or native free
+  runs on the shutdown thread. GroupPopen waits also have a finite default
+  ceiling; native calls and kernel calls themselves cannot be forced to return.
+
+The conformance matrix gates before, inside and after every handle publication, during
+active use (both Vosk feed and final-result), during the first blocked close,
+and during constructor failure after each publication. It asserts retained
+ownership, bounded shutdown and its warning, independent escalation, no busy
+handoff proof, one disposal at a time, and final group/reap completion. The
+four synthesis variants also cancel inside allocation and assert the terminal
+cancelled outcome, with the late child reaped. The
+player/sink rows cover worker creation and sink creation separately. Null
+engines have no allocating startup or child; the tests state these exceptions.
+Constructors that only validate Python configuration cannot leak native
+resources; their later allocation/publication paths run the startup matrix.
+
+### Work outside the resource matrix
+
+The matrix does not claim to control arbitrary process-wide reapers, group
+escapes, SIGCHLD changes after launch, a kernel-stuck signal syscall, or native
+memory safety inside a provider. Its native Vosk handles are inert fixtures;
+other tests exercise a compiled stub library. No physical device, GPU or real
+model is required by this suite.
+
+The receiver watcher is a turn-local daemon thread. Its finally path signals
+`watch_done` and joins at most `JOIN_TIMEOUT_S`; a stuck watcher can outlive
+that join. Shutdown bounds its parent turn's join and closes the control
+socket/releases the session, but cannot stop a Python thread. The watcher has
+no separate resource entry or escalation handle. The ingest connection
+workers are also daemon threads, limited by admission slots and socket IO
+bounds; a worker stuck in a filesystem or extension call can outlive shutdown.
+Cleanup workers remain attached to their owner state and are reported through
+that state. Recorder reader and player worker threads are covered by their
+resource's join/reap proof. Python interpreter shutdown ends daemon threads;
+it does not constitute a resource/lease acknowledgement.
+
+Vosk's `_load_library` (ctypes/dlopen, symbol binding) precedes the owner
+callback. If its native library initializer hangs, no recognizer/model handle
+has yet been published to the resource registry. The dictation thread is
+joined only to the shared deadline; shutdown can release its session without
+proving that initializer complete. Resolution, settings, consent/digest checks
+and TTS configuration before registration can likewise block in filesystem or
+extension code. They allocate no owned recorder/provider child before the
+callback, but are not cancellable native initializers. Whisper/Whistle and
+VibeVoice native runtime/model loading happens in their registered child
+processes. External Piper/Qwen service processes belong to their respective
+providers; this daemon owns and tests only its client/status processes.

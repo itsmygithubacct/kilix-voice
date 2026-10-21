@@ -78,8 +78,20 @@ class VibeVoiceConsentBindingTests(unittest.TestCase):
         reply = self._send({"op": "owned-dictate", "owner": owner, "hold": False,
                             "silence_ms": 300, "sock": receiver.getsockname()})
         self.assertTrue(reply["ok"], reply)
-        # "listening" is sent after the consent gate and the engine are done.
+        # Owned capture can open before engine preparation finishes. Wait for
+        # the constructor to publish ready ownership before replacing a path;
+        # an early "listening" message proves only that capture has started.
         self.assertEqual(json.loads(receiver.recv(65536)), {"listening": True})
+        ready = False
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            owners = self._send({"op": "status"})["status"]["resource_owners"]
+            ready = any(row["kind"] == "provider" and row["state"] == "active"
+                        for row in owners)
+            if ready:
+                break
+            time.sleep(.01)
+        self.assertTrue(ready, "provider construction did not finish")
         swap = self.model / (stt.VIBEASR_LM + ".new")
         swap.write_bytes(b"lm B")
         os.replace(swap, self.model / stt.VIBEASR_LM)

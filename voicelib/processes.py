@@ -1,4 +1,6 @@
 """Teardown of children launched with start_new_session=True."""
+from .lifecycle import Resource, closing
+
 import contextlib
 import os
 import signal
@@ -97,21 +99,23 @@ class GroupPopen(subprocess.Popen):
         return poll_exit(self)
 
     def wait(self, timeout=None):
+        # No owner wait is unbounded, even for a caller without its own cap.
+        timeout = 300 if timeout is None else timeout
+        deadline = time.monotonic() + timeout
         if not getattr(self, '_voice_group_signalled', False):
-            if timeout is None:
-                while poll_exit(self) is None:
-                    time.sleep(.01)
-            else:
-                wait_exit(self, timeout)
+            wait_exit(self, timeout)
             kill_group(self)
-        return super().wait(timeout=timeout)
+        return super().wait(timeout=max(0, deadline - time.monotonic()))
 
     def kill(self):
         kill_group(self)
 
 
-class SynthesisOwner:
+class SynthesisOwner(Resource):
     """Keep a synthesizer's child through IO and every failed close attempt."""
+
+    resource_kinds = ("piper-status",)
+    lifecycle_error = OSError
 
     def __init__(self):
         self._process = None
@@ -136,6 +140,16 @@ class SynthesisOwner:
             if self._process is process:
                 self._process = None
 
+    def _on_close_requested(self):
+        self._cancelled.set()
+        process = self._process
+        if process is not None and (self.lifecycle.starting or self.lifecycle.users):
+            kill_group(process)
+
+    def _dispose_complete(self):
+        return self._process is None
+
+    @closing
     def close(self):
         self.cancel()
         # A close blocked on IO remains registered. Daemon escalation uses
@@ -151,19 +165,40 @@ class SynthesisOwner:
 
 @contextlib.contextmanager
 def _running_process(owner, *args, **kwargs):
-    with owner._io_lock:
+    life = owner.lifecycle
+    try:
+        life.enter(owner)
+    except OSError:
+        yield None
+        return
+    locked = False
+    process = None
+    try:
+        locked = owner._io_lock.acquire(timeout=2)
+        if not locked:
+            raise TimeoutError("synthesis IO is still in use")
         with owner._process_lock:
-            if owner._cancelled.is_set():
-                process = None
-            else:
+            if not owner._cancelled.is_set():
                 if owner._process is not None:
                     raise OSError('previous synthesis cleanup is unproven')
-                process = owner._process = GroupPopen(*args, **kwargs)
+                try:
+                    process = owner._publish("_process", lambda: GroupPopen(*args, **kwargs))
+                except OSError as error:
+                    if not getattr(error, 'resource_closed', False):
+                        raise
+                    # A late published child stays owned until the final
+                    # close below. The caller still sees cancellation.
         try:
             yield process
         finally:
             if process is not None:
                 owner._finish_process(process)
+    finally:
+        if locked:
+            owner._io_lock.release()
+        life.leave()
+        if life.requested:
+            owner.close()
 
 
 def run_owned(command, *, timeout, owner=None, **kwargs):

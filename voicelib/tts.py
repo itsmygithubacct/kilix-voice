@@ -13,6 +13,8 @@ import and to exercise on a machine with no sound server at all.
 
 from __future__ import annotations
 
+from .lifecycle import using
+
 import json
 import os
 import re
@@ -602,7 +604,7 @@ def speech_chunks(text: str, *, max_chars: int | None) -> list[str]:
 # --------------------------------------------------------------------------
 
 
-class NullTts:
+class NullTts(processes.Resource):
     """The engine for `KILIX_VOICE_TTS_ENGINE=off`: silence, not failure.
 
     Read-aloud that is switched off must still answer a speak request, so the
@@ -610,12 +612,14 @@ class NullTts:
     working pipeline with no audio at the end of it.
     """
 
+    resource_kinds = ("null-tts",)
     name = "null"
     model = "off"
     voice = ""
     rate = 0
     last_provenance: SynthesisProvenance | None = None
 
+    @using
     def synth(self, text: str, *,
               budget: float | None = None) -> tuple[bytes, int]:
         """Return an empty clip regardless of ``text``."""
@@ -629,7 +633,9 @@ class NullTts:
     def cancel(self) -> None:
         """Silence has no process to interrupt."""
 
-    close = cancel
+    @processes.closing
+    def close(self):
+        pass
 
 
 def espeak_binary() -> str | None:
@@ -694,6 +700,7 @@ class EspeakTts(processes.SynthesisOwner):
     for this clip — the caller is told it rather than assuming it.
     """
 
+    resource_kinds = ("espeak", "mbrola")
     name = "espeak"
     # The espeak-ng voice the mbrola tier runs (mb-us1), resolved at
     # construction; None when the tier is off or has nothing to run.
@@ -940,6 +947,7 @@ def piper_status(*, budget: float | None = None) -> tuple[bool, str]:
 class PiperTts(processes.SynthesisOwner):
     """Pinned Kristin synthesis through the isolated persistent provider."""
 
+    resource_kinds = ("piper",)
     name = models.TTS_ENGINE_PIPER
     model = models.PIPER_KRISTIN_MODEL
     voice = PIPER_VOICE

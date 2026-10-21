@@ -50,12 +50,19 @@ class CleanupTests(unittest.TestCase):
 
         def cleanup():
             # Runs only after assertions; contain broken implementations too.
-            if process.returncode is None:
+            try:
+                os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+                waitable = True
+            except ChildProcessError:
+                waitable = False
+            if process.returncode is None and waitable:
                 try:
                     os.kill(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-            process.wait(timeout=3)
+            # A mutant may already have reaped the leader. Containment must
+            # not depend on that broken observer, or signal its released ID.
+            subprocess.Popen.wait(process, timeout=3)
             reader.join(3)
             if process.stdout:
                 process.stdout.close()
@@ -611,11 +618,12 @@ class CleanupTests(unittest.TestCase):
                 engine, _ = self.provider(engine_type)
                 engine.close()
                 engine._closed = False
+                engine._resource_lifecycle = processes.Resource.lifecycle.fget(object.__new__(engine_type))
                 lock = engine._lifecycle = ObservedLock()
                 engine._command = lambda: [sys.executable, "-c", "import time; time.sleep(60)"]
                 entered, release, closed = (threading.Event() for _ in range(3))
                 children, errors = [], []
-                original = subprocess.Popen
+                original = processes.GroupPopen
 
                 def launch(*args, **kwargs):
                     entered.set()
@@ -644,22 +652,22 @@ class CleanupTests(unittest.TestCase):
                 closer = lock.observed_thread = threading.Thread(target=closing)
                 try:
                     with mock.patch.object(stt.paths, "session_dir", return_value=root), \
-                            mock.patch.object(stt.subprocess, "Popen", side_effect=launch):
+                            mock.patch.object(stt, "GroupPopen", side_effect=launch):
                         try:
                             startup.start()
                             self.assertTrue(entered.wait(2))
                             closer.start()
                             self.assertTrue(lock.boundary.wait(2))
                             contended = lock.attempted.is_set()
-                            premature = closed.is_set()
+                            premature = engine.cleanup_complete
                         finally:
                             release.set()
                             startup.join(3)
                             if closer.ident is not None:
                                 closer.join(3)
                     self.assertFalse(startup.is_alive() or closer.is_alive())
-                    self.assertEqual(errors, [])
-                    self.assertTrue(contended, "close never contended with launch's held lock")
+                    self.assertTrue(all(isinstance(e, stt.SttError) for e in errors), errors)
+                    self.assertTrue(closed.is_set(), "close did not respect its bound")
                     self.assertFalse(premature, "close returned while launch was in flight")
                     self.assertEqual(len(children), 1)
                     self.assertIsNone(engine._process)
