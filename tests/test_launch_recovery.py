@@ -12,9 +12,35 @@ from unittest import mock
 
 from voicelib import processes
 from tests.test_terminal_outcomes import voiced
+from tests import test_cleanup_recovery as recovery
 
 
 class Recovery(unittest.TestCase):
+
+    def test_launch_calls_failed_launch_retry(self):
+        with mock.patch.object(processes, 'retry_failed_launches') as retry, mock.patch.object(processes, 'require_waitable_children', side_effect=ValueError('no spawn fixture')):
+            with self.assertRaises(ValueError):
+                processes.GroupPopen(['/bin/true'])
+            retry.assert_called_once_with()
+
+    def test_idle_hook_restores_one_worker_after_construction_failure(self):
+        owner = processes._FailedLaunches()
+        child = mock.Mock(pid=123)
+        with mock.patch.object(processes, '_failed_launches', owner), mock.patch.object(processes, '_dispose_failed_launch') as dispose:
+            with mock.patch.object(threading, 'Thread', side_effect=RuntimeError('fixture cannot construct thread')):
+                owner.retain(child)
+            self.assertIn(child, owner.pending)
+            self.assertIsNone(owner.worker)
+            d = recovery.Boundaries.daemon(self)[0]
+            d._idle_seconds = 0
+            d._owned_expire = mock.Mock()
+            d._check_idle()
+            worker = owner.worker
+            if worker:
+                worker.join(3)
+            self.assertFalse(owner.pending)
+            dispose.assert_called_once_with(child)
+
     def fixture(self, stack):
         owner = processes._FailedLaunches()
         observed = {}

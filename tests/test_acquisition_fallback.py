@@ -12,6 +12,20 @@ from tests.test_process_identity import finish_group
 
 
 class Acquisition(unittest.TestCase):
+
+    def test_acquisition_checks_fd_identity_before_waitability_or_proc_reads(self):
+        from types import SimpleNamespace
+        child = SimpleNamespace(pid=123, _voice_pidfd=17)
+        with mock.patch.object(processes, '_pidfd_pid', return_value=456), mock.patch.object(processes, '_waitid', return_value=None) as wait, mock.patch.object(Path, 'read_text', return_value='PPid:\t' + str(os.getpid()) + '\n'), mock.patch.object(Path, 'read_bytes', return_value=b'_KILIX_GROUP_NONCE=fixture\x00'), mock.patch.object(processes, '_member_stat', return_value=('S', 123, '1')):
+            self.assertFalse(processes._verify_spawn_identity(child, 'fixture'))
+            wait.assert_not_called()
+
+    def test_acquisition_refuses_waitable_exit_without_a_pidfd(self):
+        from types import SimpleNamespace
+        child = SimpleNamespace(pid=123, _voice_pidfd=None)
+        with mock.patch.object(Path, 'read_text', return_value='PPid:\t' + str(os.getpid()) + '\n'), mock.patch.object(Path, 'read_bytes', return_value=b'_KILIX_GROUP_NONCE=fixture\x00'), mock.patch.object(processes, '_member_stat', return_value=('S', 123, '1')), mock.patch.object(processes, '_waitid', return_value=object()):
+            self.assertFalse(processes._verify_spawn_identity(child, 'fixture'))
+
     def contain(self, child):
         # Every PID here belongs to a child this test just started and has
         # never reaped. No identity reuse or external reaper runs in a fixture.

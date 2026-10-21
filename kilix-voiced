@@ -879,6 +879,7 @@ class _CleanupState:
     """Retry bookkeeping, separate from the resource that owns its children."""
 
     def __init__(self, grant=None):
+        self.registration = None
         self.since = time.monotonic()
         self.grant = grant
         self.closed = False
@@ -2571,6 +2572,7 @@ class Daemon(OwnedTurns):
     def _register_cleanup(self, turn_id, kind, resource, grant=None, method="close"):
         """Own a resource before any launch or teardown can block."""
         key = (turn_id, kind)
+        registration = key
         late = False
         with self._cleanup_lock:
             stopping = getattr(self, '_stopping', None)
@@ -2583,9 +2585,27 @@ class Daemon(OwnedTurns):
                 self._cleanup_owners = {}
             if self._dictation_cleanup_state is None:
                 self._dictation_cleanup_state = {}
+            # A delayed finalizer may register after a successor has claimed
+            # this logical slot. Keep both resources, with independent state;
+            # repeated registration of either must find its own generation.
+            for owned_key, owner in self._cleanup_owners.items():
+                if (owner is resource and
+                        self._dictation_cleanup_state[owned_key].registration == registration):
+                    key = owned_key
+                    break
+            else:
+                generation = 0
+                while key in self._cleanup_owners:
+                    generation += 1
+                    key = (f"{turn_id}/cleanup-{generation}", kind)
             new_owner = self._cleanup_owners.get(key) is not resource
             self._cleanup_owners[key] = resource
-            state = self._dictation_cleanup_state.setdefault(key, _CleanupState(grant))
+            if new_owner:
+                state = _CleanupState(grant)
+                state.registration = registration
+                self._dictation_cleanup_state[key] = state
+            else:
+                state = self._dictation_cleanup_state[key]
             if grant is not None:
                 state.grant = grant
             state.method = method
@@ -2701,6 +2721,7 @@ class Daemon(OwnedTurns):
         processes.retry_failed_launches()
         deadline = time.monotonic() + timeout
         waiting = []
+        starting = []
         with self._cleanup_lock:
             for key, resource in (self._failed_dictation_cleanup or {}).items():
                 state = self._dictation_cleanup_state[key]
@@ -2709,16 +2730,23 @@ class Daemon(OwnedTurns):
                 if not state.running:
                     state.running = True
                     state.done.clear()
-                    worker = threading.Thread(
-                        target=self._attempt_dictation_cleanup, args=(key, resource, state),
-                        name=f"kilix-voice-cleanup-{key[0]}-{key[1]}", daemon=True)
-                    try:
-                        worker.start()
-                    except RuntimeError:
-                        state.running = False
-                        state.done.set()
-                        self._warn(f"{key[0]}: {key[1]} cleanup retry could not start; ownership retained")
+                    starting.append((key, resource, state))
                 waiting.append(state.done)
+        # Reserve every attempt under the lock, but release it before starting
+        # threads. Each worker needs it to check its generation; making it wait
+        # for all subsequent Thread.start calls can consume the shared budget
+        # before the first resource even enters close under scheduler load.
+        for key, resource, state in starting:
+            try:
+                worker = threading.Thread(
+                    target=self._attempt_dictation_cleanup, args=(key, resource, state),
+                    name=f"kilix-voice-cleanup-{key[0]}-{key[1]}", daemon=True)
+                worker.start()
+            except RuntimeError:
+                with self._cleanup_lock:
+                    state.running = False
+                    state.done.set()
+                self._warn(f"{key[0]}: {key[1]} cleanup retry could not start; ownership retained")
         for done in waiting:
             done.wait(max(0.0, deadline - time.monotonic()))
 
