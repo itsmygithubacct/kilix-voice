@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 from voicelib import audio, microphone
+import kilix_device_lease as canonical
 from tests.test_tui_shell import load_script
 
 PEER = str(Path(__file__).with_name('microphone_peer.py'))
@@ -21,6 +22,12 @@ PEER = str(Path(__file__).with_name('microphone_peer.py'))
 
 class CaptureTests(unittest.TestCase):
     def setUp(self):
+        # Isolated (-I) peers must use the same explicitly selected lease
+        # component as the parent, including checkouts without sibling repos.
+        source = str(Path(canonical.__file__).resolve().parents[1])
+        environment = mock.patch.dict(os.environ, DEVICE_LEASE_TEST_PATH=source)
+        environment.start()
+        self.addCleanup(environment.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.namespace = str(self.root / 'leases')

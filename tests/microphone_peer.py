@@ -11,7 +11,8 @@ import tempfile
 import time
 lease_source = Path(os.environ.get('DEVICE_LEASE_TEST_SOURCE',
     str(Path(__file__).resolve().parents[2] / 'kilix-system-monitor')))
-sys.path.insert(0, str(lease_source / 'components/kilix-device-lease/src'))
+sys.path.insert(0, os.environ.get('DEVICE_LEASE_TEST_PATH',
+    str(lease_source / 'components/kilix-device-lease/src')))
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from voicelib import audio, device_leases
