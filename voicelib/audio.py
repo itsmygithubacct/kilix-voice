@@ -219,6 +219,12 @@ class MicCapture(Resource):
     _JOIN_TIMEOUT = 2.0
     _TERM_TIMEOUT = 1.0
 
+    def __new__(cls, cfg=None, *, control=None):
+        if cls is MicCapture and control is not None:
+            from .managed_audio import ManagedMicCapture
+            return object.__new__(ManagedMicCapture)
+        return object.__new__(cls)
+
     def __init__(self, cfg: dict | None = None) -> None:
         self._cfg = cfg if cfg is not None else {}
         self._rate = _positive_int(
