@@ -336,18 +336,36 @@ class _FailedLaunches:
         self.condition = threading.Condition()
         self.pending = set()
         self.worker = None
+        self.scheduling_failed = False
 
     def retain(self, process):
         with self.condition:
             self.pending.add(process)
-            if self.worker is None:
-                worker = threading.Thread(target=self._run, daemon=True,
-                                          name='failed-launch-cleanup')
-                worker.start()
-                self.worker = worker
             self.condition.notify_all()
         logging.getLogger(__name__).warning(
             'process group %s: failed launch retained for cleanup retry', process.pid)
+        self.retry()
+
+    def retry(self):
+        """Restart scheduling after thread exhaustion, without losing ownership."""
+        with self.condition:
+            if not self.pending or self.worker is not None:
+                return
+            try:
+                worker = threading.Thread(target=self._run, daemon=True,
+                                          name='failed-launch-cleanup')
+                worker.start()
+            except Exception as error:
+                # The constructor's original typed failure must reach its
+                # caller. A later daemon tick or launch retries scheduling.
+                if not self.scheduling_failed:
+                    logging.getLogger(__name__).warning(
+                        'failed launch cleanup retry could not start (%s); ownership retained',
+                        type(error).__name__)
+                self.scheduling_failed = True
+                return
+            self.worker = worker
+            self.scheduling_failed = False
 
     def _run(self):
         while True:
@@ -371,6 +389,11 @@ class _FailedLaunches:
 _failed_launches = _FailedLaunches()
 
 
+def retry_failed_launches():
+    """Nonblocking recovery hook for periodic daemon work and later launches."""
+    _failed_launches.retry()
+
+
 class GroupPopen(subprocess.Popen):
     """A pipe client whose leader reserves its group until the final signal.
 
@@ -381,6 +404,7 @@ class GroupPopen(subprocess.Popen):
 
     def __init__(self, *args, **kwargs):
         global _pidfd_available
+        retry_failed_launches()
         require_waitable_children()
         if not kwargs.get('close_fds', True) or (len(args) > 7 and not args[7]):
             raise ValueError('GroupPopen does not support close_fds=False; use pass_fds')
@@ -408,6 +432,7 @@ class GroupPopen(subprocess.Popen):
         env['_KILIX_GROUP_NONCE'] = nonce
         kwargs['env'] = env
         parent, child = socket.socketpair()
+        admitted = False
         try:
             kwargs['pass_fds'] = (*kwargs.get('pass_fds', ()), child.fileno())
             launch = [sys.executable, '-I', '-B', '-S', str(Path(__file__).with_name('process_launch.py')), str(child.fileno())]
@@ -434,6 +459,7 @@ class GroupPopen(subprocess.Popen):
             if not verified:
                 _identity_unproven(self)
                 return
+            admitted = True
             executables = [executable] if os.path.dirname(executable) else [
                 os.path.join(directory, executable) for directory in os.get_exec_path(target_env)]
             request = marshal.dumps(dict(argv=argv, executables=executables, env=target_env,
@@ -446,26 +472,43 @@ class GroupPopen(subprocess.Popen):
             while part := parent.recv(65536):
                 reply.extend(part)
             if reply != b'X':
+                failure = bytes(reply).removeprefix(b'X')
+                if failure.startswith(b'F'):
+                    kind, code, message = marshal.loads(failure[1:])
+                    if kind == 'ValueError':
+                        raise ValueError(message)
+                    if kind == 'TypeError':
+                        raise TypeError(message)
+                    if isinstance(code, int):
+                        raise OSError(code, message, executable)
+                    raise RuntimeError('process launcher failed: ' + message)
+                raise RuntimeError('process launcher failed before exec')
+        except BaseException:
+            # After admission we own this launcher, even when protocol IO
+            # fails before a reply can be decoded. Never strand it in
+            # subprocess's passive list or replace the original exception.
+            if admitted:
                 try:
-                    failure = bytes(reply).removeprefix(b'X')
-                    if failure.startswith(b'F'):
-                        kind, code, message = marshal.loads(failure[1:])
-                        if kind == 'ValueError':
-                            raise ValueError(message)
-                        if kind == 'TypeError':
-                            raise TypeError(message)
-                        if isinstance(code, int):
-                            raise OSError(code, message, executable)
-                        raise RuntimeError('process launcher failed: ' + message)
-                    raise RuntimeError('process launcher failed before exec')
-                finally:
+                    _dispose_failed_launch(self)
+                except Exception:
+                    _failed_launches.retain(self)
+            raise
+        finally:
+            failing = sys.exc_info()[0] is not None
+            close_error = None
+            for channel in (parent, child):
+                try:
+                    channel.close()
+                except Exception as error:
+                    if close_error is None:
+                        close_error = error
+            if close_error is not None and not failing:
+                if admitted:
                     try:
                         _dispose_failed_launch(self)
                     except Exception:
                         _failed_launches.retain(self)
-        finally:
-            parent.close()
-            child.close()
+                raise close_error
 
     def poll(self):
         return poll_exit(self)

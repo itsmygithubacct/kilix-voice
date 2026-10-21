@@ -1128,6 +1128,7 @@ class Daemon(OwnedTurns):
             pass  # nothing buffered, or the pipe is closing under us
 
     def _check_idle(self) -> None:
+        processes.retry_failed_launches()
         self._owned_expire()
         if self._idle_seconds <= 0:
             return
@@ -1833,7 +1834,7 @@ class Daemon(OwnedTurns):
             self._prepare_cleanup(key, turn.engine, state)
             # The worker owns the first attempt just as dictation does.
             with self._cleanup_lock:
-                first = not state.running
+                first = self._cleanup_current(key, turn.engine, state) and not state.running
                 if first:
                     state.running = True
                     state.done.clear()
@@ -2599,8 +2600,18 @@ class Daemon(OwnedTurns):
                        "allocation refused; cleanup ownership retained")
         return key, state
 
+    def _cleanup_current(self, key, resource, state):
+        """Check the registration generation while holding _cleanup_lock."""
+        return ((self._dictation_cleanup_state or {}).get(key) is state
+                and (self._cleanup_owners or {}).get(key) is resource)
+
     def _prepare_cleanup(self, key, resource, state):
         with self._cleanup_lock:
+            # Registration may have completed cleanup while this caller was
+            # outside the lock. A stale state cannot republish that owner or
+            # overwrite a successor registered under the same key.
+            if not self._cleanup_current(key, resource, state):
+                return
             state.pending = True
             if self._failed_dictation_cleanup is None:
                 self._failed_dictation_cleanup = {}
@@ -2621,6 +2632,8 @@ class Daemon(OwnedTurns):
         first_error = None
         for key, resource, state in entries:
             with self._cleanup_lock:
+                if not self._cleanup_current(key, resource, state):
+                    continue
                 if state.running:
                     error = RuntimeError("dictation cleanup is still running")
                     if first_error is None:
@@ -2639,6 +2652,9 @@ class Daemon(OwnedTurns):
                 and getattr(state.grant, "acknowledgement", None) == "quarantined")
 
     def _attempt_dictation_cleanup(self, key, resource, state) -> Exception | None:
+        with self._cleanup_lock:
+            if not self._cleanup_current(key, resource, state):
+                return None
         turn_id, kind = key
         try:
             try:
@@ -2652,21 +2668,23 @@ class Daemon(OwnedTurns):
             except Exception as error:
                 with self._cleanup_lock:
                     state.failed = True
-                    if self._failed_dictation_cleanup is None:
-                        self._failed_dictation_cleanup = {}
-                    self._failed_dictation_cleanup[key] = resource
+                    if self._cleanup_current(key, resource, state):
+                        if self._failed_dictation_cleanup is None:
+                            self._failed_dictation_cleanup = {}
+                        self._failed_dictation_cleanup[key] = resource
                 # Exception text can contain command arguments or heard text.
                 self._warn(f"{turn_id}: {kind} cleanup failed "
                            f"({type(error).__name__}); ownership retained")
                 return error
             else:
                 with self._cleanup_lock:
-                    if self._failed_dictation_cleanup is not None:
-                        self._failed_dictation_cleanup.pop(key, None)
-                    self._dictation_cleanup_state.pop(key, None)
-                    self._cleanup_owners.pop(key, None)
-                    if kind == "player" and getattr(self, "_player", None) is resource:
-                        self._player = None
+                    if self._cleanup_current(key, resource, state):
+                        if self._failed_dictation_cleanup is not None:
+                            self._failed_dictation_cleanup.pop(key, None)
+                        self._dictation_cleanup_state.pop(key, None)
+                        self._cleanup_owners.pop(key, None)
+                        if kind == "player" and getattr(self, "_player", None) is resource:
+                            self._player = None
                 return None
         finally:
             with self._cleanup_lock:
@@ -2680,6 +2698,7 @@ class Daemon(OwnedTurns):
         owner an attempt even if another blocks in close/reap/lease release.
         Those threads retain ownership after this caller's wait expires.
         """
+        processes.retry_failed_launches()
         deadline = time.monotonic() + timeout
         waiting = []
         with self._cleanup_lock:
@@ -3098,7 +3117,7 @@ class Daemon(OwnedTurns):
                 # Status completes only its own inspection; it never retries
                 # another owner's cleanup or touches an audio device.
                 with self._cleanup_lock:
-                    first = not state.running
+                    first = self._cleanup_current(key, owner, state) and not state.running
                     if first:
                         state.running = True
                         state.done.clear()
