@@ -914,6 +914,7 @@ class Daemon(OwnedTurns):
     _cleanup_owners: dict | None = None
     _failed_dictation_cleanup: dict | None = None
     _dictation_cleanup_state: dict | None = None
+    _tts_inspecting = False
 
     def __init__(self, *, config_path: str | None = None,
                  idle_seconds: float | None = None,
@@ -3122,7 +3123,7 @@ class Daemon(OwnedTurns):
         return protocol.reply_ok(request["id"], status=payload)
 
     def _tts_status(self, deadline: float | None = None) -> dict:
-        """Report read-aloud without launching anything.
+        """Report read-aloud, with at most one unproven provider inspection.
 
         The Piper probe is the one step here that runs a process, so it gets
         the caller's remaining budget and raises TtsDeadlineExceeded when that
@@ -3136,21 +3137,41 @@ class Daemon(OwnedTurns):
                 f"{settings.KEY_TTS_ENGINE}=espeak to enable it.")}
         if engine == models.TTS_ENGINE_PIPER:
             budget = None if deadline is None else deadline - time.monotonic()
-            owner = processes.SynthesisOwner()
-            key, state = self._register_cleanup(self._next_turn_id("probe"), "synthesiser", owner)
+            if budget is not None and budget <= 0:
+                raise tts_lib.TtsDeadlineExceeded(
+                    "the request deadline elapsed before the speech provider could be checked")
+            with self._cleanup_lock:
+                # Reserve before constructing/registering a probe. A parallel
+                # status must answer without launching another one, including
+                # while the first inspection has not reached teardown yet.
+                blocked = self._tts_inspecting or bool(self._failed_dictation_cleanup)
+                if not blocked:
+                    self._tts_inspecting = True
+            if blocked:
+                return {"engine": engine, "model": models.PIPER_KRISTIN_MODEL,
+                        "voice": tts_lib.PIPER_VOICE, "available": False,
+                        "detail": ("speech provider inspection is blocked by another "
+                                   "inspection or unproven voice cleanup; status still "
+                                   "reports every retained resource. Retry after cleanup completes.")}
             try:
-                available, detail = tts_lib.piper_probe(budget=budget, owner=owner)
-            finally:
-                self._prepare_cleanup(key, owner, state)
-                # Status completes only its own inspection; it never retries
-                # another owner's cleanup or touches an audio device.
-                with self._cleanup_lock:
-                    first = self._cleanup_current(key, owner, state) and not state.running
+                owner = processes.SynthesisOwner()
+                key, state = self._register_cleanup(self._next_turn_id("probe"), "synthesiser", owner)
+                try:
+                    available, detail = tts_lib.piper_probe(budget=budget, owner=owner)
+                finally:
+                    self._prepare_cleanup(key, owner, state)
+                    # Status completes only its own inspection; it never retries
+                    # another owner's cleanup or touches an audio device.
+                    with self._cleanup_lock:
+                        first = self._cleanup_current(key, owner, state) and not state.running
+                        if first:
+                            state.running = True
+                            state.done.clear()
                     if first:
-                        state.running = True
-                        state.done.clear()
-                if first:
-                    self._attempt_dictation_cleanup(key, owner, state)
+                        self._attempt_dictation_cleanup(key, owner, state)
+            finally:
+                with self._cleanup_lock:
+                    self._tts_inspecting = False
             return {
                 "engine": engine,
                 "model": models.PIPER_KRISTIN_MODEL,
