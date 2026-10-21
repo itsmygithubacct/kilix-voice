@@ -18,16 +18,21 @@ class IdentityTests(unittest.TestCase):
         for fallback, disposition in ((f, d) for f in (False, True) for d in ('waitpid', 'ignore')):
             with self.subTest(fallback=fallback, disposition=disposition), \
                     mock.patch.object(processes, '_pidfd_group_supported', False if fallback else None):
-                child = processes.GroupPopen(['/bin/sleep', '.05'])
+                # Keep the child alive until the disposition is installed.
+                # SIG_IGN does not reap a zombie that predates the change.
+                child = processes.GroupPopen(['/bin/cat'], stdin=subprocess.PIPE,
+                                             stdout=subprocess.DEVNULL)
                 previous = signal.getsignal(signal.SIGCHLD)
                 try:
                     if disposition == 'ignore':
                         signal.signal(signal.SIGCHLD, signal.SIG_IGN)
-                        deadline = time.monotonic() + 3
+                        child.stdin.close()
+                        deadline = time.monotonic() + 15
                         while Path(f'/proc/{child.pid}').exists():
                             self.assertLess(time.monotonic(), deadline)
                             time.sleep(.005)
                     else:
+                        child.stdin.close()
                         os.waitpid(child.pid, 0)
                     with mock.patch.object(processes.os, 'killpg') as numeric:
                         error = None
@@ -45,6 +50,7 @@ class IdentityTests(unittest.TestCase):
                         child.wait(timeout=.1)
                 finally:
                     signal.signal(signal.SIGCHLD, previous)
+                    child.stdin.close()
                     # Only this already exited child; no signal by stale PID.
                     try:
                         subprocess.Popen.wait(child, timeout=2)
