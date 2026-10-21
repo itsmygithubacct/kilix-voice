@@ -228,6 +228,14 @@ class WhisperEngineTests(WhisperFixture):
             with self.subTest(mode=mode):
                 os.environ["FAKE_WHISPER_MODE"] = mode
                 engine = self.engine()
+                if mode == "crash":
+                    # EOF can arrive before the kernel publishes exit status.
+                    # This case checks a known exit code; live-EOF refusal has
+                    # separate liveness coverage and must not wait for exit.
+                    deadline = time.monotonic() + 3
+                    while stt.poll_exit(engine._process) is None and time.monotonic() < deadline:
+                        time.sleep(.005)
+                    self.assertEqual(stt.poll_exit(engine._process), 7)
                 with self.assertRaisesRegex(stt.SttError, pattern):
                     self.turn(engine, SPEECH)
 
