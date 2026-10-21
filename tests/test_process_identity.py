@@ -14,21 +14,30 @@ from voicelib import processes
 
 
 def finish_group(test, child):
-    """A bounded backend may retain ownership when a loaded scan expires.
+    """Routing fixture: exactly one owned /bin/sleep, incapable of forking.
 
-    Retry that valid unproven outcome; assert it never seals or drops proof.
-    The test still requires eventual cleanup of its finite, non-forking child.
+    Scope enumeration and the creation counter to this known fixture. Host
+    process churn is irrelevant to signal routing and can legitimately deny
+    production's global scan proof. test_member_scan covers that refusal and
+    actual concurrent forks, without this fixture view.
     """
-    for _ in range(3):
-        try:
-            processes.kill_group(child)
-            return
-        except TimeoutError:
-            test.assertFalse(getattr(child, '_voice_group_signalled', False),
-                             'an incomplete scan was sealed as cleanup')
-            test.assertIsNotNone(child._voice_pidfd, 'timeout discarded identity')
-            test.assertIsNone(child.returncode, 'timeout fabricated a reap')
-    test.fail('finite fixture group did not complete across bounded retries')
+    enumerate_entries = Path.iterdir
+    def entries(path):
+        if path == Path('/proc'):
+            return iter([path / str(child.pid)])
+        return enumerate_entries(path)
+    with mock.patch.object(Path, 'iterdir', entries), \
+            mock.patch.object(processes, '_birth_count', return_value=0):
+        for _ in range(3):
+            try:
+                processes.kill_group(child)
+                return
+            except TimeoutError:
+                test.assertFalse(getattr(child, '_voice_group_signalled', False),
+                                 'an incomplete scan was sealed as cleanup')
+                test.assertIsNotNone(child._voice_pidfd, 'timeout discarded identity')
+                test.assertIsNone(child.returncode, 'timeout fabricated a reap')
+        test.fail('finite fixture group did not complete across bounded retries')
 
 
 class IdentityTests(unittest.TestCase):
@@ -183,7 +192,7 @@ class IdentityTests(unittest.TestCase):
             finally:
                 # Contain a mutant that seals a mocked (undelivered) signal.
                 signal.pidfd_send_signal(child._voice_pidfd, signal.SIGKILL)
-                processes.kill_group(child)
+                finish_group(self, child)
                 child.wait(timeout=2)
 
     def test_unsupported_group_flag_is_detected_once(self):
