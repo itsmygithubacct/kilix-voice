@@ -21,7 +21,7 @@ from unittest import mock
 
 from tests.test_dictation_waits_for_words import FrameCapture, pop_then_words
 from tests.test_terminal_outcomes import _LiveTurnsFixture, voiced
-from voicelib import consent, models, paths, stt
+from voicelib import consent, models, paths, processes, stt
 
 FAKE_PROVIDER = r"""#!{python}
 import hashlib, json, os, sys, time
@@ -228,6 +228,11 @@ class WhisperEngineTests(WhisperFixture):
             with self.subTest(mode=mode):
                 os.environ["FAKE_WHISPER_MODE"] = mode
                 engine = self.engine()
+                if mode == "crash":
+                    # EOF can arrive just before the kernel publishes exit.
+                    # This diagnostic test requires the known status; retain
+                    # the zombie while establishing that fixture boundary.
+                    self.assertEqual(processes.wait_exit(engine._process, 15), 7)
                 with self.assertRaisesRegex(stt.SttError, pattern):
                     self.turn(engine, SPEECH)
 
