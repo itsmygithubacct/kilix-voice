@@ -4,6 +4,12 @@ from .lifecycle import Resource, closing
 import contextlib
 import errno
 import logging
+import json
+from pathlib import Path
+import secrets
+import select
+import socket
+import sys
 import os
 import signal
 import subprocess
@@ -46,6 +52,117 @@ def _waitid(process):
     return os.waitid(os.P_PID, process.pid, flags)
 
 
+def _pidfd_pid(fd):
+    for line in Path(f'/proc/self/fdinfo/{fd}').read_text().splitlines():
+        if line.startswith('Pid:'):
+            return int(line.split()[1])
+    raise OSError('pidfd identity unavailable')
+
+
+def _verify_spawn_identity(process, nonce):
+    """The trusted launcher is still gated; it cannot normally exit or exec."""
+    fd = process._voice_pidfd
+    if fd is not None and _pidfd_pid(fd) != process.pid:
+        return False
+    status = Path(f'/proc/{process.pid}/status').read_text()
+    parent = next(line for line in status.splitlines() if line.startswith('PPid:'))
+    if int(parent.split()[1]) != os.getpid():
+        return False
+    if _member_stat(process.pid)[1] != process.pid:
+        return False
+    environ = Path(f'/proc/{process.pid}/environ').read_bytes().split(b'\0')
+    if ('_KILIX_GROUP_NONCE=' + nonce).encode() not in environ:
+        return False
+    if _waitid(process) is not None:
+        return False  # the gated launcher died before admission
+    if fd is not None:
+        # On Linux 5.3 waitid(P_PIDFD) falls back to P_PID. Poll and fdinfo
+        # still refer to the original process, even if an outside reaper ran.
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        if poller.poll(0) or _pidfd_pid(fd) != process.pid:
+            return False
+    return True
+
+
+def _identity_unproven(process):
+    process._voice_identity_unproven = True
+    logging.getLogger(__name__).warning(
+        'process group %s: acquisition identity unproven; cleanup unproven', process.pid)
+    _close_pidfd(process)
+
+
+def _member_stat(pid):
+    fields = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
+    return fields[0], int(fields[2]), fields[19]  # state, pgrp, starttime
+
+
+def _scan_group_members(group):
+    """Open stable handles, then validate membership again after each open."""
+    members = []
+    try:
+        for entry in Path('/proc').iterdir():
+            if not entry.name.isdecimal():
+                continue
+            pid = int(entry.name)
+            fd = None
+            try:
+                before = _member_stat(pid)
+                if before[1] != group or before[0] in ('Z', 'X'):
+                    continue
+                fd = os.pidfd_open(pid)
+                after = _member_stat(pid)
+                if after[1:] != before[1:] or _pidfd_pid(fd) != pid:
+                    continue
+                members.append(fd)
+                fd = None
+            except (FileNotFoundError, ProcessLookupError):
+                pass  # member exited during enumeration
+            finally:
+                if fd is not None:
+                    os.close(fd)
+        return members
+    except BaseException:
+        for fd in members:
+            os.close(fd)
+        raise
+
+
+def _check_leader(process):
+    # Never replace the stable leader check with a check of its number alone.
+    fd = process._voice_pidfd
+    if _pidfd_pid(fd) != process.pid:
+        raise ChildProcessError('outside reap')
+    _waitid(process)
+    if _pidfd_pid(fd) != process.pid:
+        raise ChildProcessError('outside reap')
+
+
+def _kill_members(process):
+    """Older pidfd kernels: bounded rescans, with no numeric signal at all."""
+    deadline = time.monotonic() + 1.0
+    while True:
+        _check_leader(process)
+        members = _scan_group_members(process.pid)
+        try:
+            # The unreaped leader pins the group number over the entire scan.
+            # If that proof was lost, none of the collected handles is used.
+            _check_leader(process)
+            if not members:
+                return
+            for fd in members:
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGKILL, None, 0)
+                except ProcessLookupError:
+                    pass  # this exact member already exited
+        finally:
+            for fd in members:
+                os.close(fd)
+        if time.monotonic() >= deadline:
+            raise TimeoutError('process group members remain; cleanup unproven')
+        time.sleep(.002)
+
+
 def require_waitable_children() -> None:
     """Establish exclusive reaping before creating an owned group leader."""
     if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
@@ -63,7 +180,7 @@ def poll_exit(process: subprocess.Popen) -> int | None:
     Only the teardown owner reaps, after the last possible group signal.
     """
     with _group_lock:
-        if getattr(process, '_voice_outside_reap', False):
+        if getattr(process, '_voice_outside_reap', False) or getattr(process, '_voice_identity_unproven', False):
             return None
         if process.returncode is not None:
             return process.returncode
@@ -84,6 +201,8 @@ def wait_exit(process: subprocess.Popen, timeout: float) -> int:
         code = poll_exit(process)
         if code is not None:
             return code
+        if getattr(process, '_voice_identity_unproven', False):
+            raise ChildProcessError('acquisition identity unproven')
         if getattr(process, '_voice_outside_reap', False):
             raise ChildProcessError('outside reap; process group cleanup is unproven')
         left = deadline - time.monotonic()
@@ -109,7 +228,7 @@ def kill_group(process: subprocess.Popen) -> None:
     with _group_lock:
         if getattr(process, "_voice_group_signalled", False):
             return
-        if getattr(process, '_voice_outside_reap', False):
+        if getattr(process, '_voice_outside_reap', False) or getattr(process, '_voice_identity_unproven', False):
             return
         if process.returncode is not None:
             # Defensive refusal for an object reaped outside our ownership
@@ -129,17 +248,29 @@ def kill_group(process: subprocess.Popen) -> None:
                     _pidfd_group_supported = True
                     process._voice_group_signalled = True
                     return
-            # Older kernels: retain the leader, check waitability immediately
-            # before killpg, and reject automatic reaping. An outside reaper
-            # can still race between this check and the numeric syscall.
-            try:
-                _waitid(process)
-            except ChildProcessError:
-                _outside_reap(process)
-                return
+            if fd is not None:
+                try:
+                    _check_leader(process)
+                except ChildProcessError:
+                    _outside_reap(process)
+                    return
             if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
                 raise OSError('changed SIGCHLD disposition; group cleanup unproven')
-            os.killpg(process.pid, signal.SIGKILL)
+            if fd is not None:
+                try:
+                    _kill_members(process)
+                except ChildProcessError:
+                    _outside_reap(process)
+                    return
+            else:
+                # Only kernels without pidfd_open use numeric signals. This
+                # path still requires exclusive reaping through the syscall.
+                try:
+                    _waitid(process)
+                except ChildProcessError:
+                    _outside_reap(process)
+                    return
+                os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             # ESRCH alone is not proof: the leader may have been reaped by
             # somebody else while descendants still own devices or pipes.
@@ -161,21 +292,69 @@ class GroupPopen(subprocess.Popen):
         global _pidfd_available
         require_waitable_children()
         self._voice_pidfd = None
+        self._voice_identity_unproven = False
         kwargs['start_new_session'] = True
-        super().__init__(*args, **kwargs)
-        if _pidfd_available:
+        if not _pidfd_available:
+            super().__init__(*args, **kwargs)
+            return
+        # A gated exec avoids the uncheckable nonce of an already dead child.
+        # No preexec_fn is used: that would be unsafe in this threaded daemon.
+        command = args[0] if args else kwargs.pop('args')
+        argv = [os.fsdecode(command)] if isinstance(command, (str, bytes, os.PathLike)) else [os.fsdecode(x) for x in command]
+        executable = kwargs.pop('executable', None)
+        if kwargs.pop('shell', False):
+            argv = [os.fsdecode(executable or '/bin/sh'), '-c', *argv]
+            executable = argv[0]
+        executable = os.fsdecode(executable) if executable is not None else argv[0]
+        nonce = secrets.token_hex(32)
+        env = kwargs.get('env')
+        env = {os.fsdecode(k): os.fsdecode(v) for k, v in (os.environ if env is None else env).items()}
+        target_env = env.copy()
+        env['_KILIX_GROUP_NONCE'] = nonce
+        kwargs['env'] = env
+        parent, child = socket.socketpair()
+        try:
+            kwargs['pass_fds'] = (*kwargs.get('pass_fds', ()), child.fileno())
+            launch = [sys.executable, '-I', '-B', '-S', str(Path(__file__).with_name('process_launch.py')), str(child.fileno())]
+            super().__init__(launch, *args[1:], **kwargs)
+            self.args = command
+            child.close()
+            if parent.recv(1) != b'R':
+                _identity_unproven(self)
+                return
             try:
                 self._voice_pidfd = os.pidfd_open(self.pid)
             except OSError as error:
                 if error.errno == errno.ENOSYS:
                     _pidfd_available = False
                 else:
-                    # Keep ownership even if the descriptor limit is reached;
-                    # the checked fallback can still clean up this child.
-                    logging.getLogger(__name__).warning(
-                        'process group %s: pidfd unavailable; using checked fallback', self.pid)
+                    _identity_unproven(self)
+                    return
             else:
                 os.set_inheritable(self._voice_pidfd, False)
+            try:
+                verified = _verify_spawn_identity(self, nonce)
+            except (OSError, ValueError, StopIteration):
+                verified = False
+            if not verified:
+                _identity_unproven(self)
+                return
+            parent.sendall((json.dumps(dict(argv=argv, executable=executable, env=target_env,
+                restore_signals=kwargs.get('restore_signals', True))) + '\n').encode())
+            # EOF is exec success. On failure the launcher reports errno before
+            # exiting; the verified owner still retires it before raising.
+            failure = parent.recv(32)
+            if failure:
+                kill_group(self)
+                self.wait(timeout=2)
+                for stream in (self.stdin, self.stdout, self.stderr):
+                    if stream is not None:
+                        stream.close()
+                code = int(failure)
+                raise OSError(code, os.strerror(code), executable)
+        finally:
+            parent.close()
+            child.close()
 
     def poll(self):
         return poll_exit(self)
@@ -200,6 +379,8 @@ class GroupPopen(subprocess.Popen):
             return pid, status
 
     def wait(self, timeout=None):
+        if getattr(self, '_voice_identity_unproven', False):
+            raise ChildProcessError('acquisition identity unproven; process group cleanup is unproven')
         if getattr(self, '_voice_outside_reap', False):
             raise ChildProcessError('outside reap; process group cleanup is unproven')
         # No owner wait is unbounded, even for a caller without its own cap.

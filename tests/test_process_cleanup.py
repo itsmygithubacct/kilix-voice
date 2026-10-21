@@ -43,9 +43,9 @@ class ObservedLock:
 @unittest.skipUnless(sys.platform.startswith("linux"), "Linux waitid and groups")
 class CleanupTests(unittest.TestCase):
     def setUp(self):
-        # Exercise the guarded older-kernel backend on current kernels too.
+        # Exercise the legacy kernel without pidfd_open on current kernels too.
         # The matrix and test_process_identity exercise the pidfd backend.
-        backend = mock.patch.object(processes, '_pidfd_group_supported', False)
+        backend = mock.patch.object(processes, '_pidfd_available', False)
         backend.start()
         self.addCleanup(backend.stop)
 

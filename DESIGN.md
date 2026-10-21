@@ -537,11 +537,12 @@ and that every command the refusal names is one these tools accept.
 
 Every daemon-owned resource implements `voicelib.lifecycle.Resource`. The
 shared `Lifecycle` implements the states **starting**, **ready**, **in use**,
-**closing**, **closed**, and **unproven**. This includes MicCapture, NullStt,
+**closing**, **closed**, and **unproven**. This includes ordinary and managed MicCapture, NullStt,
 Vosk, Whisper, Whistle, VibeVoice, eSpeak/MBROLA, Piper, Qwen, the Piper status
 owner, NullTts, and the Player with its worker and sinks. `resource_kinds`
 registers concrete kinds; `tests/test_lifecycle_matrix.py` compares its
-independent matrix with that registry, so a new kind needs a test row.
+independent matrix with that registry and instantiates both capture factory
+variants, so a concrete factory result cannot bypass the inventory.
 
 - A starting operation holds a count before it can allocate. `_publish`
   retains each allocated handle before dropping its own startup count. If
@@ -568,25 +569,63 @@ independent matrix with that registry, so a new kind needs a test row.
   cleanup. The daemon's constructor marker prevents even a second public
   close call during that cleanup; the matrix asserts this separately from
   the resource's disposal guard.
-- Every child uses `processes.GroupPopen`: a private group, WNOWAIT exit
-  observation, the group's final signal under the group seal, then reaping.
-  GroupPopen opens a close-on-exec pidfd immediately after spawning under the
-  default SIGCHLD precondition. On Linux >= 6.9 the final signal uses
-  `pidfd_send_signal(fd, SIGKILL, None, 1 << 2)` (process-group scope), so
-  neither an outside reap nor a syscall-entry delay can retarget a reused PID.
-  The pidfd stays open until final reap. ECHILD/outside reap is logged and
-  never becomes a fabricated successful exit; ESRCH alone is not proof.
-  A missing pidfd API/ENOSYS or unsupported flag/EINVAL selects the fallback.
-  Immediately before numeric killpg, it checks waitability using
-  `waitid(P_PIDFD, WEXITED|WNOHANG|WNOWAIT)` and refuses a changed SIGCHLD
-  disposition. Without pidfd wait support it uses P_PID. A zombie is still
-  waitable and keeps its identity; ECHILD forbids the signal. This fallback
-  retains a narrow outside-reap/PID-reuse window between check and syscall,
-  including when a tracer delays syscall entry. Linux >= 6.9 closes that
-  window. No numeric group signal is authorized by a stored number alone.
-  The process object remains on the resource until reaping completes.
-  VibeVoice's decoder owns communicate/reap while busy; close signals it and
-  remains pending. Passing work to that decoder never counts as proof.
+- Ordinary process owners use `processes.GroupPopen`: a private group,
+  WNOWAIT exit observation, final signal under the group seal, then reaping.
+  On pidfd-capable systems a small isolated Python launcher waits on a private
+  inherited socket before executing the requested program. The parent opens
+  a non-inherited pidfd, checks its fdinfo PID, checks `/proc/<pid>/status`
+  PPid against its own PID and the child's environment against a random
+  per-spawn nonce, then checks waitability and pidfd liveness again. Only
+  successful verification releases the launcher to exec. The launcher removes
+  the nonce, preserves the requested environment and reports exec errno over
+  the close-on-exec socket. Short-lived commands cannot exit before their
+  identity is established. A launcher killed or reaped during acquisition,
+  a wrong descriptor, missing nonce, wrong parent, or unavailable `/proc`
+  leaves ownership unproven and never authorizes a signal. Transient
+  `pidfd_open` errors fail closed; only a missing API or ENOSYS enables the
+  legacy numeric backend.
+
+  This guarantee assumes the trusted launcher/interpreter and local procfs
+  are intact, and no untrusted code in the parent can read/forge its nonce or
+  alter its descriptors. The default SIGCHLD disposition is required. It does
+  not promise availability against a competing reaper: outside reaping is
+  logged and retains unproven cleanup. An already-dead launcher is refused;
+  an already-dead requested command still has the verified pidfd acquired
+  before exec. No trust is inferred just from a same-parent zombie.
+
+  Linux >= 6.9 uses `pidfd_send_signal(fd, SIGKILL, None, 1 << 2)` for the
+  original process group. With the group flag unavailable, Linux with
+  `pidfd_open` enumerates group members from procfs, opens individual pidfds,
+  revalidates each member's group and starttime after opening, then rechecks
+  the original leader's still-waitable pidfd after the scan. Only then does
+  it signal the collected descriptors, with flags zero. It repeats until no
+  live members are observed, with a one-second bound; a timeout retains
+  ownership for retry. All temporary descriptors close on every path. An
+  outside-reaped leader forbids signalling the collected members. Even a
+  reap after the final check cannot retarget these descriptors to a new
+  numeric group. Linux 5.3's missing `waitid(P_PIDFD)` uses `P_PID` together
+  with checks of the retained pidfd's identity. No numeric signal is used
+  while a leader pidfd is available.
+
+  Only systems without `pidfd_open` use checked numeric `killpg`. They still
+  have a check-to-syscall window and require exclusive child reaping and
+  unchanged SIGCHLD throughout spawning, signalling and final wait. That
+  legacy path does not provide protection against a competing reaper.
+  On all backends, the leader pidfd stays open until final reap, ECHILD never
+  becomes successful exit, and ESRCH alone is not cleanup proof. The process
+  remains owned until wait succeeds. VibeVoice retains its decoder while
+  busy; handing work to it never proves cleanup.
+- Explicit `MicCapture(control=CaptureControl(...))` selects the registered
+  `managed-capture` kind. Its start, publication, active read and close share
+  the same lifecycle counts and one-shot admission. It publishes stderr,
+  the CaptureOwner, supervisor and reader before releasing startup. A late
+  supervisor, request_stop, and daemon escalation all ask CaptureOwner to
+  stop cooperatively. They never kill it as an ordinary recorder group.
+  Its dedicated reaper closes the separate recorder session, authenticates
+  the cleanup reply and releases or quarantines the microphone lease.
+  Capture keeps the owner and all outstanding handles until that proof and
+  reader completion; neither a busy start/read nor a false owner stop can
+  report successful stop. The default daemon still selects ordinary capture.
 - `cleanup_complete` is true only after the shared state reaches closed.
   The daemon checks that proof before marking its owner closed, acknowledging
   an ExecutionGrant, or removing an entry. Acknowledgement failures keep the
@@ -616,7 +655,9 @@ resources; their later allocation/publication paths run the startup matrix.
 The matrix does not claim to control group escapes, a kernel-stuck signal
 syscall, or native memory safety inside a provider. Process identity tests
 exercise outside reaping and SIGCHLD changes, including the forced fallback;
-the fallback's check-to-signal window remains as documented above. Its native Vosk handles are inert fixtures;
+only the backend without pidfd_open retains the numeric window above. These
+are ordinary owned-child and mocked signal-routing tests, not a namespace or
+tracing qualification. The native Vosk handles are inert fixtures;
 other tests exercise a compiled stub library. No physical device, GPU or real
 model is required by this suite.
 
@@ -647,3 +688,6 @@ retained until disposal is proven. Whisper/Whistle and
 VibeVoice native runtime/model loading happens in their registered child
 processes. External Piper/Qwen service processes belong to their respective
 providers; this daemon owns and tests only its client/status processes.
+
+Process API references: [Python subprocess](https://docs.python.org/3/library/subprocess.html)
+and [Linux pidfd_send_signal](https://kernel.googlesource.com/pub/scm/docs/man-pages/man-pages/+/master/man/man2/pidfd_send_signal.2).

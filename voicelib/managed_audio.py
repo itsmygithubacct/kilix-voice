@@ -15,6 +15,7 @@ import time
 from typing import IO
 from .audio import (MicCapture, AudioError, _positive_int, _EOF, _READ_CHUNK,
                     DEFAULT_RATE, DEFAULT_FRAME_MS, build_capture_cmd, _exit_message, _CAPTURE_HINT)
+from .lifecycle import Resource, starting
 from .util import cfg_get
 from .microphone import CaptureControl, CaptureOwner, MAX_SECONDS
 
@@ -32,6 +33,8 @@ class ManagedMicCapture(MicCapture):
     click-to-talk guarantee in DESIGN.md rather than an implementation detail.
     """
 
+    resource_kinds = ("managed-capture",)
+
     _QUEUE_FRAMES = 512     # ~10 s at 20 ms
     _JOIN_TIMEOUT = 2.0
     _TERM_TIMEOUT = 1.0
@@ -40,6 +43,7 @@ class ManagedMicCapture(MicCapture):
         self._cfg = cfg if cfg is not None else {}
         self._control = control
         self._owner: CaptureOwner | None = None
+        self._stderr = None
         self._rate = _positive_int(
             cfg_get(self._cfg, "audio.rate", DEFAULT_RATE), "audio.rate")
         frame_ms = _positive_int(
@@ -89,81 +93,83 @@ class ManagedMicCapture(MicCapture):
 
     @property
     def cleanup_complete(self) -> bool:
-        return self._owner.cleanup_complete if self._owner is not None else True
+        return (Resource.cleanup_complete.fget(self)
+                and (self._owner is None or self._owner.cleanup_complete))
 
+    @starting
     def start(self) -> None:
-        """Launch the recorder and begin buffering frames."""
-        if self._process is not None or not self.cleanup_complete:
-            raise AudioError(
-                "MicCapture.start() was called while capture was already "
-                "running. Call stop() first; one MicCapture owns one recorder "
-                "process.")
+        """Count and publish every allocation before releasing startup."""
+        if self._process is not None or self._started:
+            raise AudioError("one MicCapture owns one recorder process")
         cmd = build_capture_cmd(self._cfg)
         self._drain()
         self._stopping.clear()
         self._error = None
         self._overruns = 0
-        # A temporary file rather than a pipe: the recorder's diagnostics are
-        # only wanted if it dies, and a pipe nobody drains would wedge it.
-        stderr = tempfile.TemporaryFile()
         try:
+            stderr = self._publish("_stderr", tempfile.TemporaryFile)
             control = self._control or CaptureControl(time.monotonic() + min(MAX_SECONDS,
                 float(cfg_get(self._cfg, "stt.max_seconds", MAX_SECONDS))))
-            self._owner = CaptureOwner(control)
-            process = self._owner.start(cmd, stderr)
-            self._process = process
+            owner = self._publish("_owner", lambda: CaptureOwner(control))
+            process = self._publish("_process", lambda: owner.start(cmd, stderr))
             self._started = True
-            self._reader = threading.Thread(
+            reader = self._publish("_reader", lambda: threading.Thread(
                 target=self._read_stream, args=(process, stderr, cmd),
-                name="kilix-voice-mic", daemon=True)
-            self._reader.start()
+                name="kilix-voice-mic", daemon=True))
+            reader.start()
         except BaseException as error:
-            # Construction can fail after the recorder starts, and an
-            # interruption can arrive while the reader itself is starting.
-            # Keep ownership until teardown is proved in either case.
-            try:
-                self.stop()
-            finally:
-                stderr.close()
+            self.request_stop()
+            # The starting decorator retries disposal after its count drops.
             if isinstance(error, Exception):
                 raise AudioError(f"cannot start microphone capture: {error}") from error
             raise
 
-    def read(self, timeout: float | None = None) -> bytes | None:
-        """Return exactly one frame, or None on timeout or end of stream."""
-        if not self._started:
-            raise AudioError(
-                "MicCapture.read() was called before start(). Call start() to "
-                "open the microphone; a MicCapture holds no audio until then.")
-        try:
-            item = self._queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
-        if item is _EOF:
-            # Put the sentinel back so every later read returns None at once
-            # instead of blocking on a stream that has already ended.
-            self._put(_EOF)
-            return None
-        return item
+    def request_stop(self) -> None:
+        self.request_close()
+        self._stopping.set()
+        self._put(_EOF)
+        owner = self._owner
+        if owner is not None:
+            owner.request_stop()
+
+    def _on_close_requested(self):
+        self.request_stop()
+
+    def _cancel_published_process(self, process):
+        # The supervisor owns a separate recorder session and authenticates
+        # cleanup. Killing its process group would strand that session.
+        self.request_stop()
+
+    def escalate_cleanup(self):
+        self.request_stop()
+
+    def _dispose_complete(self):
+        return (self._process is None and self._reader is None and self._stderr is None
+                and (self._owner is None or self._owner.cleanup_complete))
 
     def stop(self) -> bool:
-        """Stop owned descendants; return only authenticated cleanup success."""
-        self._stopping.set()
+        """Return true only after lifecycle and authenticated owner proof."""
+        self.lifecycle.close(self, self._stop_capture)
+        proven = self.cleanup_complete
+        return proven
+
+    def _stop_capture(self):
         process, reader = self._process, self._reader
         proven = self._owner.stop() if self._owner is not None else True
         if reader is not None and reader.ident is not None:
             reader.join(timeout=self._JOIN_TIMEOUT)
+            if reader.is_alive():
+                return
+        if not proven:
+            return
         if process is not None and process.stdout is not None:
-            try:
-                process.stdout.close()
-            except OSError:
-                pass
+            process.stdout.close()
         self._process = self._reader = None
+        if self._stderr is not None:
+            self._stderr.close()
+            self._stderr = None
         self._drain()
-        # Guarantees a blocking read() after stop() returns rather than hangs,
-        # even if the reader thread outlived its join timeout.
         self._put(_EOF)
-        return proven
 
     def _read_stream(self, process: subprocess.Popen, stderr: IO[bytes],
                      cmd: list[str]) -> None:

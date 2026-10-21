@@ -128,6 +128,15 @@ class Resource:
         error.resource_closed = True
         return error
 
+    def _cancel_published_process(self, process):
+        from .processes import kill_group
+        kill_group(process)
+
+    def escalate_cleanup(self):
+        process = getattr(self, "_process", None)
+        if process is not None:
+            self._cancel_published_process(process)
+
     def _publish(self, field, allocate):
         """Publish before releasing startup ownership, even after cancellation.
 
@@ -144,8 +153,7 @@ class Resource:
                 # Publish first, then refuse the handoff. A late child must
                 # be interrupted even if shutdown's escalation pass is over.
                 if field == "_process":
-                    from .processes import kill_group
-                    kill_group(value)
+                    self._cancel_published_process(value)
                 raise self._closed_error("resource closed during allocation")
             return value
         finally:

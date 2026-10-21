@@ -18,13 +18,15 @@ from unittest import mock
 
 from tests import test_cleanup_recovery as recovery
 from tests.test_terminal_outcomes import voiced, wait_until
-from voicelib import audio, lifecycle, models, processes, qwen_provider, stt, tts
+from voicelib import audio, lifecycle, microphone, models, processes, qwen_provider, stt, tts
+from voicelib.managed_audio import ManagedMicCapture
 
 SETUP = 15
 FRAME = b'\x01\x00' * 320
 # Field occurrence numbers distinguish each held model descriptor.
 MATRIX = {
     'capture': (audio.MicCapture, ('_stderr', '_process', '_reader')),
+    'managed-capture': (ManagedMicCapture, ('_stderr', '_owner', '_process', '_reader')),
     'vosk': (stt.VoskStt, ('_model', '_rec')),
     'whisper': (stt.WhisperStt, ('_held',) * len(models.REQUIRED_FILES['whisper']) + ('_links', '_process')),
     'whistle': (stt.WhistleStt, ('_held',) * len(models.REQUIRED_FILES['whistle']) + ('_links', '_process')),
@@ -39,6 +41,7 @@ MATRIX = {
     'player': (audio.Player, ('_worker', '_sink_stderr', '_process')),
     'sink': (audio.Player, ('_worker', '_sink_stderr', '_process')),
 }
+CAPTURE_KINDS = {'capture', 'managed-capture'}
 CONSTRUCTORS = {'vosk', 'whisper', 'whistle', 'vibevoice'}
 NO_ALLOCATION = {'null-stt', 'null-tts'}
 NO_CHILD = NO_ALLOCATION | {'vosk'}
@@ -65,7 +68,7 @@ class Case:
         self.d._speech = self.d._dictation = self.d._player = self.d._socket = None
         self.d._socket_ino = None
         self.d._wake_w = -1
-        self.category = ('capture' if kind == 'capture' else
+        self.category = ('capture' if kind in CAPTURE_KINDS else
                          'player' if kind in ('player', 'sink') else
                          'provider' if kind in CONSTRUCTORS | {'null-stt'} else 'synthesiser')
         self.key = ('matrix-' + kind, self.category)
@@ -138,8 +141,8 @@ class Case:
     def create(self, callback=None):
         if self.kind in CONSTRUCTORS:
             owner = self.cls(model_path=str(self.model), on_owner=lambda r: self.register(r, callback))
-        elif self.kind == 'capture':
-            owner = self.cls({'audio': {'capture_cmd': self.command}})
+        elif self.kind in CAPTURE_KINDS:
+            owner = audio.MicCapture({'audio': {'capture_cmd': self.command}}, **({'control': microphone.CaptureControl(time.monotonic()+60, locked=lambda: False, namespace=str(self.root/'leases'))} if self.kind == 'managed-capture' else {}))
         elif self.kind in ('player', 'sink'):
             owner = self.cls({'audio': {'play_cmd': self.command}})
         elif self.kind in ('espeak', 'mbrola'):
@@ -155,7 +158,7 @@ class Case:
 
     def activate(self, budget=.2):
         r = self.owner
-        if self.kind == 'capture':
+        if self.kind in CAPTURE_KINDS:
             r.start()
         elif self.kind in ('player', 'sink'):
             r.play(FRAME, 16000)
@@ -172,7 +175,7 @@ class Case:
 
     def run_use(self, native='feed'):
         r = self.owner
-        if self.kind == 'capture':
+        if self.kind in CAPTURE_KINDS:
             r.read(timeout=.2)
         elif self.kind in ('vosk', 'null-stt'):
             r.start_utterance()
@@ -211,6 +214,12 @@ class Case:
         self.d._prepare_cleanup(key, r, state)
         self.d._retry_dictation_cleanup(.15)
 
+    def stop_child(self, child):
+        if self.kind == 'managed-capture':
+            self.owner.request_stop()
+        else:
+            processes.kill_group(child)
+
     def drain(self, contain=False):
         for release in self.gates:
             release.set()
@@ -221,7 +230,7 @@ class Case:
                     # A deliberately broken starter may publish after the
                     # failed assertion. Contain only these recorded children.
                     for child in self.children:
-                        processes.kill_group(child)
+                        self.stop_child(child)
                     thread.join(.01)
             else:
                 thread.join(SETUP)
@@ -239,20 +248,24 @@ class Case:
             if self.kind == 'vosk':
                 self.test.assertEqual(sorted(self.frees), sorted(self.allocations), 'native handle dropped without free')
             for child in self.children:
-                self.test.assertIsInstance(child, processes.GroupPopen, 'child bypassed the group owner')
+                if self.kind == 'managed-capture':
+                    self.test.assertTrue(self.owner._owner.cleanup_complete, 'supervisor cleanup is unproven')
+                else:
+                    self.test.assertIsInstance(child, processes.GroupPopen, 'child bypassed the group owner')
                 self.test.assertIsNotNone(child.returncode, 'close dropped an unreaped child')
-                self.test.assertTrue(getattr(child, '_voice_group_signalled', False), 'reaped before final group signal')
+                if self.kind != 'managed-capture':
+                    self.test.assertTrue(getattr(child, '_voice_group_signalled', False), 'reaped before final group signal')
             self.test.assertTrue(all(isinstance(e, (OSError, RuntimeError)) for e in self.errors), self.errors)
         finally:
             for child in self.children:
-                processes.kill_group(child)
+                self.stop_child(child)
                 child.wait(timeout=3)
         self.test.assertFalse(self.d._resource_owners(), 'proven cleanup was not retired')
 
     def __exit__(self, *exc):
         if exc[0] is not None:
             for child in self.children:
-                processes.kill_group(child)
+                self.stop_child(child)
         try:
             self.drain(contain=exc[0] is not None)
         finally:
@@ -261,11 +274,29 @@ class Case:
 
 class Conformance(unittest.TestCase):
     def test_registry_is_exhaustive(self):
+        for options in ({}, {'control': microphone.CaptureControl(time.monotonic()+10, locked=lambda: False)}):
+            concrete = type(audio.MicCapture({}, **options))
+            self.assertIn(concrete, [cls for cls, _ in MATRIX.values()], 'factory variant absent from the matrix')
+            self.assertIn(concrete, lifecycle.RESOURCE_KINDS.values(), 'factory variant absent from the registry')
         self.assertEqual(set(MATRIX), set(lifecycle.RESOURCE_KINDS),
                          'every registered resource kind must have a matrix row')
         for kind, (cls, _) in MATRIX.items():
             self.assertIs(lifecycle.RESOURCE_KINDS[kind], cls)
             self.assertTrue(issubclass(cls, lifecycle.Resource))
+
+    def test_managed_stop_requires_authenticated_proof(self):
+        with Case(self, 'managed-capture') as c:
+            r = c.create()
+            r.start()
+            child = r._process
+            with mock.patch.object(r._owner, 'stop', return_value=False), \
+                    mock.patch.object(type(r), '_on_close_requested'):
+                r._owner.cleanup_complete = False
+                self.assertFalse(r.stop(), 'stop discarded authenticated cleanup proof')
+                self.assertFalse(r.cleanup_complete)
+                self.assertIs(r._process, child, 'unproven supervisor handle was discarded')
+            c.close_registered()
+            c.drain()
 
     def test_synthesis_cancel_during_allocator_keeps_cancelled_outcome(self):
         for kind in ('espeak', 'mbrola', 'piper', 'qwen'):
@@ -316,7 +347,7 @@ class Conformance(unittest.TestCase):
                             # The assertion below records the illegal handoff;
                             # contain this late fixture child by its own group.
                             if attr == '_process':
-                                processes.kill_group(result)
+                                owner._cancel_published_process(result)
                         if hit and phase == 'after':
                             block()
                         return result
@@ -340,10 +371,10 @@ class Conformance(unittest.TestCase):
         for native in (('feed', 'end') if kind == 'vosk' else ('feed',)):
             with self.subTest(call=native), Case(self, kind) as c:
                 r = c.create()
-                if kind == 'capture':
+                if kind in CAPTURE_KINDS:
                     r.start()
                 entered, release, block = c.gate()
-                if kind == 'capture':
+                if kind in CAPTURE_KINDS:
                     original = r._queue.get
                     c.patch(r._queue, 'get', side_effect=lambda *a, **k: (block(), original(*a, **k))[1])
                 elif kind == 'vosk':
@@ -381,7 +412,8 @@ class Conformance(unittest.TestCase):
                 self.assertIn(c.key, c.d._cleanup_owners)
                 if child:
                     self.assertIs(r._process, child, 'lost escalation handle before reaping')
-                    self.assertIsNone(child.returncode, 'active owner has not reaped')
+                    if kind != 'managed-capture':
+                        self.assertIsNone(child.returncode, 'active owner has not reaped')
                 if kind == 'vosk':
                     self.assertEqual(c.frees, [], 'native handle freed during active call')
                 began = time.monotonic()
@@ -396,7 +428,7 @@ class Conformance(unittest.TestCase):
     def blocked_close(self, kind):
         with Case(self, kind) as c:
             r = c.create()
-            if kind == 'capture':
+            if kind in CAPTURE_KINDS:
                 r.start()
             elif kind not in NO_CHILD | {'whisper', 'whistle'}:
                 c.worker(lambda: c.activate(budget=60))
@@ -421,9 +453,13 @@ class Conformance(unittest.TestCase):
             self.assertIn(c.key, c.d._cleanup_owners)
             self.assertIn('cleanup unproven', str(c.d._warn.call_args_list))
             if child is not None:
-                self.assertIsInstance(child, processes.GroupPopen)
-                self.assertTrue(wait_until(lambda: processes.poll_exit(child) is not None, .5))
-                self.assertTrue(child._voice_group_signalled, 'shutdown did not seal the owned group')
+                if kind == 'managed-capture':
+                    self.assertTrue(r._owner.wait(SETUP), 'shutdown did not ask the supervisor to stop')
+                    self.assertTrue(r._owner.cleanup_complete, 'shutdown lost authenticated recorder proof')
+                else:
+                    self.assertIsInstance(child, processes.GroupPopen)
+                    self.assertTrue(wait_until(lambda: processes.poll_exit(child) is not None, .5))
+                    self.assertTrue(child._voice_group_signalled, 'shutdown did not seal the owned group')
             release.set()
             c.drain()
             self.assertTrue(r.cleanup_complete)

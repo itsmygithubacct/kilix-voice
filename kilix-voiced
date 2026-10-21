@@ -1189,7 +1189,10 @@ class Daemon(OwnedTurns):
             process = getattr(resource, "_process", None)
             if isinstance(getattr(process, "pid", None), int):
                 try:
-                    processes.kill_group(process)
+                    if isinstance(resource, processes.Resource):
+                        resource.escalate_cleanup()
+                    else:
+                        processes.kill_group(process)
                 except Exception as error:
                     self._warn(f"shutdown: {key[0]}: {key[1]} escalation failed "
                                f"({type(error).__name__}); ownership retained")

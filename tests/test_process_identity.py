@@ -78,7 +78,10 @@ class IdentityTests(unittest.TestCase):
                 processes.kill_group(child)
                 send.assert_called_once_with(fd, signal.SIGKILL, None, 1 << 2)
                 numeric.assert_not_called()
-                os.fstat(fd)  # retained while final reap has not happened
+                try:
+                    os.fstat(fd)  # retained while final reap has not happened
+                except OSError as error:
+                    self.fail(f'pidfd closed before final reap: {error}')
                 child.wait(timeout=2)
                 processes.kill_group(child)
                 self.assertEqual(send.call_count, 1)
@@ -119,23 +122,32 @@ class IdentityTests(unittest.TestCase):
             child.stdout.close()
 
     def test_fallback_checks_pidfd_immediately_before_numeric_signal(self):
+        # Historical test name retained for mutation-catalogue references.
+        # With a pidfd this backend must now use member descriptors only.
         with mock.patch.object(processes, '_pidfd_group_supported', False):
             child = processes.GroupPopen(['/bin/sleep', '30'])
             try:
                 order = []
-                waitid, killpg = os.waitid, os.killpg
-                def checked(*args):
-                    order.append(('check', args))
-                    return waitid(*args)
-                def signal_group(*args):
-                    order.append(('signal', args))
-                    return killpg(*args)
-                with mock.patch.object(os, 'waitid', side_effect=checked), \
-                        mock.patch.object(os, 'killpg', side_effect=signal_group):
+                check, scan, send = processes._check_leader, processes._scan_group_members, signal.pidfd_send_signal
+                def checked(p):
+                    order.append('check')
+                    return check(p)
+                def scanned(p):
+                    order.append('scan')
+                    return scan(p)
+                def signalled(*args):
+                    order.append('signal')
+                    return send(*args)
+                with mock.patch.object(processes, '_check_leader', side_effect=checked), \
+                        mock.patch.object(processes, '_scan_group_members', side_effect=scanned), \
+                        mock.patch.object(signal, 'pidfd_send_signal', side_effect=signalled), \
+                        mock.patch.object(os, 'killpg') as numeric:
                     processes.kill_group(child)
-                self.assertEqual(order, [
-                    ('check', (os.P_PIDFD, child._voice_pidfd, os.WEXITED | os.WNOHANG | os.WNOWAIT)),
-                    ('signal', (child.pid, signal.SIGKILL))])
+                    numeric.assert_not_called()
+                self.assertIn('signal', order)
+                for index, event in enumerate(order):
+                    if event == 'scan':
+                        self.assertEqual(order[index-1:index+2], ['check', 'scan', 'check'])
             finally:
                 processes.kill_group(child)
                 child.wait(timeout=2)
@@ -157,15 +169,21 @@ class IdentityTests(unittest.TestCase):
                 child.wait(timeout=2)
 
     def test_unsupported_group_flag_is_detected_once(self):
+        original = signal.pidfd_send_signal
+        def old_kernel(fd, sig, info=None, flags=0):
+            if flags == processes.PIDFD_SIGNAL_PROCESS_GROUP:
+                raise OSError(errno.EINVAL, 'old kernel')
+            return original(fd, sig, info, flags)
         with mock.patch.object(processes, '_pidfd_group_supported', None), \
-                mock.patch.object(signal, 'pidfd_send_signal', side_effect=OSError(errno.EINVAL, 'old kernel')) as send, \
+                mock.patch.object(signal, 'pidfd_send_signal', side_effect=old_kernel) as send, \
                 mock.patch.object(os, 'killpg', wraps=os.killpg) as numeric:
             for _ in range(2):
                 child = processes.GroupPopen(['/bin/sleep', '30'])
                 processes.kill_group(child)
                 child.wait(timeout=2)
-            self.assertEqual(send.call_count, 1)
-            self.assertEqual(numeric.call_count, 2)
+            self.assertEqual(sum(call.args[3] == 1 << 2 for call in send.call_args_list), 1)
+            self.assertGreaterEqual(sum(call.args[3] == 0 for call in send.call_args_list), 2)
+            numeric.assert_not_called()
 
     def test_no_pidfd_uses_waitable_child_fallback(self):
         with mock.patch.object(processes, '_pidfd_available', False):

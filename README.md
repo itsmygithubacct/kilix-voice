@@ -175,14 +175,20 @@ is retained until the final group signal is sealed, before reaping. On Linux
 if another reaper releases its leader's PID. An outside reap is logged and
 keeps cleanup unproven; ESRCH alone does not prove cleanup.
 
-On older kernels (including older WSL2 kernels), cleanup checks the leader
-with `waitid(P_PIDFD, WEXITED|WNOHANG|WNOWAIT)` immediately before numeric
-`killpg`, and refuses it if SIGCHLD no longer has its default disposition.
-Without pidfd support it checks the still-waitable child with `P_PID` instead.
-This fallback leaves a narrow check-to-signal window: an outside reaper,
-including a later SIGCHLD change, can reap the leader and allow PID reuse
-before `killpg` enters the kernel. Use Linux 6.9 or later for protection from
-that window, and do not install a competing child reaper in the daemon.
+On older kernels with `pidfd_open` (including Linux 5.3+ WSL2 kernels),
+cleanup opens a pidfd for each group member, validates membership, rechecks
+its retained leader after the scan, and signals only those descriptors.
+Bounded rescans catch members created during cleanup; incomplete cleanup
+remains owned. Acquisition uses a gated launcher so identity is checked
+before even a short-lived command executes. A failed check leaves cleanup
+unproven.
+
+Only kernels without `pidfd_open` use checked numeric `killpg`. This legacy
+backend retains a check-to-signal window if a competing reaper releases the
+leader between the check and syscall. Use a pidfd-capable kernel and do not
+install a competing child reaper in the daemon. Explicit managed capture uses
+its supervisor's cooperative stop and authenticated cleanup protocol; it
+retains unproven ownership if the supervisor cannot supply proof.
 
 Descendants that leave the private group with `setsid()` or `setpgid()`
 survive a normal stop, an abort and shutdown. Configure custom commands to

@@ -313,6 +313,10 @@ class CaptureOwner:
             self.error = error
             self.phase = "unavailable"
 
+    def request_stop(self) -> None:
+        """Wake the dedicated reaper; keep the supervisor alive for its proof."""
+        self._stop.set()
+
     def stop(self) -> bool:
         if self.process is None:
             return self.cleanup_complete
