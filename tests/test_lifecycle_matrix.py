@@ -472,10 +472,60 @@ class Conformance(unittest.TestCase):
                 c.drain()
                 self.assertTrue(c.owner.cleanup_complete)
 
+    def preparation(self, kind):
+        if kind not in CONSTRUCTORS:
+            self.skipTest(NOT_APPLICABLE.get(kind, NOT_APPLICABLE['constructor']))
+        for owned in (False, True):
+            with self.subTest(owned_capture_pending=owned), Case(self, kind) as c:
+                registered = []
+                register = c.register
+                def observe_registration(owner, callback=None):
+                    register(owner, callback)
+                    registered.append(owner.lifecycle.requested)
+                c.patch(c, 'register', side_effect=observe_registration)
+                entered, release, block = c.gate()
+                c.patch(stt, '_resolve_model', side_effect=lambda *a, **k: (block(), str(c.model))[1])
+                c.patch(voiced.stt_lib, 'make_stt', side_effect=lambda *a, **kw: c.create(kw.get('on_owner')))
+                reader_entered, reader_release, reader_block = c.gate()
+                original = audio.MicCapture._read_stream
+                c.patch(audio.MicCapture, '_read_stream',
+                        lambda owner, *args: (reader_block(), original(owner, *args))[1])
+                capture = audio.MicCapture({'audio': {'capture_cmd': c.command}})
+                c.patch(voiced.audio, 'MicCapture', return_value=capture)
+                turn = voiced._DictationTurn(c.key[0], mock.Mock())
+                c.d._dictation = turn
+                if owned:
+                    turn.owner = 'fixture-owner'
+                    turn.owned_finish = threading.Event()
+                c.d._dictate = lambda t: c.d._record_turn(t, SimpleNamespace(), None)
+                turn.thread = c.worker(lambda: c.d._run_dictation(turn))
+                self.assertTrue(entered.wait(SETUP), c.errors)
+                self.assertIsNone(c.owner, 'preparation must precede registration')
+                if owned:
+                    self.assertTrue(reader_entered.wait(SETUP), c.errors)
+                # Resume only after the final registry snapshot and logging.
+                def release_session():
+                    release.set()
+                    turn.thread.join(SETUP)
+                c.d._arbiter.release.side_effect = release_session
+                c.d._shutdown()
+                self.assertIsNotNone(c.owner, c.errors)
+                self.assertEqual(registered, [True], 'registration returned open after shutdown')
+                self.assertTrue(c.owner.lifecycle.requested, 'late registration was not born closed')
+                self.assertFalse(turn.thread.is_alive(), 'late constructor launched work')
+                self.assertIn('provider cleanup unproven', str(c.d._warn.call_args_list),
+                              'late owner missed the final shutdown warning')
+                self.assertFalse(any(p is not capture._process and p.returncode is None
+                                     for p in c.children), 'late provider child survived shutdown')
+                if kind == 'vosk':
+                    self.assertEqual(c.allocations, [], 'late constructor allocated native handles')
+                reader_release.set()
+                c.drain()
+
 
 # unittest reports every kind x scenario cell by name, including explicit N/A.
 for _kind in MATRIX:
-    for _scenario in ('publication', 'active', 'blocked_close', 'constructor'):
+    for _scenario in ('publication', 'active', 'blocked_close', 'constructor', 'preparation'):
         def _test(self, kind=_kind, scenario=_scenario):
             return getattr(self, scenario)(kind)
         setattr(Conformance, 'test_' + _kind.replace('-', '_') + '_' + _scenario, _test)

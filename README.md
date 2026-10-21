@@ -170,7 +170,26 @@ it can launch work or enter teardown. It keeps the owner until that resource's
 close and any accelerator acknowledgement succeed. This includes a first
 cleanup still in flight, a failed cleanup being retried, and read-aloud's
 synthesis clients and sink worker. The process group is private; its leader
-is retained until the final group signal is sealed, before reaping.
+is retained until the final group signal is sealed, before reaping. On Linux
+6.9 and later, a non-inherited pidfd targets the original process group even
+if another reaper releases its leader's PID. An outside reap is logged and
+keeps cleanup unproven; ESRCH alone does not prove cleanup.
+
+On older kernels (including older WSL2 kernels), cleanup checks the leader
+with `waitid(P_PIDFD, WEXITED|WNOHANG|WNOWAIT)` immediately before numeric
+`killpg`, and refuses it if SIGCHLD no longer has its default disposition.
+Without pidfd support it checks the still-waitable child with `P_PID` instead.
+This fallback leaves a narrow check-to-signal window: an outside reaper,
+including a later SIGCHLD change, can reap the leader and allow PID reuse
+before `killpg` enters the kernel. Use Linux 6.9 or later for protection from
+that window, and do not install a competing child reaper in the daemon.
+
+Descendants that leave the private group with `setsid()` or `setpgid()`
+survive a normal stop, an abort and shutdown. Configure custom commands to
+stay in their group. For existing escapees, identify and stop them through
+the provider's own controls, verify that they have exited and released the
+device, or reboot if their ownership cannot be established. A logged old PID
+or group number is not authorization to signal a later process.
 
 Pending cleanup refuses new dictation and read-aloud. Settlement and admission
 retry with one shared 250 ms wait budget, and each owner has at most one

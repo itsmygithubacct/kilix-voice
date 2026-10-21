@@ -549,7 +549,10 @@ independent matrix with that registry, so a new kind needs a test row.
   signals a late child through its retained group owner. The
   condition lock is never held across an allocator. Close permanently refuses
   new operations; shutdown sets this request even for a constructor already
-  doing its own cleanup. A starter that resumes after that request gives up
+  doing its own cleanup. Registry insertion and the stopping check share the
+  cleanup lock with shutdown's snapshot. Every late registrant is born closed;
+  arrivals after the final snapshot log their unproven ownership themselves.
+  A starter that resumes after that request gives up
   and cleanup covers all published handles. A tagged lifecycle refusal lets
   synthesis preserve a cancelled turn's outcome while retaining any late
   child for final close; an unrelated launch error remains a failure.
@@ -567,6 +570,20 @@ independent matrix with that registry, so a new kind needs a test row.
   the resource's disposal guard.
 - Every child uses `processes.GroupPopen`: a private group, WNOWAIT exit
   observation, the group's final signal under the group seal, then reaping.
+  GroupPopen opens a close-on-exec pidfd immediately after spawning under the
+  default SIGCHLD precondition. On Linux >= 6.9 the final signal uses
+  `pidfd_send_signal(fd, SIGKILL, None, 1 << 2)` (process-group scope), so
+  neither an outside reap nor a syscall-entry delay can retarget a reused PID.
+  The pidfd stays open until final reap. ECHILD/outside reap is logged and
+  never becomes a fabricated successful exit; ESRCH alone is not proof.
+  A missing pidfd API/ENOSYS or unsupported flag/EINVAL selects the fallback.
+  Immediately before numeric killpg, it checks waitability using
+  `waitid(P_PIDFD, WEXITED|WNOHANG|WNOWAIT)` and refuses a changed SIGCHLD
+  disposition. Without pidfd wait support it uses P_PID. A zombie is still
+  waitable and keeps its identity; ECHILD forbids the signal. This fallback
+  retains a narrow outside-reap/PID-reuse window between check and syscall,
+  including when a tracer delays syscall entry. Linux >= 6.9 closes that
+  window. No numeric group signal is authorized by a stored number alone.
   The process object remains on the resource until reaping completes.
   VibeVoice's decoder owns communicate/reap while busy; close signals it and
   remains pending. Passing work to that decoder never counts as proof.
@@ -580,7 +597,9 @@ independent matrix with that registry, so a new kind needs a test row.
   runs on the shutdown thread. GroupPopen waits also have a finite default
   ceiling; native calls and kernel calls themselves cannot be forced to return.
 
-The conformance matrix gates before, inside and after every handle publication, during
+The conformance matrix also gates every allocating constructor before its owner
+callback, both with and without owned capture still pending at shutdown. It
+gates before, inside and after every handle publication, during
 active use (both Vosk feed and final-result), during the first blocked close,
 and during constructor failure after each publication. It asserts retained
 ownership, bounded shutdown and its warning, independent escalation, no busy
@@ -594,9 +613,10 @@ resources; their later allocation/publication paths run the startup matrix.
 
 ### Work outside the resource matrix
 
-The matrix does not claim to control arbitrary process-wide reapers, group
-escapes, SIGCHLD changes after launch, a kernel-stuck signal syscall, or native
-memory safety inside a provider. Its native Vosk handles are inert fixtures;
+The matrix does not claim to control group escapes, a kernel-stuck signal
+syscall, or native memory safety inside a provider. Process identity tests
+exercise outside reaping and SIGCHLD changes, including the forced fallback;
+the fallback's check-to-signal window remains as documented above. Its native Vosk handles are inert fixtures;
 other tests exercise a compiled stub library. No physical device, GPU or real
 model is required by this suite.
 

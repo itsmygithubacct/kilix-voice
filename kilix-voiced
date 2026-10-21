@@ -1205,6 +1205,8 @@ class Daemon(OwnedTurns):
                 if state is not None and state.grant is not None else ""
             if state is not None and self._ack_failed(state):
                 lease = "; accelerator acknowledgement failed; quarantine requires manual recovery: " + accelerator.QUARANTINE_RECOVERY
+            if getattr(process, "_voice_outside_reap", False):
+                lease += "; outside reap; group cleanup cannot be proven"
             self._warn(f"shutdown: {turn_id}: {kind} cleanup unproven; "
                        f"process group {group if isinstance(group, int) else 'none'}{lease}")
         if self._socket is not None:
@@ -2460,7 +2462,9 @@ class Daemon(OwnedTurns):
                     state.running = True
                     state.done.clear()
                     constructing = state
-                    self._dictation_cleanup_state[(turn.id, "capture")].grant = None
+                    capture_state = self._dictation_cleanup_state.get((turn.id, "capture"))
+                    if capture_state is not None:
+                        capture_state.grant = None
                 self._prepare_cleanup(key, resource, state)
 
             try:
@@ -2476,7 +2480,9 @@ class Daemon(OwnedTurns):
                             self._failed_dictation_cleanup.pop((turn.id, "provider"), None)
             self._register_cleanup(turn.id, "provider", engine, grant)
             with self._cleanup_lock:
-                self._dictation_cleanup_state[(turn.id, "capture")].grant = None
+                capture_state = self._dictation_cleanup_state.get((turn.id, "capture"))
+                if capture_state is not None:
+                    capture_state.grant = None
             with turn.capture_lock:
                 turn.interrupt = getattr(engine, "cancel", None)
             # The last boundary before the device is opened. Everything above
@@ -2563,6 +2569,12 @@ class Daemon(OwnedTurns):
         key = (turn_id, kind)
         late = False
         with self._cleanup_lock:
+            stopping = getattr(self, '_stopping', None)
+            stopping = stopping is not None and stopping.is_set()
+            # Close admission under the same lock as registry publication.
+            # Constructors can resume after shutdown's final cleanup pass.
+            if stopping and isinstance(resource, processes.Resource):
+                resource.request_close()
             if self._cleanup_owners is None:
                 self._cleanup_owners = {}
             if self._dictation_cleanup_state is None:
@@ -2573,20 +2585,14 @@ class Daemon(OwnedTurns):
             if grant is not None:
                 state.grant = grant
             state.method = method
-            stopping = getattr(self, "_stopping", None)
-            if stopping is not None and stopping.is_set():
-                # Construction can resume after shutdown's last owner snapshot.
-                # Close admission at the same registry boundary as publication,
-                # before the constructor can allocate or hand off a resource.
-                if isinstance(resource, processes.Resource):
-                    resource.request_close()
+            if stopping:
                 state.pending = True
                 if self._failed_dictation_cleanup is None:
                     self._failed_dictation_cleanup = {}
                 self._failed_dictation_cleanup[key] = resource
                 late = new_owner
         if late:
-            self._warn(f"shutdown: {turn_id}: {kind} registered while stopping; "
+            self._warn(f"shutdown: {turn_id}: {kind} cleanup unproven; registered while stopping; "
                        "allocation refused; cleanup ownership retained")
         return key, state
 

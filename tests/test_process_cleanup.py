@@ -42,6 +42,13 @@ class ObservedLock:
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Linux waitid and groups")
 class CleanupTests(unittest.TestCase):
+    def setUp(self):
+        # Exercise the guarded older-kernel backend on current kernels too.
+        # The matrix and test_process_identity exercise the pidfd backend.
+        backend = mock.patch.object(processes, '_pidfd_group_supported', False)
+        backend.start()
+        self.addCleanup(backend.stop)
+
     def capture(self, command="import time; time.sleep(60)"):
         capture = audio.MicCapture({"audio": {"capture_cmd": [
             sys.executable, "-c", command]}})
@@ -62,7 +69,8 @@ class CleanupTests(unittest.TestCase):
                     pass
             # A mutant may already have reaped the leader. Containment must
             # not depend on that broken observer, or signal its released ID.
-            subprocess.Popen.wait(process, timeout=3)
+            with contextlib.suppress(ChildProcessError):
+                subprocess.Popen.wait(process, timeout=3)
             reader.join(3)
             if process.stdout:
                 process.stdout.close()
@@ -305,6 +313,9 @@ class CleanupTests(unittest.TestCase):
 
     def test_group_signal_failure_can_be_retried_before_sealing(self):
         process = SimpleNamespace(pid=424242, returncode=None)
+        check = mock.patch.object(processes, '_waitid', return_value=None)
+        check.start()
+        self.addCleanup(check.stop)
         with mock.patch.object(processes.os, "killpg",
                                side_effect=[InterruptedError("before signal"), None]) as send:
             with self.assertRaises(InterruptedError):
@@ -318,6 +329,9 @@ class CleanupTests(unittest.TestCase):
 
     def test_overlapping_group_callers_serialize_the_final_signal(self):
         process = SimpleNamespace(pid=424242, returncode=None)
+        check = mock.patch.object(processes, '_waitid', return_value=None)
+        check.start()
+        self.addCleanup(check.stop)
         entered, release, second_started = (threading.Event() for _ in range(3))
         calls, errors = [], []
 
@@ -908,6 +922,8 @@ class CleanupTests(unittest.TestCase):
                 processes.kill_group(process)
                 processes.kill_group(process)
             send.assert_not_called()
+            self.assertFalse(getattr(process, '_voice_outside_reap', False),
+                             'a known exit was incorrectly reported as an outside reap')
 
     def test_capture_refuses_automatic_child_reaping_before_launch(self):
         capture = audio.MicCapture({"audio": {"capture_cmd": [sys.executable, "-c", "pass"]}})
@@ -950,7 +966,12 @@ class CleanupTests(unittest.TestCase):
             for worker in workers:
                 worker.join(2)
                 self.assertFalse(worker.is_alive())
-            capture.stop()
+            error = None
+            try:
+                capture.stop()
+            except OSError as caught:
+                error = caught
+            self.assertIsNone(error, 'concurrent stops did not seal before the final reap')
             processes.kill_group(process)
             send.assert_called_once_with(process.pid, signal.SIGKILL)
 

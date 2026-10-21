@@ -4,6 +4,26 @@ from unittest import mock
 from voicelib import lifecycle,processes
 
 class HelperWitness(unittest.TestCase):
+ def test_registration_check_and_insertion_share_shutdown_lock(self):
+  from tests.test_lifecycle_matrix import Case
+  from voicelib import audio
+  with Case(self, 'capture') as c:
+   original = c.d._cleanup_lock
+   class Interleave:
+    fired = False
+    def __enter__(self):
+     original.acquire()
+    def __exit__(self, *exc):
+     original.release()
+     if not self.fired:
+      self.fired = True
+      c.d._shutdown()
+   c.d._cleanup_lock = Interleave()
+   c.owner = audio.MicCapture()
+   c.d._register_cleanup(*c.key, c.owner, method='stop')
+   self.assertTrue(c.owner.lifecycle.requested,
+                   'shutdown slipped between the stopping check and registry insertion')
+
  def test_late_publication_signals_before_handoff_unwinds(self):
   owner=lifecycle.Resource();token=object();seen=[]
   def allocate():
