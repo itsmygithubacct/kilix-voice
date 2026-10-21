@@ -394,7 +394,7 @@ class MicCapture(Resource):
         # short frame would shift every following sample in the recogniser.
         try:
             code = wait_exit(process, timeout=self._TERM_TIMEOUT)
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, ChildProcessError):
             code = None
         if not self._stopping.is_set() and code not in (0, None):
             self._error = _exit_message("capture", cmd, code, stderr,

@@ -1197,6 +1197,7 @@ class Daemon(OwnedTurns):
         with self._cleanup_lock:
             retained = list((self._cleanup_owners or {}).items())
             states = dict(self._dictation_cleanup_state or {})
+            self._cleanup_snapshot_finished = True
         for (turn_id, kind), resource in retained:
             process = getattr(resource, "_process", None)
             group = getattr(process, "pid", None)
@@ -1205,6 +1206,8 @@ class Daemon(OwnedTurns):
                 if state is not None and state.grant is not None else ""
             if state is not None and self._ack_failed(state):
                 lease = "; accelerator acknowledgement failed; quarantine requires manual recovery: " + accelerator.QUARANTINE_RECOVERY
+            if getattr(process, "_voice_outside_reap", False):
+                lease += "; outside reap; group cleanup cannot be proven"
             self._warn(f"shutdown: {turn_id}: {kind} cleanup unproven; "
                        f"process group {group if isinstance(group, int) else 'none'}{lease}")
         if self._socket is not None:
@@ -2460,7 +2463,9 @@ class Daemon(OwnedTurns):
                     state.running = True
                     state.done.clear()
                     constructing = state
-                    self._dictation_cleanup_state[(turn.id, "capture")].grant = None
+                    capture_state = self._dictation_cleanup_state.get((turn.id, "capture"))
+                    if capture_state is not None:
+                        capture_state.grant = None
                 self._prepare_cleanup(key, resource, state)
 
             try:
@@ -2476,7 +2481,9 @@ class Daemon(OwnedTurns):
                             self._failed_dictation_cleanup.pop((turn.id, "provider"), None)
             self._register_cleanup(turn.id, "provider", engine, grant)
             with self._cleanup_lock:
-                self._dictation_cleanup_state[(turn.id, "capture")].grant = None
+                capture_state = self._dictation_cleanup_state.get((turn.id, "capture"))
+                if capture_state is not None:
+                    capture_state.grant = None
             with turn.capture_lock:
                 turn.interrupt = getattr(engine, "cancel", None)
             # The last boundary before the device is opened. Everything above
@@ -2562,6 +2569,10 @@ class Daemon(OwnedTurns):
         """Own a resource before any launch or teardown can block."""
         key = (turn_id, kind)
         with self._cleanup_lock:
+            stopping = getattr(self, '_stopping', None)
+            stopping = stopping is not None and stopping.is_set()
+            if stopping and isinstance(resource, processes.Resource):
+                resource.request_close()
             if self._cleanup_owners is None:
                 self._cleanup_owners = {}
             if self._dictation_cleanup_state is None:
@@ -2571,6 +2582,9 @@ class Daemon(OwnedTurns):
             if grant is not None:
                 state.grant = grant
             state.method = method
+            if stopping and getattr(self, "_cleanup_snapshot_finished", False):
+                self._warn(f"shutdown: {turn_id}: {kind} cleanup unproven; "
+                           "registered after final cleanup snapshot; allocation refused")
         return key, state
 
     def _prepare_cleanup(self, key, resource, state):
