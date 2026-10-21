@@ -4,7 +4,7 @@ from .lifecycle import Resource, closing
 import contextlib
 import errno
 import logging
-import json
+import marshal
 from pathlib import Path
 import secrets
 import select
@@ -97,10 +97,27 @@ def _member_stat(pid):
     return fields[0], int(fields[2]), fields[19]  # state, pgrp, starttime
 
 
+class _MemberScan(list):
+    # A disappeared or replaced entry could have forked a member not listed
+    # by this enumeration. It cannot contribute to a completion proof.
+    complete = True
+
+
+def _birth_count():
+    # Linux publishes total_forks after attaching the new task's PID and
+    # before either it or its forking parent can return to userspace.
+    # A fresh open is required for each observation of this procfs counter.
+    for line in Path('/proc/stat').read_text().splitlines():
+        if line.startswith('processes '):
+            return int(line.split()[1])
+    raise OSError('process creation counter unavailable; cleanup unproven')
+
+
 def _scan_group_members(group):
     """Open stable handles, then validate membership again after each open."""
-    members = []
+    members = _MemberScan()
     try:
+        births = _birth_count()
         for entry in Path('/proc').iterdir():
             if not entry.name.isdecimal():
                 continue
@@ -108,19 +125,22 @@ def _scan_group_members(group):
             fd = None
             try:
                 before = _member_stat(pid)
-                if before[1] != group or before[0] in ('Z', 'X'):
+                if before[1] != group:
                     continue
                 fd = os.pidfd_open(pid)
                 after = _member_stat(pid)
                 if after[1:] != before[1:] or _pidfd_pid(fd) != pid:
+                    members.complete = False
                     continue
                 members.append(fd)
                 fd = None
             except (FileNotFoundError, ProcessLookupError):
-                pass  # member exited during enumeration
+                members.complete = False
             finally:
                 if fd is not None:
                     os.close(fd)
+        if _birth_count() != births:
+            members.complete = False
         return members
     except BaseException:
         for fd in members:
@@ -139,28 +159,44 @@ def _check_leader(process):
 
 
 def _kill_members(process):
-    """Older pidfd kernels: bounded rescans, with no numeric signal at all."""
+    """Prove quiescence before a complete scan; never trust an empty scan."""
     deadline = time.monotonic() + 1.0
-    while True:
-        _check_leader(process)
-        members = _scan_group_members(process.pid)
-        try:
+    previous = []
+    members = []
+    try:
+        while True:
+            _check_leader(process)
+            dead_before = {}
+            for fd in previous:
+                poller = select.poll()
+                poller.register(fd, select.POLLIN)
+                if poller.poll(0):
+                    pid = _pidfd_pid(fd)
+                    if pid > 0:
+                        dead_before[pid] = fd
+            members = _scan_group_members(process.pid)
             # The unreaped leader pins the group number over the entire scan.
             # If that proof was lost, none of the collected handles is used.
             _check_leader(process)
-            if not members:
+            identities = [_pidfd_pid(fd) for fd in members]
+            if (getattr(members, 'complete', False) and process.pid in identities
+                    and all(pid in dead_before and _pidfd_pid(dead_before[pid]) == pid
+                            for pid in identities)):
                 return
             for fd in members:
                 try:
                     signal.pidfd_send_signal(fd, signal.SIGKILL, None, 0)
                 except ProcessLookupError:
                     pass  # this exact member already exited
-        finally:
-            for fd in members:
+            for fd in previous:
                 os.close(fd)
-        if time.monotonic() >= deadline:
-            raise TimeoutError('process group members remain; cleanup unproven')
-        time.sleep(.002)
+            previous, members = members, []
+            if time.monotonic() >= deadline:
+                raise TimeoutError('process group scan is inconclusive; cleanup unproven')
+            time.sleep(.002)
+    finally:
+        for fd in previous + members:
+            os.close(fd)
 
 
 def require_waitable_children() -> None:
@@ -291,6 +327,8 @@ class GroupPopen(subprocess.Popen):
     def __init__(self, *args, **kwargs):
         global _pidfd_available
         require_waitable_children()
+        if kwargs.get('close_fds') is False or (len(args) > 7 and args[7] is False):
+            raise ValueError('GroupPopen does not support close_fds=False; use pass_fds')
         self._voice_pidfd = None
         self._voice_identity_unproven = False
         kwargs['start_new_session'] = True
@@ -306,6 +344,8 @@ class GroupPopen(subprocess.Popen):
             argv = [os.fsdecode(executable or '/bin/sh'), '-c', *argv]
             executable = argv[0]
         executable = os.fsdecode(executable) if executable is not None else argv[0]
+        if any('\0' in value for value in [executable, *argv]):
+            raise ValueError('embedded null byte')
         nonce = secrets.token_hex(32)
         env = kwargs.get('env')
         env = {os.fsdecode(k): os.fsdecode(v) for k, v in (os.environ if env is None else env).items()}
@@ -339,19 +379,34 @@ class GroupPopen(subprocess.Popen):
             if not verified:
                 _identity_unproven(self)
                 return
-            parent.sendall((json.dumps(dict(argv=argv, executable=executable, env=target_env,
-                restore_signals=kwargs.get('restore_signals', True))) + '\n').encode())
-            # EOF is exec success. On failure the launcher reports errno before
-            # exiting; the verified owner still retires it before raising.
-            failure = parent.recv(32)
-            if failure:
+            executables = [executable] if os.path.dirname(executable) else [
+                os.path.join(directory, executable) for directory in os.get_exec_path(target_env)]
+            request = marshal.dumps(dict(argv=argv, executables=executables, env=target_env,
+                restore_signals=kwargs.get('restore_signals', True)))
+            parent.sendall(len(request).to_bytes(8, 'big') + request)
+            # A complete exec-attempt marker followed by EOF is success.
+            # Every Python failure, including argument/protocol failures,
+            # carries a typed reply; a partial reply is never success.
+            reply = bytearray()
+            while part := parent.recv(65536):
+                reply.extend(part)
+            if reply != b'X':
                 kill_group(self)
                 self.wait(timeout=2)
                 for stream in (self.stdin, self.stdout, self.stderr):
                     if stream is not None:
                         stream.close()
-                code = int(failure)
-                raise OSError(code, os.strerror(code), executable)
+                failure = bytes(reply).removeprefix(b'X')
+                if failure.startswith(b'F'):
+                    kind, code, message = marshal.loads(failure[1:])
+                    if kind == 'ValueError':
+                        raise ValueError(message)
+                    if kind == 'TypeError':
+                        raise TypeError(message)
+                    if isinstance(code, int):
+                        raise OSError(code, message, executable)
+                    raise RuntimeError('process launcher failed: ' + message)
+                raise RuntimeError('process launcher failed before exec')
         finally:
             parent.close()
             child.close()

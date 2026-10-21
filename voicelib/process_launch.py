@@ -1,35 +1,58 @@
 """Hold a new group leader until its parent has verified its identity.
 
-Executed directly with an isolated interpreter, before the requested program.
-The private socket closes on exec; an errno reply preserves exec failures.
+Only built-in/frozen modules are needed on the isolated interpreter's hot
+path. The private descriptor closes on exec. Marshal is used only between
+this trusted launcher and its parent, running the same interpreter.
 """
-import json
-import os
-import signal
-import socket
+import marshal
+import posix as os
+import _signal as signal
 import sys
 
 
-def main():
-    channel = socket.socket(fileno=int(sys.argv[1]))
-    os.set_inheritable(channel.fileno(), False)
-    channel.sendall(b"R")
+def read_exact(fd, count):
     data = bytearray()
-    while not data.endswith(b'\n'):
-        part = channel.recv(65536)
+    while len(data) < count:
+        part = os.read(fd, count - len(data))
         if not part:
-            return 125  # parent refused identity or died before admission
+            raise EOFError('parent closed launch channel')
         data.extend(part)
-    request = json.loads(data)
-    os.environ.pop('_KILIX_GROUP_NONCE', None)
-    if request['restore_signals']:
-        for name in ('SIGPIPE', 'SIGXFZ', 'SIGXFSZ'):
-            if hasattr(signal, name):
-                signal.signal(getattr(signal, name), signal.SIG_DFL)
+    return data
+
+
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def main():
+    channel = int(sys.argv[1])
     try:
-        os.execvpe(request['executable'], request['argv'], request['env'])
-    except OSError as error:
-        channel.sendall(str(error.errno).encode('ascii'))
+        os.set_inheritable(channel, False)
+        write_all(channel, b'R')
+        size = int.from_bytes(read_exact(channel, 8), 'big')
+        request = marshal.loads(read_exact(channel, size))
+        if request['restore_signals']:
+            for name in ('SIGPIPE', 'SIGXFZ', 'SIGXFSZ'):
+                if hasattr(signal, name):
+                    signal.signal(getattr(signal, name), signal.SIG_DFL)
+        write_all(channel, b'X')
+        saved_error = last_error = None
+        for executable in request['executables']:
+            try:
+                os.execve(executable, request['argv'], request['env'])
+            except OSError as error:
+                last_error = error
+                if not isinstance(error, (FileNotFoundError, NotADirectoryError)) and saved_error is None:
+                    saved_error = error
+        raise saved_error or last_error
+    except BaseException as error:
+        failure = marshal.dumps((type(error).__name__, getattr(error, 'errno', None), str(error)))
+        try:
+            write_all(channel, b'F' + failure)
+        except OSError:
+            pass  # parent refused identity or died before admission
         return 127
 
 

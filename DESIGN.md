@@ -577,8 +577,14 @@ variants, so a concrete factory result cannot bypass the inventory.
   PPid against its own PID and the child's environment against a random
   per-spawn nonce, then checks waitability and pidfd liveness again. Only
   successful verification releases the launcher to exec. The launcher removes
-  the nonce, preserves the requested environment and reports exec errno over
-  the close-on-exec socket. Short-lived commands cannot exit before their
+  the nonce at exec by replacing the environment. It reports typed argument,
+  protocol and exec failures over the close-on-exec socket; the parent requires
+  an exec-attempt marker before accepting EOF. Embedded NUL arguments are
+  rejected before spawning. `close_fds=False` is explicitly unsupported and
+  raises ValueError; callers may select inherited descriptors with `pass_fds`.
+  The isolated helper uses built-in modules and a length-prefixed marshal
+  request from its trusted parent to avoid importing JSON, socket and signal
+  wrappers on every spawn. Short-lived commands cannot exit before their
   identity is established. A launcher killed or reaped during acquisition,
   a wrong descriptor, missing nonce, wrong parent, or unavailable `/proc`
   leaves ownership unproven and never authorizes a signal. Transient
@@ -598,9 +604,42 @@ variants, so a concrete factory result cannot bypass the inventory.
   `pidfd_open` enumerates group members from procfs, opens individual pidfds,
   revalidates each member's group and starttime after opening, then rechecks
   the original leader's still-waitable pidfd after the scan. Only then does
-  it signal the collected descriptors, with flags zero. It repeats until no
-  live members are observed, with a one-second bound; a timeout retains
-  ownership for retry. All temporary descriptors close on every path. An
+  it signal the collected descriptors, with flags zero. An empty snapshot is
+  never completion proof. The termination rule requires a complete fresh scan
+  containing the retained leader, in which every group member has a pidfd
+  retained from the previous pass that was readable **before** this scan
+  began. Each old descriptor must still report that member's PID after the
+  scan, so reaping/replacement cannot reuse a previous observation. A zombie
+  stat is insufficient: pidfd readability proves all threads have exited.
+
+  Completion additionally requires an unchanged Linux `processes` counter
+  from fresh `/proc/stat` reads before and after enumeration and inspection.
+  This detects a parent that forks and vanishes before its directory entry
+  can even be listed. Linux attaches the new task before incrementing this
+  counter and before returning to userspace. Both checks are needed: a
+  stable birth count rules out omitted concurrent births; retained readable
+  pidfds prove that the listed members cannot fork after the last scan.
+  A missing counter or unreadable procfs refuses proof. The counter must be
+  the native, unfiltered kernel counter without a full wrap during the bound.
+  See [task publication](https://github.com/torvalds/linux/blob/v6.12/kernel/fork.c#L2394-L2438)
+  and [counter export](https://github.com/torvalds/linux/blob/v6.12/fs/proc/stat.c#L161-L171).
+
+  A disappearing entry or changed identity makes the scan inconclusive,
+  including entries whose group could not be read. A newly observed exited
+  member also requires a later scan: it could have forked a live member after
+  enumeration. Thus any member able to fork during the final enumeration
+  either appears as non-quiescent, or changes the birth counter and makes
+  that scan inconclusive. A member omitted because it was born during enumeration has
+  such an ancestor. No member known dead before enumeration can create it.
+  This relies on complete same-view procfs enumeration and the documented
+  group-escape exclusion; hidden processes or a partial procfs mount cannot
+  provide this guarantee. It is not a fixed number of empty scans or a delay.
+
+  The one-second bound is unchanged. Failure to obtain this proof raises
+  TimeoutError and retains the leader handle, unsealed group, resource and
+  lease for retry; neither handle disposal nor lease release is authorized.
+  Unrelated process churn can also make scans inconclusive. All temporary
+  member descriptors close on success, error and timeout. An
   outside-reaped leader forbids signalling the collected members. Even a
   reap after the final check cannot retarget these descriptors to a new
   numeric group. Linux 5.3's missing `waitid(P_PIDFD)` uses `P_PID` together
