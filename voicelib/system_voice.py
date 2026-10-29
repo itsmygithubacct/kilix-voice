@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from array import array
 import os
 import select
 import signal
@@ -44,8 +45,25 @@ def health_monitor():
     return HealthMonitor()
 
 
-def play_clip(player, clip):
-    player.play(*clip)
+def quiet_pcm(pcm, volume=20):
+    """Attenuate signed 16-bit little-endian PCM before any output backend."""
+    level = max(0, min(20, int(volume)))
+    samples = array('h')
+    samples.frombytes(pcm)
+    if sys.byteorder != 'little':
+        samples.byteswap()
+    for index, sample in enumerate(samples):
+        samples[index] = int(sample * level / 100)
+    if sys.byteorder != 'little':
+        samples.byteswap()
+    return samples.tobytes()
+
+
+def play_clip(player, clip, volume=20):
+    if volume <= 0:
+        return
+    pcm, rate = clip
+    player.play(quiet_pcm(pcm, volume), rate)
     if not player.wait(60):
         raise tts.TtsError('System voice playback timed out.')
     if player.error:
@@ -55,8 +73,9 @@ def play_clip(player, clip):
 def run(greeting='hello', *, wait=wait_for_owner, loaded=provider_loaded,
         engine_factory=tts.PiperTts, player_factory=audio.Player,
         monitor_factory=health_monitor, shutdown_factory=shutdown.connect,
-        clock=time.monotonic):
+        clock=time.monotonic, volume=20):
     greeting = validate_greeting(greeting)
+    volume = max(0, min(20, int(volume)))
     licensing.require_covering_receipt(models.PIPER_KRISTIN_MODEL)
     def stop(_signum, _frame):
         raise KeyboardInterrupt
@@ -69,7 +88,7 @@ def run(greeting='hello', *, wait=wait_for_owner, loaded=provider_loaded,
         # An empty greeting still loads the model, without making a sound.
         clip = engine.synth(greeting or 'hello')
         if greeting:
-            play_clip(player, clip)
+            play_clip(player, clip, volume)
         monitor = monitor_factory() if monitor_factory is not None else None
         # Prepare fixed warnings once; incident playback needs no synthesis.
         warning_clips = {phrase: engine.synth(phrase) for phrase in monitor.phrases} if monitor else {}
@@ -88,7 +107,7 @@ def run(greeting='hello', *, wait=wait_for_owner, loaded=provider_loaded,
                 try:
                     # A menu request followed by logind's signal is one goodbye.
                     if clock()-goodbye_at >= 10:
-                        play_clip(player, goodbye_clip)
+                        play_clip(player, goodbye_clip, volume)
                         goodbye_at = clock()
                     print('System voice goodbye complete', flush=True)
                 finally:
@@ -98,7 +117,7 @@ def run(greeting='hello', *, wait=wait_for_owner, loaded=provider_loaded,
             if monitor and (shutdown_watch is None or clock() >= next_health):
                 for phrase in monitor.poll():
                     if phrase in warning_clips:
-                        play_clip(player, warning_clips[phrase])
+                        play_clip(player, warning_clips[phrase], volume)
                 next_health = clock()+2
             if clock() >= next_keepalive or (monitor is None and shutdown_watch is None):
                 # Recovery stays silent. Alerts use cached PCM even if the

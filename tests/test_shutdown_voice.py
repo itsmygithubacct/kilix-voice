@@ -41,7 +41,7 @@ class ShutdownTests(unittest.TestCase):
 
     def run_voice(self, events, watch=None, player_error=None):
         engine = mock.Mock()
-        engine.synth.side_effect = lambda text: (text.encode(), 22050)
+        engine.synth.side_effect = lambda text: (b'\x10\x27', 22050)
         player = mock.Mock(error=player_error)
         with mock.patch.object(system_voice.licensing, 'require_covering_receipt'), contextlib.redirect_stdout(io.StringIO()):
             system_voice.run('', wait=mock.Mock(side_effect=events),
@@ -53,7 +53,7 @@ class ShutdownTests(unittest.TestCase):
         watch = mock.Mock()
         watch.poll.side_effect = [False, True]
         engine, player = self.run_voice(['goodbye', False, True], watch)
-        player.play.assert_called_once_with(b'Goodbye', 22050)
+        player.play.assert_called_once_with(b'\xd0\x07', 22050)
         self.assertEqual(engine.synth.call_args_list, [mock.call('hello'), mock.call('Goodbye')])
         watch.release.assert_called_once()
         watch.close.assert_called_once()
@@ -69,11 +69,11 @@ class ShutdownTests(unittest.TestCase):
             # The run default is bound at definition, so inject explicitly.
             with mock.patch.object(system_voice.licensing, 'require_covering_receipt'), contextlib.redirect_stdout(io.StringIO()):
                 system_voice.run('', wait=mock.Mock(side_effect=[False, True]),
-                    engine_factory=lambda **kw: mock.Mock(synth=lambda text: (text.encode(), 22050)),
+                    engine_factory=lambda **kw: mock.Mock(synth=lambda text: (b'\x10\x27', 22050)),
                     player_factory=lambda cfg: player, monitor_factory=None,
                     shutdown_factory=lambda: watch, clock=lambda: 0)
         self.assertEqual(order, ['finished', 'released'])
-        player.play.assert_called_once_with(b'Goodbye', 22050)
+        player.play.assert_called_once_with(b'\xd0\x07', 22050)
 
     def test_owner_eof_does_not_say_goodbye(self):
         _, player = self.run_voice([True])

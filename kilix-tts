@@ -1361,11 +1361,15 @@ def main(argv: list[str] | None = None) -> int:
                         help='show the Piper notice and install the startup voice')
     parser.add_argument('--system-voice', action='store_true',
                         help='desktop-owned warm Piper session; --speak sets its greeting')
+    parser.add_argument('--system-volume', type=int, choices=range(21), metavar='0..20',
+                        help='system-voice output percentage, capped at 20 (default: 20)')
     parser.add_argument('--reader-session', metavar='FILE',
                         help='desktop document reader: JSON status and private stdin playback controls')
     parser.add_argument('--enable-kristin', action='store_true',
                         help='opt in: show the Piper notice, install Kristin, and make it the shared read-aloud default')
     args = parser.parse_args(argv)
+    if args.system_volume is not None and not args.system_voice:
+        parser.error('--system-volume requires --system-voice')
 
     if args.reader_session is not None or args.enable_kristin:
         selected = 'reader_session' if args.reader_session is not None else 'enable_kristin'
@@ -1390,9 +1394,9 @@ def main(argv: list[str] | None = None) -> int:
             parser.exit(1, f'kilix-tts: {error}\n')
 
     if args.prepare_system_voice or args.system_voice:
-        allowed = {'prepare_system_voice', 'system_voice', 'speak'}
+        allowed = {'prepare_system_voice', 'system_voice', 'speak', 'system_volume'}
         if (args.prepare_system_voice and args.system_voice or
-                args.prepare_system_voice and args.speak is not None or
+                args.prepare_system_voice and (args.speak is not None or args.system_volume is not None) or
                 any(value != parser.get_default(key) for key, value in vars(args).items()
                     if key not in allowed)):
             parser.error('system voice is standalone; only --system-voice accepts --speak')
@@ -1404,7 +1408,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(_install_model(qwen_setup.PIPER_ID), flush=True)
                 return 0
             from voicelib import system_voice
-            return system_voice.run('hello' if args.speak is None else args.speak)
+            return system_voice.run('hello' if args.speak is None else args.speak,
+                                    volume=20 if args.system_volume is None else args.system_volume)
         except (qwen_setup.Declined, licensing.LicenseRefused) as error:
             parser.exit(licensing.LICENCE_REFUSED_EXIT, f'kilix-tts: {error}\n')
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:

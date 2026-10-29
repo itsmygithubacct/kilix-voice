@@ -39,7 +39,7 @@ class StartupVoiceTests(unittest.TestCase):
         phrases = ('WARNING: the system is overheating', 'battery low',
                    'battery critically low', 'offline', 'heavy swapping')
         engine = mock.Mock()
-        engine.synth.side_effect = lambda text: (text.encode(), 22050)
+        engine.synth.side_effect = lambda text: (b'\x10\x27', 22050)
         player = mock.Mock(error=None)
         monitor = mock.Mock(phrases=phrases)
         monitor.poll.side_effect = [[phrase] for phrase in phrases]
@@ -51,7 +51,7 @@ class StartupVoiceTests(unittest.TestCase):
         self.assertEqual(engine.synth.call_args_list,
                          [mock.call('hello')]+[mock.call(p) for p in phrases]+[mock.call('Goodbye')])
         self.assertEqual(player.play.call_args_list,
-                         [mock.call(p.encode(), 22050) for p in phrases])
+                         [mock.call(b'\xd0\x07', 22050) for p in phrases])
         monitor.close.assert_called_once()
         player.close.assert_called_once()
         engine.close.assert_called_once()
@@ -59,7 +59,7 @@ class StartupVoiceTests(unittest.TestCase):
 
     def test_playback_error_releases_monitor_and_player(self):
         engine = mock.Mock()
-        engine.synth.return_value = (b'pcm', 22050)
+        engine.synth.return_value = (b'\x10\x27', 22050)
         player = mock.Mock(error='output unavailable')
         monitor = mock.Mock(phrases=('offline',))
         monitor.poll.return_value = ['offline']
@@ -93,7 +93,7 @@ class StartupVoiceTests(unittest.TestCase):
         tool=load_tool()
         with mock.patch.object(system_voice,'run',return_value=0) as run:
             self.assertEqual(tool.main(['--system-voice','--speak','hello; $(false)']),0)
-        run.assert_called_once_with('hello; $(false)')
+        run.assert_called_once_with('hello; $(false)', volume=20)
 
     def test_prepare_uses_visible_notice_before_install(self):
         tool=load_tool()

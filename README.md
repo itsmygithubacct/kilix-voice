@@ -1,5 +1,13 @@
 # Kilix Voice
 
+System announcements use a separate output gain capped at 20% (the default).
+`kilix tts --system-voice --system-volume=10` selects a quieter session;
+`--system-volume=0` mutes it. The matching Kilix 95 System Voice dialog saves
+this choice privately. Greetings, cached health/power notices and goodbye
+all pass through PCM attenuation before the output backend, so the cap applies
+with every supported audio player. This does not change the master mixer or
+ordinary read-aloud, document-reader or media-player volume.
+
 Kilix Voice gives a terminal two things it normally lacks: it can **read what a
 pane is showing out loud**, and it can **type what you say into a pane**. It
 ships the engine behind Kilix's speaking-head and microphone tab-bar buttons,
