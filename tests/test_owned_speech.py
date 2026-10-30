@@ -105,21 +105,22 @@ class OwnedDaemonTests(unittest.TestCase):
     _send = daemon_tests.DaemonTestCase._send
     request = daemon_tests.DaemonTestCase.request
 
-    def _fixture(self, *, fail=False, delay=0.8):
+    def _fixture(self, *, fail=False, delay=0.8, capture=False):
         synthesiser = pathlib.Path(self.nowhere) / "espeak-ng"
         synthesiser.write_text(
             f"#!{sys.executable}\nimport io, sys, wave\n"
             "sys.stdin.buffer.read()\noutput = io.BytesIO()\n"
             "with wave.open(output, 'wb') as wav:\n"
             "    wav.setnchannels(1)\n    wav.setsampwidth(2)\n"
-            "    wav.setframerate(22050)\n    wav.writeframes(b'\\x01\\x00' * 1000)\n"
+            "    wav.setframerate(22050)\n    wav.writeframes(b'\\x10\\x27' * 1000)\n"
             "sys.stdout.buffer.write(output.getvalue())\n", encoding="utf-8")
         synthesiser.chmod(0o755)
         self.play_log = pathlib.Path(self.root) / "play-started"
         sink = pathlib.Path(self.nowhere) / "pacat"
         sink.write_text(
-            f"#!{sys.executable}\nimport sys, time\nsys.stdin.buffer.read()\n"
+            f"#!{sys.executable}\nimport sys, time, pathlib\ndata=sys.stdin.buffer.read()\n"
             f"with open({str(self.play_log)!r}, 'a') as log: log.write('played\\n')\n"
+            + (f"pathlib.Path({str(self.play_log.with_name('pcm'))!r}).write_bytes(data)\n" if capture else "")
             + ("raise SystemExit(23)\n" if fail else f"time.sleep({delay!r})\n"),
             encoding="utf-8")
         sink.chmod(0o755)
@@ -153,6 +154,25 @@ class OwnedDaemonTests(unittest.TestCase):
         done = self._wait(("completed",))
         self.assertFalse(done["playing"])
         self.assertEqual(done["detail"], "")
+
+    def test_owned_volume_reaches_output_without_affecting_legacy_speech(self):
+        import struct
+        self._fixture(delay=0, capture=True)
+        self.assertIn('owned-speech-volume/v1', self.request({'op': 'status'})['status']['capabilities'])
+        for index, level in enumerate((100, 50, 20, 0)):
+            token = f'{index:032x}'
+            reply = self.request(dict(op='owned-speak', owner='a'*32, utterance=token,
+                                      text='level check', model='espeak', volume=level))
+            self.assertTrue(reply['ok'], reply)
+            self._wait(('completed',), token)
+            pcm = self.play_log.with_name('pcm').read_bytes()
+            self.assertEqual(pcm, struct.pack('<h', level*100)*1000)
+        self.play_log.with_name('pcm').unlink()
+        self.assertTrue(self.request(dict(op='speak', text='ordinary speech', model='espeak'))['ok'])
+        deadline = time.monotonic()+3
+        while not self.play_log.with_name('pcm').exists() and time.monotonic()<deadline:
+            time.sleep(.01)
+        self.assertEqual(self.play_log.with_name('pcm').read_bytes(), struct.pack('<h', 10000)*1000)
 
     def test_admission_does_not_replace_any_current_turn(self):
         self._fixture()

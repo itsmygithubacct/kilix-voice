@@ -17,6 +17,7 @@ import time
 from collections import OrderedDict
 
 from . import jobs, protocol
+from .playback_volume import PlaybackVolume
 
 OWNED_RESULTS_KEPT = 128
 SPEECH_LEASE_S = 5.0
@@ -29,7 +30,7 @@ END_EXPIRED = "expired"
 
 def _signature(request):
     return hashlib.sha256(protocol.encode(
-        {key: request[key] for key in ("text", "model", "voice", "rate")
+        {key: request[key] for key in ("text", "model", "voice", "rate", "volume")
          if key in request})).hexdigest()
 
 
@@ -92,6 +93,8 @@ class OwnedTurns:
             return self._owned_status(request)
         if op == "owned-stop":
             return self._owned_stop(request)
+        if op == "owned-volume":
+            return self._owned_volume(request)
         if op == "owned-dictate":
             with self._lock:
                 if self._arbiter.speaking:
@@ -130,6 +133,8 @@ class OwnedTurns:
             # Runs under the lock with the turn not yet started, so the lease,
             # the owner and the retained result exist before any audio does.
             turn.owner = owner
+            if "volume" in request:
+                turn.playback_volume = PlaybackVolume(request["volume"])
             turn.owned_end = ""
             turn.lease_until = time.monotonic() + SPEECH_LEASE_S
             self._owned_keep(key, {"turn": turn, "token": self._owned_token(turn.id),
@@ -163,6 +168,18 @@ class OwnedTurns:
             if entry["turn"] is not None and entry["turn"] is self._speech:
                 entry["turn"].lease_until = time.monotonic() + SPEECH_LEASE_S
             return protocol.reply_ok(request["id"], **self._owned_payload(entry))
+
+    def _owned_volume(self, request):
+        with self._lock:
+            self._owned_state()
+            turn = self._speech
+            active = bool(turn is not None and getattr(turn, "owner", "") == request["owner"]
+                          and self._owned_token(turn.id) == request["turn"]
+                          and getattr(turn, "playback_volume", None) is not None)
+            if active:
+                turn.playback_volume.set(request["volume"])
+                turn.lease_until = time.monotonic() + SPEECH_LEASE_S
+            return protocol.reply_ok(request["id"], applied=active)
 
     def _owned_stop(self, request):
         with self._lock:

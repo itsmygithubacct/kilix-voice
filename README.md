@@ -535,6 +535,20 @@ result may have aged out or the daemon may have restarted. Owner tokens
 coordinate same-user clients; they are not protection against other code
 running under that UID.
 
+`owned-speech-volume/v1` adds an optional integer `volume` (0–100) to
+`owned-speak`. It attaches gain to that turn only. Send `owned-volume` with the
+same `owner`, current `turn`, and `volume` to adjust speech already playing;
+the reply's `applied` is false for a stale or mismatched turn. These updates
+renew the speech lease. They never change another turn or the system mixer.
+Repeating an utterance still uses its original admission options, even after
+its playback volume changes.
+
+Conversation gain is applied to small PCM blocks before every supported output
+backend, without resynthesis. Standard output queues are kept short; custom
+sinks may buffer longer. Unscoped speech keeps its existing gain. Avatar's
+0–100% preference is separate from the system-announcement path, which retains
+its configurable 0–20% cap, and from intro/outro music.
+
 ### Model sizing
 
 Both tools ask the shared `plebian-model-sizer` provider for read-only resource

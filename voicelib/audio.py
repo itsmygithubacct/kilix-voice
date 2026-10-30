@@ -470,7 +470,7 @@ class Player(Resource):
         return self._error
 
     @using
-    def play(self, pcm: bytes, rate: int) -> None:
+    def play(self, pcm: bytes, rate: int, *, volume=None) -> None:
         """Queue one s16le mono clip for playback and return immediately."""
         if self._closed:
             raise AudioError(
@@ -494,7 +494,7 @@ class Player(Resource):
             self._start_worker_locked()
             self._pending += 1
             self._idle.clear()
-            self._queue.put((self._generation, data, rate))
+            self._queue.put((self._generation, data, rate, volume))
 
     def stop(self) -> None:
         """Cancel playback now: drop the queue and kill the running sink."""
@@ -573,9 +573,9 @@ class Player(Resource):
             item = self._queue.get()
             if item is None:
                 return
-            generation, pcm, rate = item
+            generation, pcm, rate, volume = item
             try:
-                self._play_clip(generation, pcm, rate)
+                self._play_clip(generation, pcm, rate, volume)
             except AudioError as error:
                 if not self.lifecycle.requested:
                     self._error = str(error)
@@ -586,10 +586,17 @@ class Player(Resource):
                     self._clip_done_locked()
 
     @using
-    def _play_clip(self, generation: int, pcm: bytes, rate: int) -> None:
+    def _play_clip(self, generation: int, pcm: bytes, rate: int, volume=None) -> None:
         """Run one sink process to completion, or until stop() kills it."""
         try:
             cmd = build_play_cmd(self._cfg, rate)
+            # Bound the normal sink's queue for interactive conversation gain.
+            # Custom sink commands retain their own buffering contract.
+            if volume is not None and cfg_get(self._cfg, "audio.play_cmd") is None:
+                if cmd[0] == "pacat":
+                    cmd.append("--latency-msec=30")
+                elif cmd[0] == "aplay":
+                    cmd += ["--buffer-time=30000", "--period-time=10000"]
         except AudioError as error:
             # A machine with no sink installed must not take the worker down
             # with it: the failure is reported and the next clip still tries.
@@ -602,7 +609,7 @@ class Player(Resource):
                     return  # stopped while this clip waited in the queue
                 try:
                     process = self._publish("_process", lambda: GroupPopen(
-                        cmd, stdin=subprocess.PIPE,
+                        cmd, stdin=subprocess.PIPE, bufsize=0 if volume is not None else -1,
                         stdout=subprocess.DEVNULL, stderr=stderr))
                 except OSError as error:
                     self._error = (
@@ -615,7 +622,22 @@ class Player(Resource):
                 # The write blocks once the sink's buffer fills, which is the
                 # flow control: the clip is handed over at the speed it plays,
                 # so a kill from stop() lands mid-clip instead of after it.
-                process.stdin.write(pcm)
+                if volume is None:
+                    process.stdin.write(pcm)
+                else:
+                    # Small sample-aligned writes pick up slider changes during
+                    # a sentence. No resynthesis or copy of the whole clip.
+                    size = max(2, rate // 50 * 2)
+                    for offset in range(0, len(pcm), size):
+                        with self._lock:
+                            if generation != self._generation:
+                                break
+                        chunk = memoryview(volume.apply(pcm[offset:offset + size]))
+                        while chunk:
+                            written = process.stdin.write(chunk)
+                            if not written:
+                                raise OSError("Playback pipe closed")
+                            chunk = chunk[written:]
             except (OSError, ValueError):
                 pass  # killed by stop(), or the sink died mid-clip
             finally:

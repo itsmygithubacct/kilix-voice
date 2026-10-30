@@ -25,7 +25,7 @@ OP_STATUS = "status"
 OP_INGEST_AUDIO = "ingest-audio"
 
 OWNED_OPS = ("owned-speak", "owned-status", "owned-stop", "owned-dictate",
-             "owned-dictation-status", "owned-stop-dictation")
+             "owned-dictation-status", "owned-stop-dictation", "owned-volume")
 OPS = (OP_SPEAK, OP_STOP_SPEECH, OP_DICTATE, OP_STOP_DICTATION, OP_STATUS,
        OP_INGEST_AUDIO)
 
@@ -639,11 +639,16 @@ def validate_request(msg: dict, session_dir: str) -> dict:
             if not isinstance(value,str) or re.fullmatch(r"[a-f0-9]{32}",value) is None:
                 raise ProtocolError("Owned speech requires an utterance token")
             request["utterance"]=value
-        if op == "owned-stop":
+        if op in ("owned-stop", "owned-volume"):
             value=msg.get("turn")
             if not isinstance(value,str) or re.fullmatch(r"speak-[0-9a-f]{16}-[0-9]+",value) is None:
                 raise ProtocolError("Owned stop requires a speech turn")
             request["turn"]=value
+        if op == "owned-volume" or (op == "owned-speak" and "volume" in msg):
+            volume = msg.get("volume")
+            if type(volume) is not int or not 0 <= volume <= 100:
+                raise ProtocolError("Owned speech volume must be an integer from 0 to 100")
+            request["volume"] = volume
         if op == "owned-speak" and len(request["text"].encode("utf-8")) > 4096:
             raise ProtocolError("Owned speech is limited to 4096 bytes")
         if op == "owned-dictate":
