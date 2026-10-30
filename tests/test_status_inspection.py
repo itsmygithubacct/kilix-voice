@@ -42,8 +42,9 @@ class Inspection(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             binary = Path(tmp) / 'probe'
-            payload = {'model': voiced.models.PIPER_KRISTIN_MODEL,
-                       'voice': voiced.tts_lib.PIPER_VOICE, 'installed': True}
+            payload = {'model': voiced.models.PIPER_FEMALE02_MODEL,
+                       'voice': voiced.models.PIPER_FEMALE02_MODEL,
+                       'installed': True, 'checkpoint': 80}
             binary.write_text('#!' + sys.executable + '\nprint(' + repr(json.dumps(payload)) + ')\n')
             binary.chmod(0o700)
             try:

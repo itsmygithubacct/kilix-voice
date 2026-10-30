@@ -708,12 +708,12 @@ class EngineSelection(unittest.TestCase):
                 self.assertIsInstance(engine, tts.EspeakTts)
                 self.assertEqual(engine.mbrola, mbrola)
 
-    def test_piper_setting_selects_fixed_kristin_provider(self) -> None:
+    def test_piper_setting_selects_female02_checkpoint_80(self) -> None:
         self.write("piper")
         engine = tts.make_tts()
         self.assertIsInstance(engine, tts.PiperTts)
-        self.assertEqual(engine.model, models.PIPER_KRISTIN_MODEL)
-        self.assertEqual(engine.voice, "en_US-kristin-medium")
+        self.assertEqual(engine.model, models.PIPER_FEMALE02_MODEL)
+        self.assertEqual(engine.voice, models.PIPER_FEMALE02_MODEL)
 
     def test_piper_rejects_a_voice_not_owned_by_its_model(self) -> None:
         with self.assertRaises(tts.TtsError) as caught:

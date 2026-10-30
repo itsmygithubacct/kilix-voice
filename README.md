@@ -316,9 +316,10 @@ an executable, model path, URL, or download action. An explicit MBROLA request
 fails if its voice is unavailable; the longstanding saved MBROLA preference
 keeps its eSpeak fallback. Use `--speak -` for strict UTF-8 standard input.
 Piper supports `en_US-kristin-medium` and `kilix-female-02` through CPU-only
-inference. With engine `piper`, the configured `KILIX_VOICE_TTS_VOICE` chooses
-the default voice for Avatar and other callers that omit a voice/model override.
-An explicit model remains exact, even when the system default changes.
+inference. The 0.2.2 default is `kilix-female-02` checkpoint 80. With engine
+`piper`, an unset voice or a saved generic eSpeak name selects that voice for
+Avatar and other callers that omit a voice/model override. An explicit model
+remains exact, including Kristin.
 Female-02 requires the named-voice provider and its checksum-pinned local export;
 use `kilix-piper-tts install kilix-female-02 --model-file FILE --config-file FILE`.
 Unavailable named voices fail clearly without speaking through another model.

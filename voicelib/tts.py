@@ -34,6 +34,21 @@ if TYPE_CHECKING:
 ESPEAK_SAMPLE_RATE = 22050
 PIPER_SAMPLE_RATE = 22050
 PIPER_VOICE = "en_US-kristin-medium"
+# A saved eSpeak voice name means "no Piper voice was chosen." 0.2.2 speaks
+# kilix-female-02 checkpoint 80 in that case. An explicit Kristin model stays
+# Kristin.
+_GENERIC_PIPER_VOICES = frozenset({"en", "en-us", "en_us", "default"})
+
+
+def configured_piper_voice(voice: str | None) -> str | None:
+    """Return the Piper voice a saved setting selects.
+
+    Generic eSpeak leftovers select kilix-female-02. Any other saved name is
+    returned unchanged so an explicit voice stays exact.
+    """
+    if voice is not None and voice.lower() in _GENERIC_PIPER_VOICES:
+        return models.PIPER_FEMALE02_MODEL
+    return voice
 PIPER_STATUS_TIMEOUT_S = 5.0
 PIPER_SYNTH_TIMEOUT_S = 210.0
 PIPER_ENV_COMMAND = "KILIX_PIPER_TTS"
@@ -1077,11 +1092,7 @@ def make_tts(cfg: dict | None = None, *, model: str | None = None,
         return NullTts()
     if engine == models.TTS_ENGINE_PIPER:
         if model is None and voice is None:
-            voice = settings.tts_voice()
-            # Older installations kept the generic eSpeak default while
-            # selecting Piper. Preserve their Kristin behavior.
-            if voice.lower() in {"en", "en-us", "en_us", "default"}:
-                voice = None
+            voice = configured_piper_voice(settings.tts_voice())
         return PiperTts(voice=voice, rate=rate, model=model)
     if engine == models.TTS_ENGINE_QWEN:
         from .qwen_provider import QwenProviderTts

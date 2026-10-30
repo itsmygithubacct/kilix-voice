@@ -127,8 +127,8 @@ class Section(NamedTuple):
 def _read_aloud_summary(values: dict) -> str:
     button = "button on" if values[settings.KEY_SPEAK] else "button off"
     voice = values[settings.KEY_TTS_VOICE]
-    if values[settings.KEY_TTS_ENGINE] == models.TTS_ENGINE_PIPER and voice.lower() in {"en", "en-us", "en_us", "default"}:
-        voice = tts_lib.PIPER_VOICE
+    if values[settings.KEY_TTS_ENGINE] == models.TTS_ENGINE_PIPER:
+        voice = tts_lib.configured_piper_voice(voice) or voice
     return (f"Read-aloud: {button} · {values[settings.KEY_TTS_ENGINE]} · "
             f"{voice} · "
             f"{values[settings.KEY_TTS_RATE]} wpm")
@@ -1165,7 +1165,9 @@ def _print_models() -> None:
     voice_count = len(discover_voices()) if synthesizer else 0
     selected = settings.tts_engine()
     selected_voice = settings.tts_voice()
-    selected_piper = (models.PIPER_FEMALE02_MODEL if selected_voice == "kilix-female-02"
+    resolved_piper = tts_lib.configured_piper_voice(selected_voice) or selected_voice
+    selected_piper = (models.PIPER_FEMALE02_MODEL
+                      if resolved_piper == models.PIPER_FEMALE02_MODEL
                       else models.PIPER_KRISTIN_MODEL)
     for spec in models.TTS_MODELS:
         if spec.engine == models.TTS_ENGINE_ESPEAK:
