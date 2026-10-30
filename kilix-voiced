@@ -3144,6 +3144,11 @@ class Daemon(OwnedTurns):
             if budget is not None and budget <= 0:
                 raise tts_lib.TtsDeadlineExceeded(
                     "the request deadline elapsed before the speech provider could be checked")
+            try:
+                selected = tts_lib.make_tts(self._cfg)
+            except tts_lib.TtsError as error:
+                return {"engine": engine, "voice": settings.tts_voice(),
+                        "available": False, "detail": str(error)}
             with self._cleanup_lock:
                 # Reserve before constructing/registering a probe. A parallel
                 # status must answer without launching another one, including
@@ -3152,8 +3157,8 @@ class Daemon(OwnedTurns):
                 if not blocked:
                     self._tts_inspecting = True
             if blocked:
-                return {"engine": engine, "model": models.PIPER_KRISTIN_MODEL,
-                        "voice": tts_lib.PIPER_VOICE, "available": False,
+                return {"engine": engine, "model": selected.model,
+                        "voice": selected.voice, "available": False,
                         "detail": ("speech provider inspection is blocked by another "
                                    "inspection or unproven voice cleanup; status still "
                                    "reports every retained resource. Retry after cleanup completes.")}
@@ -3161,7 +3166,9 @@ class Daemon(OwnedTurns):
                 owner = processes.SynthesisOwner()
                 key, state = self._register_cleanup(self._next_turn_id("probe"), "synthesiser", owner)
                 try:
-                    available, detail = tts_lib.piper_probe(budget=budget, owner=owner)
+                    selection = ({"model": selected.model}
+                                 if selected.model != models.PIPER_KRISTIN_MODEL else {})
+                    available, detail = tts_lib.piper_probe(budget=budget, owner=owner, **selection)
                 finally:
                     self._prepare_cleanup(key, owner, state)
                     # Status completes only its own inspection; it never retries
@@ -3178,9 +3185,9 @@ class Daemon(OwnedTurns):
                     self._tts_inspecting = False
             return {
                 "engine": engine,
-                "model": models.PIPER_KRISTIN_MODEL,
+                "model": selected.model,
                 "available": available,
-                "voice": tts_lib.PIPER_VOICE,
+                "voice": selected.voice,
                 "detail": detail,
             }
         voice = settings.tts_voice()

@@ -14,6 +14,21 @@ from voicelib import processes
 
 
 class Inspection(unittest.TestCase):
+    def test_status_probes_and_reports_the_configured_female02(self):
+        daemon = daemon_fixture(self)
+        with mock.patch.object(voiced.settings, 'tts_engine', return_value='piper'), \
+                mock.patch.object(voiced.settings, 'tts_voice', return_value='kilix-female-02'), \
+                mock.patch.object(voiced.tts_lib, 'piper_probe', return_value=(True, 'ready')) as probe:
+            status = daemon._tts_status()
+            self.assertEqual((status['model'], status['voice']), ('kilix-female-02', 'kilix-female-02'))
+            self.assertTrue(status['available'])
+            self.assertEqual(probe.call_args.kwargs['model'], 'kilix-female-02')
+            daemon._tts_inspecting = True
+            blocked = daemon._tts_status()
+            self.assertFalse(blocked['available'])
+            self.assertEqual(blocked['voice'], 'kilix-female-02')
+            self.assertEqual(probe.call_count, 1)
+
     def test_failed_probe_blocks_repeated_status_and_recovers_after_cleanup(self):
         daemon = daemon_fixture(self)
         owners = []
