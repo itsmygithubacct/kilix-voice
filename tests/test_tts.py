@@ -721,6 +721,27 @@ class EngineSelection(unittest.TestCase):
                 model=models.PIPER_KRISTIN_MODEL, voice="en-gb", rate=170)
         self.assertIn("fixed voice", str(caught.exception))
 
+    def test_default_piper_honors_female02_and_explicit_models_stay_exact(self) -> None:
+        self.write("piper")
+        with open(self.path, "a", encoding="utf-8") as stream:
+            stream.write(f"{settings.KEY_TTS_VOICE}=kilix-female-02\n")
+        engine = tts.make_tts()
+        self.assertEqual((engine.model, engine.voice), ("kilix-female-02", "kilix-female-02"))
+        explicit = tts.make_tts(model=models.PIPER_KRISTIN_MODEL)
+        self.assertEqual(explicit.voice, tts.PIPER_VOICE)
+        with self.assertRaises(tts.TtsUnsupported):
+            tts.make_tts(model=models.PIPER_KRISTIN_MODEL, voice="kilix-female-02")
+
+    def test_female02_availability_requests_the_selected_provider_model(self) -> None:
+        completed = tts.subprocess.CompletedProcess(["provider"], 0,
+            '{"installed":true,"loaded":false,"model":"kilix-female-02",'
+            '"voice":"kilix-female-02","checkpoint":80}', "")
+        with mock.patch.object(tts, "piper_binary", return_value="/fixed/piper"), \
+                mock.patch.object(tts.processes, "run_owned", return_value=completed) as run:
+            tts.make_tts(model="kilix-female-02").check_available()
+        self.assertEqual(run.call_args.args[0],
+            ["/fixed/piper", "status", "--json", "--model", "kilix-female-02"])
+
     def test_piper_runs_only_the_fixed_provider_argv(self) -> None:
         class Process:
             stdin = stdout = stderr = None

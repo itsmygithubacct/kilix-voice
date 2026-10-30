@@ -126,9 +126,9 @@ class Section(NamedTuple):
 
 def _read_aloud_summary(values: dict) -> str:
     button = "button on" if values[settings.KEY_SPEAK] else "button off"
-    voice = (tts_lib.PIPER_VOICE
-             if values[settings.KEY_TTS_ENGINE] == models.TTS_ENGINE_PIPER
-             else values[settings.KEY_TTS_VOICE])
+    voice = values[settings.KEY_TTS_VOICE]
+    if values[settings.KEY_TTS_ENGINE] == models.TTS_ENGINE_PIPER and voice.lower() in {"en", "en-us", "en_us", "default"}:
+        voice = tts_lib.PIPER_VOICE
     return (f"Read-aloud: {button} · {values[settings.KEY_TTS_ENGINE]} · "
             f"{voice} · "
             f"{values[settings.KEY_TTS_RATE]} wpm")
@@ -310,7 +310,11 @@ def _local_engine() -> tuple[bool, str]:
                        f"here, or {settings.KEY_TTS_ENGINE}=espeak in "
                        f"{paths.settings_file()}, to enable it.")
     if engine == models.TTS_ENGINE_PIPER:
-        return tts_lib.piper_status()
+        try:
+            selected = tts_lib.make_tts()
+            return tts_lib.piper_status(model=selected.model)
+        except tts_lib.TtsError as error:
+            return False, _one_line(error)
     voice = settings.tts_voice()
     try:
         command = tts_lib.build_synth_cmd(None, voice=voice,
@@ -1160,6 +1164,9 @@ def _print_models() -> None:
     mbrola = util.which("mbrola")
     voice_count = len(discover_voices()) if synthesizer else 0
     selected = settings.tts_engine()
+    selected_voice = settings.tts_voice()
+    selected_piper = (models.PIPER_FEMALE02_MODEL if selected_voice == "kilix-female-02"
+                      else models.PIPER_KRISTIN_MODEL)
     for spec in models.TTS_MODELS:
         if spec.engine == models.TTS_ENGINE_ESPEAK:
             available = synthesizer is not None
@@ -1171,7 +1178,7 @@ def _print_models() -> None:
                       "be installed" if available else
                       "install espeak-ng, mbrola, and an MBROLA voice package")
         elif spec.engine == models.TTS_ENGINE_PIPER:
-            available, detail = tts_lib.piper_status()
+            available, detail = tts_lib.piper_status(model=spec.catalog_id)
         else:
             from voicelib.qwen_provider import QwenProviderTts
             try:
@@ -1180,10 +1187,12 @@ def _print_models() -> None:
                 available, detail = False, str(error)
             else:
                 available, detail = True, "receipt-backed local provider ready"
+        chosen = selected == spec.engine and (
+            spec.engine != models.TTS_ENGINE_PIPER or spec.catalog_id == selected_piper)
         print(
             f"model={spec.catalog_id} engine={spec.engine} "
             f"available={'yes' if available else 'no'} "
-            f"selected={'yes' if selected == spec.engine else 'no'}")
+            f"selected={'yes' if chosen else 'no'}")
         print(f"  {spec.summary}; {detail}")
     print("\nLazy foreground models (install once, then reuse verified local weights):")
     print("  piper-en-us-kristin-medium: kilix tts --interactive --tier neural")

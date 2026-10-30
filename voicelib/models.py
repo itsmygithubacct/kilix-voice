@@ -29,6 +29,7 @@ TTS_ENGINE_MBROLA = "mbrola"
 TTS_ENGINE_PIPER = "piper"
 TTS_ENGINE_QWEN = "qwen"
 PIPER_KRISTIN_MODEL = "piper-en-us-kristin-medium"
+PIPER_FEMALE02_MODEL = "kilix-female-02"
 QWEN_CUSTOMVOICE_MODEL = "qwen3-tts-0.6b-customvoice"
 
 
@@ -150,6 +151,12 @@ TTS_MODELS = (
         "explicit local Qwen named-voice synthesis through a receipt-backed "
         "provider; candidate, not release qualified",
     ),
+    TtsModelSpec(
+        PIPER_FEMALE02_MODEL,
+        TTS_ENGINE_PIPER,
+        True,
+        "Kilix Female-02 through the shared Piper provider; checksum-pinned local voice",
+    ),
 )
 
 TTS_MODEL_BY_ID = {spec.catalog_id: spec for spec in TTS_MODELS}
@@ -202,6 +209,7 @@ __all__ = [
     "TTS_MODEL_BY_ID",
     "TTS_MODEL_IDS",
     "PIPER_KRISTIN_MODEL",
+    "PIPER_FEMALE02_MODEL",
     "QWEN_CUSTOMVOICE_MODEL",
     "TtsModelSpec",
     "engine_for_model",

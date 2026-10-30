@@ -863,7 +863,8 @@ def piper_binary() -> str | None:
     return util.which(managed) or util.which("kilix-piper-tts")
 
 
-def piper_probe(*, budget: float | None = None, owner=None) -> tuple[bool, str]:
+def piper_probe(*, budget: float | None = None, owner=None,
+                model: str = models.PIPER_KRISTIN_MODEL) -> tuple[bool, str]:
     """Inspect the provider and pinned model without starting it or networking.
 
     Returns (available, detail) for every provider state, and raises
@@ -882,16 +883,19 @@ def piper_probe(*, budget: float | None = None, owner=None) -> tuple[bool, str]:
             "the request deadline elapsed before the speech provider could "
             "be checked")
     binary = piper_binary()
+    expected_voice = (models.PIPER_FEMALE02_MODEL
+                      if model == models.PIPER_FEMALE02_MODEL else PIPER_VOICE)
     if binary is None:
         return False, (
             "kilix-piper-tts is not installed. Install the public "
             "kilix-piper-tts module, then run `kilix-tts --install "
-            f"{models.PIPER_KRISTIN_MODEL}`."
+            f"{model}`."
         )
     status_timeout = _bounded(PIPER_STATUS_TIMEOUT_S, budget)
     try:
         result = processes.run_owned(
-            [binary, "status", "--json"], owner=owner,
+            [binary, "status", "--json"] +
+            (["--model", model] if model != models.PIPER_KRISTIN_MODEL else []), owner=owner,
             capture_output=True,
             check=False,
             timeout=status_timeout,
@@ -917,35 +921,36 @@ def piper_probe(*, budget: float | None = None, owner=None) -> tuple[bool, str]:
         return False, f"{binary} status returned invalid JSON: {error}"
     if not isinstance(payload, dict):
         return False, f"{binary} status returned no JSON object"
-    if (payload.get("model") != models.PIPER_KRISTIN_MODEL
-            or payload.get("voice") != PIPER_VOICE):
+    if (payload.get("model") != model
+            or payload.get("voice") != expected_voice):
         return False, (
             f"{binary} is an incompatible Piper provider: expected "
-            f"{models.PIPER_KRISTIN_MODEL}/{PIPER_VOICE}. Reinstall the "
+            f"{model}/{expected_voice}. Reinstall the "
             "matching kilix-piper-tts release."
         )
     installed = payload.get("installed") is True
     detail = str(payload.get("detail") or "provider gave no model detail")
     if installed:
         state = "warm provider" if payload.get("loaded") else "provider starts on demand"
-        return True, f"{PIPER_VOICE} · {binary} · {state}"
+        return True, f"{expected_voice} · {binary} · {state}"
     return False, detail
 
 
-def piper_status(*, budget: float | None = None) -> tuple[bool, str]:
+def piper_status(*, budget: float | None = None,
+                 model: str = models.PIPER_KRISTIN_MODEL) -> tuple[bool, str]:
     """Inspect the provider; always RETURN (available, detail), never raise.
 
     The contract kilix-tts and the status page rely on. A caller that must
     tell a deadline from a provider failure calls piper_probe instead.
     """
     try:
-        return piper_probe(budget=budget)
+        return piper_probe(budget=budget, model=model)
     except TtsDeadlineExceeded as error:
         return False, str(error)
 
 
 class PiperTts(processes.SynthesisOwner):
-    """Pinned Kristin synthesis through the isolated persistent provider."""
+    """Pinned named-voice synthesis through the shared persistent provider."""
 
     resource_kinds = ("piper",)
     name = models.TTS_ENGINE_PIPER
@@ -955,12 +960,20 @@ class PiperTts(processes.SynthesisOwner):
     last_provenance: SynthesisProvenance | None = None
 
     def __init__(self, *, voice: str | None = None,
-                 rate: int | None = None) -> None:
-        if voice is not None and str(voice).strip().lower() not in {
-                "kristin", PIPER_VOICE.lower(), self.model.lower()}:
+                 rate: int | None = None, model: str | None = None) -> None:
+        self.model = model or (models.PIPER_FEMALE02_MODEL
+            if voice == models.PIPER_FEMALE02_MODEL else models.PIPER_KRISTIN_MODEL)
+        if self.model not in (models.PIPER_KRISTIN_MODEL, models.PIPER_FEMALE02_MODEL):
+            raise TtsUnsupported(f"unknown Piper model {self.model!r}")
+        self.voice = (models.PIPER_FEMALE02_MODEL
+                      if self.model == models.PIPER_FEMALE02_MODEL else PIPER_VOICE)
+        aliases = {self.voice.lower(), self.model.lower()}
+        if self.model == models.PIPER_KRISTIN_MODEL:
+            aliases.add("kristin")
+        if voice is not None and str(voice).strip().lower() not in aliases:
             raise TtsUnsupported(
-                f"model {self.model!r} has the fixed voice {PIPER_VOICE!r}; "
-                "omit --voice or use --voice en_US-kristin-medium."
+                f"model {self.model!r} has the fixed voice {self.voice!r}; "
+                f"omit --voice or use --voice {self.voice}."
             )
         self.rate = int(settings.tts_rate() if rate is None else rate)
         if self.rate not in (120, 150, 170, 200, 240):
@@ -988,7 +1001,7 @@ class PiperTts(processes.SynthesisOwner):
         TtsDeadlineExceeded propagates from the probe unchanged, so a caller
         can tell a budget that cut the check from a provider that failed it.
         """
-        available, detail = piper_probe(budget=budget, owner=self)
+        available, detail = piper_probe(budget=budget, owner=self, model=self.model)
         if not available:
             raise TtsError(detail)
 
@@ -1063,7 +1076,13 @@ def make_tts(cfg: dict | None = None, *, model: str | None = None,
     if engine == "off":
         return NullTts()
     if engine == models.TTS_ENGINE_PIPER:
-        return PiperTts(voice=voice, rate=rate)
+        if model is None and voice is None:
+            voice = settings.tts_voice()
+            # Older installations kept the generic eSpeak default while
+            # selecting Piper. Preserve their Kristin behavior.
+            if voice.lower() in {"en", "en-us", "en_us", "default"}:
+                voice = None
+        return PiperTts(voice=voice, rate=rate, model=model)
     if engine == models.TTS_ENGINE_QWEN:
         from .qwen_provider import QwenProviderTts
         return QwenProviderTts(voice=voice, rate=rate)
