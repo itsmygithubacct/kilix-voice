@@ -68,7 +68,7 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue(any(link.endswith('/accelerator.lock') for _, link in tree['fds']))
         self.assertFalse(any(link.startswith('socket:') for _, link in tree['fds']))
         self.assertEqual(tree['limits']['CORE'], [0, 0])
-        self.assertEqual(tree['limits']['FSIZE'], [1024 * 1024, 1024 * 1024])
+        self.assertEqual(tree['limits']['FSIZE'], [64 * 1024 * 1024, 64 * 1024 * 1024])
         self.assertLessEqual(tree['limits']['NOFILE'][1], 128)
         self.assertEqual(tree['loader_overrides'], [])
         self.assertTrue(owner.stop())

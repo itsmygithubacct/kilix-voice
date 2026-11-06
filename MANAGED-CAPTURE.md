@@ -21,5 +21,10 @@ in-package copies refuse. Default Voice accelerator behavior is preserved.
 
 Private host generations accept explicit Voice/lease source commits and bind
 both complete populations. Current carrier/provider pins are unchanged until
-the owner chooses a reviewed integration tuple. Synthetic capture/source tests
-do not qualify physical microphones, installed guests or model fit.
+the owner chooses a reviewed integration tuple.
+
+The recorder's regular-file cap is 64 MiB. PulseAudio 17's client memfd is
+that size; a 1 MiB cap kills parec with SIGXFSZ before capture starts.
+Descriptor count stays 128 and core dumps stay disabled. Synthetic
+capture/source tests do not qualify physical microphones, installed guests
+or model fit.

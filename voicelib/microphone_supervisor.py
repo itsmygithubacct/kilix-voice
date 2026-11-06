@@ -69,7 +69,10 @@ def main():
     if parent == 1 or os.getppid() != parent:
         return 125
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    for kind, limit in ((resource.RLIMIT_FSIZE, 1024 * 1024), (resource.RLIMIT_NOFILE, 128)):
+    # PulseAudio 17 maps a 64 MiB client memfd before parec writes a sample.
+    # A 1 MiB RLIMIT_FSIZE kills that process with SIGXFSZ before the device
+    # opens. The cap is per file and stays finite.
+    for kind, limit in ((resource.RLIMIT_FSIZE, 64 * 1024 * 1024), (resource.RLIMIT_NOFILE, 128)):
         _soft, hard = resource.getrlimit(kind)
         bound = limit if hard == resource.RLIM_INFINITY else min(limit, hard)
         resource.setrlimit(kind, (bound, bound))
