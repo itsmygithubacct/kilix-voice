@@ -125,10 +125,13 @@ CONTENT_ASSET_ID = {
 # above, never a replacement for it -- a probe reports, it does not obtain
 # consent -- and it is useful in the window before `kilix models install`
 # reaches the first-use flow. Each command answers for its own catalog, so the
-# line must name the command that actually accepts this id: the Piper voice is
-# kilix-tts's only downloadable model, every other gated id is kilix-stt's.
+# line must name the command that actually accepts this id: Piper voices are
+# kilix-tts's, and every other gated id is kilix-stt's.
 CHECK_FLAG = "--check-licence"
-CHECK_TOOL_BY_MODEL = {models.PIPER_KRISTIN_MODEL: "kilix-tts"}
+CHECK_TOOL_BY_MODEL = {
+    models.PIPER_KRISTIN_MODEL: "kilix-tts",
+    models.PIPER_FEMALE02_MODEL: "kilix-tts",
+}
 DEFAULT_CHECK_TOOL = "kilix-stt"
 
 

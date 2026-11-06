@@ -3,7 +3,7 @@ import contextlib
 import io
 import unittest
 from unittest import mock
-from voicelib import system_voice, licensing
+from voicelib import licensing, models, system_voice
 from tests.test_tts_tool import load_tool
 
 
@@ -13,10 +13,17 @@ class StartupVoiceTests(unittest.TestCase):
         engine.synth.return_value = (b'\0\0', 22050)
         player = mock.Mock(error=None)
         wait = mock.Mock(side_effect=[False, True])
-        with mock.patch.object(licensing, 'require_covering_receipt') as receipt, contextlib.redirect_stdout(io.StringIO()):
+        seen = {}
+        def factory(**kw):
+            seen.update(kw)
+            return engine
+        output = io.StringIO()
+        with mock.patch.object(licensing, 'require_covering_receipt') as receipt, contextlib.redirect_stdout(output):
             system_voice.run(greeting, wait=wait, loaded=lambda: loaded,
-                engine_factory=lambda **kw: engine, player_factory=lambda cfg: player, monitor_factory=None, shutdown_factory=None)
-        receipt.assert_called_once()
+                engine_factory=factory, player_factory=lambda cfg: player, monitor_factory=None, shutdown_factory=None)
+        receipt.assert_called_once_with(models.PIPER_FEMALE02_MODEL)
+        self.assertEqual(seen, {'rate': 170, 'voice': models.PIPER_FEMALE02_MODEL})
+        self.assertIn('System voice ready: kilix-female-02', output.getvalue())
         player.close.assert_called_once()
         return engine, player
 

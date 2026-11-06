@@ -76,14 +76,14 @@ def run(greeting='hello', *, wait=wait_for_owner, loaded=provider_loaded,
         clock=time.monotonic, volume=20):
     greeting = validate_greeting(greeting)
     volume = max(0, min(20, int(volume)))
-    licensing.require_covering_receipt(models.PIPER_KRISTIN_MODEL)
+    licensing.require_covering_receipt(models.PIPER_FEMALE02_MODEL)
     def stop(_signum, _frame):
         raise KeyboardInterrupt
 
     previous = signal.signal(signal.SIGTERM, stop)
     engine = player = monitor = shutdown_watch = None
     try:
-        engine = engine_factory(rate=170)
+        engine = engine_factory(rate=170, voice=models.PIPER_FEMALE02_MODEL)
         player = player_factory({})
         # An empty greeting still loads the model, without making a sound.
         clip = engine.synth(greeting or 'hello')
@@ -94,7 +94,7 @@ def run(greeting='hello', *, wait=wait_for_owner, loaded=provider_loaded,
         warning_clips = {phrase: engine.synth(phrase) for phrase in monitor.phrases} if monitor else {}
         goodbye_clip = engine.synth('Goodbye')
         shutdown_watch = shutdown_factory() if shutdown_factory else None
-        print('System voice ready: Piper Kristin', flush=True)
+        print('System voice ready: kilix-female-02', flush=True)
         next_keepalive = clock()+60
         next_health = clock()
         goodbye_at = -float('inf')

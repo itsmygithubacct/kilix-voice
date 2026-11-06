@@ -1314,7 +1314,8 @@ def main(argv: list[str] | None = None) -> int:
                         "combine with --interactive to install and use one model; "
                         "all downloads the three catalogued models only")
     parser.add_argument(
-        "--check-licence", choices=(models.PIPER_KRISTIN_MODEL,),
+        "--check-licence",
+        choices=(models.PIPER_KRISTIN_MODEL, models.PIPER_FEMALE02_MODEL),
         dest="check_licence", metavar="MODEL",
         help="exit 0 if a licence receipt covers this voice's weights, 3 if "
              "none does; fetches nothing either way, so a fetcher outside "
