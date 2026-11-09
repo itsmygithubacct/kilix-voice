@@ -5,9 +5,10 @@ Kilix's speaking-head and microphone tab-bar buttons, plus two standalone
 TUIs and the daemon that owns the audio device.
 
 **Status:** ships in Plebian-OS 0.2.3. The release pins it as
-`KILIX_VOICE_REF` in `releases/0.2.3.env`, and first boot installs it through
-Kilix's `scripts/install-kilix-voice.sh` (also run by `kilix voice install`).
-Version 0.1.6.
+`KILIX_VOICE_REF` in `releases/0.2.3.env`, and first boot installs its
+read-aloud closure through Kilix's `scripts/install-kilix-voice.sh`
+(`kilix voice install --without-dictation`). Dictation models are installed
+later, on first use, after their licence is accepted. Version 0.1.6.
 
 ## What it does
 
@@ -36,7 +37,7 @@ kilix speak "Hello from Kilix"     # with no text it reads the active pane
 kilix dictate                      # record one utterance, print what it heard
 kilix tts                          # read-aloud settings TUI
 kilix stt                          # dictation settings, level meter, models
-kilix voice status                 # installed runtime and its directories
+kilix voice status                 # speak/dictate state, engines, daemon, directories
 kilix voice doctor                 # diagnostics, including retained cleanup
 ```
 
