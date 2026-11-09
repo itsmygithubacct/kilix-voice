@@ -7,8 +7,10 @@ TUIs and the daemon that owns the audio device.
 **Status:** ships in Plebian-OS 0.2.3. The release pins it as
 `KILIX_VOICE_REF` in `releases/0.2.3.env`, and first boot installs its
 read-aloud closure through Kilix's `scripts/install-kilix-voice.sh`
-(`kilix voice install --without-dictation`). Dictation models are installed
-later, on first use, after their licence is accepted. Version 0.1.6.
+(`kilix voice install --without-dictation`). First boot also installs the
+release's offline default model bundle, which includes the Vosk small English
+and Whistle model files; dictation itself is set up with
+`kilix stt --setup-default`, which Kilix 95 offers on first run. Version 0.1.6.
 
 ## What it does
 
