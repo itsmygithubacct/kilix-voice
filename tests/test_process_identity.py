@@ -249,7 +249,8 @@ class IdentityTests(unittest.TestCase):
                 capture._stderr.close()
 
     def test_readme_explains_escaped_descendants(self):
-        readme = (Path(__file__).resolve().parents[1] / 'README.md').read_text()
+        # The recovery section moved from README.md to docs/cleanup-recovery.md.
+        readme = (Path(__file__).resolve().parents[1] / 'docs' / 'cleanup-recovery.md').read_text()
         section = readme.split('## Recovering incomplete voice cleanup', 1)[1].split('### Accelerator quarantine', 1)[0]
         for term in ('setsid()', 'setpgid()', 'abort', 'shutdown'):
             self.assertIn(term, section)

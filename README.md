@@ -1,12 +1,15 @@
 # Kilix Voice
 
-System announcements use a separate output gain capped at 20% (the default).
-`kilix tts --system-voice --system-volume=10` selects a quieter session;
-`--system-volume=0` mutes it. The matching Kilix 95 System Voice dialog saves
-this choice privately. Greetings, cached health/power notices and goodbye
-all pass through PCM attenuation before the output backend, so the cap applies
-with every supported audio player. This does not change the master mixer or
-ordinary read-aloud, document-reader or media-player volume.
+Read-aloud and click-to-talk dictation for the terminal: the engine behind
+Kilix's speaking-head and microphone tab-bar buttons, plus two standalone
+TUIs and the daemon that owns the audio device.
+
+**Status:** ships in Plebian-OS 0.2.3. The release pins it as
+`KILIX_VOICE_REF` in `releases/0.2.3.env`, and first boot installs it through
+Kilix's `scripts/install-kilix-voice.sh` (also run by `kilix voice install`).
+Version 0.1.6.
+
+## What it does
 
 Kilix Voice gives a terminal two things it normally lacks: it can **read what a
 pane is showing out loud**, and it can **type what you say into a pane**. It
@@ -24,7 +27,54 @@ Everything runs locally. No audio, text, or transcript ever leaves the machine.
 - `kilix-voiced` — the arbiter: one owner of the audio device, half-duplex, so
   opening the microphone stops speech instead of transcribing it
 
-## Design in one paragraph
+## Quick start
+
+On Plebian-OS the commands are already installed and Kilix wraps them:
+
+```sh
+kilix speak "Hello from Kilix"     # with no text it reads the active pane
+kilix dictate                      # record one utterance, print what it heard
+kilix tts                          # read-aloud settings TUI
+kilix stt                          # dictation settings, level meter, models
+kilix voice status                 # installed runtime and its directories
+kilix voice doctor                 # diagnostics, including retained cleanup
+```
+
+From a source checkout (Python 3.11 or newer, `espeak-ng` for speech):
+
+```sh
+git clone https://github.com/itsmygithubacct/kilix-voice.git
+cd kilix-voice
+make test          # offline: no microphone, no model, no audio, no network
+./kilix-voiced &   # the source tree does not start the daemon for you
+./kilix-tts --speak "Hello from Kilix"
+./kilix-stt --models
+```
+
+`make install PREFIX="$HOME/.local"` installs a self-contained runtime and
+`make uninstall PREFIX="$HOME/.local"` removes exactly what it installed.
+
+## Usage
+
+| Command | What it does |
+|---|---|
+| `kilix-tts --speak TEXT` (`-` reads stdin) | Speak through the daemon; returns once the turn is accepted |
+| `kilix-tts --speak - --output FILE.wav` | Render to a new WAV or MP3 file without the daemon |
+| `kilix-tts --models`, `--tiers`, `--recommend` | List models, hardware-aware tiers, sizer advice |
+| `kilix-tts --interactive --tier neural` | Foreground prompt/play session |
+| `kilix-tts --print`, `--set KEY=VALUE` | Read or change read-aloud settings |
+| `kilix-stt --models [--json]` | Dictation catalog and installed/default state |
+| `kilix-stt --install MODEL --default MODEL` | Install a dictation model (licence-gated) and select it |
+| `kilix-stt --setup-default` | First-run setup that Kilix 95 offers |
+| `kilix-stt --check-licence MODEL` | Exit 0 if a receipt covers the model, 3 if not |
+| `kilix-voiced [--verbose]` | Run the arbiter daemon |
+
+The full command reference, every model family and the dictation engines
+(Vosk, VibeVoice, Whisper, Whistle) are in [docs/usage.md](docs/usage.md).
+
+## How it works
+
+### Design in one paragraph
 
 `voicelib/` is **Python standard library only** — there is no third-party
 import anywhere, including speech recognition. Recognition binds `libvosk.so`
@@ -33,549 +83,66 @@ directly through `ctypes` (seven functions). Speech synthesis uses system
 `kilix-piper-tts` provider. That GPL provider owns its isolated Python runtime
 and keeps the pinned Kristin neural model warm; Kilix Voice never imports it.
 
-## Safety model
-
-These are not preferences; they are enforced by the code and covered by tests.
-
-- **The microphone is click-to-talk.** Capture opens on an explicit action and
-  closes on stop, timeout, or silence. Nothing is buffered before you ask, so
-  there is no rolling recording.
-- **Dictation never presses Enter.** The submit policy is `never` or `confirm`;
-  there is deliberately no `always`. Recognised text is inserted without a
-  trailing newline for you to read before you run it.
-- **Dictation refuses a hidden prompt.** If the target pane has echo disabled —
-  a password prompt — the request is refused rather than typed.
-- **Text is sanitised before injection.** Control characters and escape
-  sequence introducers are stripped; the destination is a PTY.
-- Sockets are private to your user (mode 0600 inside a 0700 directory) and the
-  daemon checks peer credentials on every connection.
-- **Model weights are fetched only after their licence is accepted.** Every
-  install action in this tree asks the `kilix-license` authority for a receipt
-  covering that model first. With no covering receipt it refuses, starts no
-  installer, writes nothing anywhere, exits **3**, and names the command that
-  shows the licence. A machine with no authority installed refuses too — as
-  does one whose authority is broken enough to raise — because a machine that
-  cannot check a licence must not fetch weights. **A receipt is never
-  shipped**: see "A receipt is never shipped" below.
-
-## Model licences
-
-`kilix-license` is the single licence authority. This tree copies none of its
-records and mints no receipts of its own: it asks, and refuses when the answer
-is no or when there is nobody to ask.
-
-Acceptance happens in kilix-content's first-use flow, which renders the screen,
-captures the agreement and writes the receipt before it fetches. kilix-content
-files the Vosk weights under their **upstream** ids, so the refusal names those
-rather than this catalog's:
-
-```sh
-kilix stt --install small-en-us                    # exit 3 without a receipt
-kilix models install vosk-model-small-en-us-0.15   # shows the licence, records it
-kilix stt --install small-en-us                    # now installs
+```
+ tab-bar buttons, kilix speak/dictate, kilix-tts, kilix-stt
+                         |  private Unix socket (0600, peer-checked)
+                         v
+                   kilix-voiced  -- one owner of the audio device, half-duplex
+            ___________|______________________________
+           |                     |                    |
+   espeak-ng / MBROLA     provider processes     libvosk.so (ctypes)
+                          (Piper, Whisper, ...)
 ```
 
-| this catalog | kilix-content asset |
-|---|---|
-| `small-en-us` | `vosk-model-small-en-us-0.15` |
-| `lgraph-en-us` | `vosk-model-en-us-0.22-lgraph` |
-| `piper-en-us-kristin-medium` | `piper-en-us-kristin-medium` |
-| `qwen3-tts-0.6b-customvoice` | `qwen3-tts-0.6b-customvoice` |
-| `vibevoice-asr-bitnet` | `vibevoice-asr-bitnet` |
-| `whisper-small-en` | `faster-whisper-small-en` |
+The daemon accepts one turn at a time: opening the microphone stops speech,
+and a new speech turn replaces the old one. Dictation is click-to-talk, never
+presses Enter, refuses a pane whose echo is off, and strips control characters
+before injecting text into the PTY. Every action that would fetch model
+weights first asks the `kilix-license` authority for a receipt and refuses
+with exit 3 when there is none. Settings live in the shared
+`~/.local/gpu_terminal/settings.conf`, so the tab-bar buttons, these TUIs and
+Kilix 95's Settings app read the same values.
 
-The two sides are bound by the licence record, not by either id: each asset
-names exactly the record digest this authority resolves for the catalog id
-beside it.
+The module contracts are in [DESIGN.md](DESIGN.md); the safety rules and the
+licence gate are explained in
+[docs/safety-and-licences.md](docs/safety-and-licences.md).
 
-Receipts are read from the root the licence authority names,
-`kilix_license.receipt_store_root()` — `$GPU_TERMINAL_HOME/license-receipts`,
-or `$KILIX_LICENSE_RECEIPTS` when that is set — which is where the first-use
-flow files them. `$KILIX_VOICE_LICENSE_RECEIPTS` is still read as a legacy
-alias, but it moves only this reader, never the writer, and it is ignored
-whenever `$KILIX_LICENSE_RECEIPTS` is set. This tree only ever **reads**
-that store: it is never created, and its mode is never changed, on the refusing
-path or on the covered one.
+## Documentation
 
-A fetcher that does not go through this tree cannot import `voicelib`, so it
-gets a command instead — one per catalog, so every gated model has a probe that
-runs:
+- [DESIGN.md](DESIGN.md) — design principles and module contracts
+- [MANAGED-CAPTURE.md](MANAGED-CAPTURE.md) — explicit managed microphone capture
+- [docs/usage.md](docs/usage.md) — requirements, run from source, CLI reference, dictation engines, first-run setup
+- [docs/safety-and-licences.md](docs/safety-and-licences.md) — safety model, model licences, why a receipt is never shipped
+- [docs/settings-and-sizing.md](docs/settings-and-sizing.md) — the shared settings file, data paths, model sizer reports
+- [docs/desktop-integration.md](docs/desktop-integration.md) — system voice, Document Reader bridge, owner-scoped speech and dictation
+- [docs/cleanup-recovery.md](docs/cleanup-recovery.md) — retained cleanup, process-group handling, accelerator quarantine
+- [docs/interactive-tts.md](docs/interactive-tts.md) — foreground TTS auditions and first-use downloads
+- [docs/pocket-cpu-audition.md](docs/pocket-cpu-audition.md) — development-only Pocket TTS CPU audition
+- [docs/release-notes.md](docs/release-notes.md) — release history
 
-```sh
-kilix-stt --check-licence small-en-us               # dictation models
-kilix-tts --check-licence piper-en-us-kristin-medium # the Piper voice
-# exit 0 covered, 3 refused; fetches nothing either way
-```
+## Related repositories
 
-The refusal names both: the acceptance route first, because that is the cure,
-and the probe second, because it re-checks without fetching.
+- [kilix](https://github.com/itsmygithubacct/kilix#readme) — installs this repository at a pinned commit and provides `kilix speak`, `kilix dictate`, `kilix tts`, `kilix stt` and `kilix voice`
+- [plebian-os](https://github.com/itsmygithubacct/plebian-os#readme) — pins the release ref and verifies the install at first boot
+- [kilix-license](https://github.com/itsmygithubacct/kilix-license#readme) — the licence authority asked before any weight fetch
+- [kilix-content](https://github.com/itsmygithubacct/kilix-content#readme) — first-use licence screen and model installs (`kilix models install`)
+- [kilix-system-monitor](https://github.com/itsmygithubacct/kilix-system-monitor#readme) — the device-lease component and the model sizer
+- [kilix-piper-tts](https://github.com/itsmygithubacct/kilix-piper-tts#readme), [kilix-whisper-stt](https://github.com/itsmygithubacct/kilix-whisper-stt#readme), [kilix-qwen-tts](https://github.com/itsmygithubacct/kilix-qwen-tts#readme) — optional speech providers
+- [kilix-bonsai](https://github.com/itsmygithubacct/kilix-bonsai#readme) — installs the shared VibeVoice weights
+- [kilix-tui-utils](https://github.com/itsmygithubacct/kilix-tui-utils#readme) — Voice Studio, a front end over these commands
+- [kilix-95](https://github.com/itsmygithubacct/kilix-95#readme) — System Voice dialog, Document Reader and first-run dictation setup
 
-### A receipt is never shipped
+## Part of Plebian-OS
 
-**The only thing that may produce a receipt is an acceptance the user performed
-on that user's own machine.** A receipt must never be vendored into a
-repository, baked into an image, provisioned onto a machine, or written by a
-build.
-
-This has to be said out loud because the gate cannot tell the difference. A
-`kilix.license.receipt/v1` binds the licence record, the licence text digest,
-the licensor, the binding conditions and the decision class — it carries **no
-subject, no timestamp and no signature**. Any well-formed receipt in the store
-therefore covers forever, for every user, on every machine. An image that
-shipped one would pass this gate on every unit sold while nobody had ever seen
-a licence, and the audit surface would read "gated": the hole OS-V-VERIFY F2
-reported, restored in a form that looks compliant. OD-S is explicit that the
-user "gives an explicit acceptance before download".
-
-So shipping a receipt is **not** an acceptable remedy for an image that cannot
-install weights unattended. The acceptable outcomes are exactly two: the user
-accepts at first use, or the weights are not installed. If a build ever needs a
-build-time attestation of its own, OQ-C4 already rules that it must be a
-distinct schema and never a `kilix.license.receipt/v1`.
-
-Making a receipt bind the person and the moment is the deeper fix, and it is
-**not this repository's to make**: kilix-license owns the receipt schema as the
-single licence authority (OD-AJ), and that work is tracked there. This gate
-verifies what the authority defines and cannot bind more than the authority
-binds.
-
-**The library is not weights.** `libvosk.so` is Apache-2.0 code. Loading it,
-probing for it, reporting on it and installing it need no receipt, and none of
-those paths touch the gate: `--print`, `--models`, `--models --json` and the
-whole read-aloud side keep working with no receipt and no authority. Only the
-three actions that cause weights to be fetched are gated — `kilix-stt
---install` for the Vosk models and for the shared VibeVoice weights, and
-`kilix-tts --install` for the Piper voice. `kilix-stt --install
-whisper-small-en` hands straight to `kilix models install`: that command is
-the acceptance route itself, so it is not asked for a receipt first.
-
-One coupling is outside this repository: at the pinned ref,
-`kilix/scripts/install-kilix-voice.sh` fetches the Vosk wheel and the model in
-one block, and its `--without-dictation` flag skips both. So refusing the
-weights on that leg also withholds the library. Keeping the library installable
-on its own needs a library-only leg in that installer; nothing here can do it.
-
-## Requirements
-
-- Python 3.11 or newer
-- `espeak-ng` for read-aloud (`mbrola` plus a voice such as `mbrola-us1` is an
-  optional quality tier)
-- `kilix-piper-tts` plus its explicitly installed
-  `piper-en-us-kristin-medium` model for the optional local neural tier
-- `ffmpeg` or `lame` only when exporting MP3; WAV export needs no encoder
-- PulseAudio or PipeWire tools — `parec`/`pacat`, or ALSA's `arecord`/`aplay`
-- `libvosk.so` and a model for dictation, built and fetched by Kilix's pinned
-  installer
-
-Read-aloud works without any recognition support, and dictation works without
-any synthesis support. A missing piece disables that one feature and says so;
-it never blocks startup.
-
-## Recovering incomplete voice cleanup
-
-The daemon registers each recorder, recognizer, synthesizer and player before
-it can launch work or enter teardown. It keeps the owner until that resource's
-close and any accelerator acknowledgement succeed. This includes a first
-cleanup still in flight, a failed cleanup being retried, and read-aloud's
-synthesis clients and sink worker. The process group is private; its leader
-is retained until the final group signal is sealed, before reaping. On Linux
-6.9 and later, a non-inherited pidfd targets the original process group even
-if another reaper releases its leader's PID. An outside reap is logged and
-keeps cleanup unproven; ESRCH alone does not prove cleanup.
-
-On older kernels with `pidfd_open` (including Linux 5.3+ WSL2 kernels),
-cleanup opens a pidfd for each group member, validates membership, rechecks
-its retained leader after the scan, and signals only those descriptors.
-Bounded rescans catch members created during cleanup; incomplete cleanup
-remains owned. Acquisition uses a gated launcher so identity is checked
-before even a short-lived command executes. A failed check leaves cleanup
-unproven.
-
-Only kernels without `pidfd_open` use checked numeric `killpg`. This legacy
-backend retains a check-to-signal window if a competing reaper releases the
-leader between the check and syscall. Use a pidfd-capable kernel and do not
-install a competing child reaper in the daemon. Explicit managed capture uses
-its supervisor's cooperative stop and authenticated cleanup protocol; it
-retains unproven ownership if the supervisor cannot supply proof.
-
-Descendants that leave the private group with `setsid()` or `setpgid()`
-survive a normal stop, an abort and shutdown. Configure custom commands to
-stay in their group. For existing escapees, identify and stop them through
-the provider's own controls, verify that they have exited and released the
-device, or reboot if their ownership cannot be established. A logged old PID
-or group number is not authorization to signal a later process.
-
-Pending cleanup refuses new dictation and read-aloud. Settlement and admission
-retry with one shared 250 ms wait budget, and each owner has at most one
-cleanup worker in flight. Successful resources are removed independently;
-unproven owners are never evicted. Active playback still supports normal
-replacement and barge-in; its owner remains registered throughout.
-
-`kilix voice doctor` and the launcher's summary show `cleanup retained` with
-turn, resource kind and age. `status.retained_cleanup` includes a first running
-attempt with `state: in_flight`; an acknowledgement failure has
-`state: quarantined`, `reason: acknowledgement-failed` and fixed recovery
-instructions. `status.resource_owners` also lists active registered resources.
-Status does not retry existing owners or open an audio device. Capture and
-playback detail show only the executable, never its configured arguments.
-`listening: false` describes the turn, and is not proof that a retained
-recorder stopped.
-
-Retry a request for another bounded cleanup attempt. If it persists, stop the
-daemon normally and inspect stderr. Shutdown starts registered cleanups in
-workers, spends one shared 5-second turn-join budget, then independently sends
-the final SIGKILL to every still-owned process group, including first attempts.
-It spends one shared additional 1-second cleanup wait and logs every unproven
-resource by turn, kind and group. It never waits on a resource's close or
-lifecycle lock on the shutdown thread. These are userspace wait bounds; a
-kernel-stuck system call cannot be forced to return by Python.
-
-A kernel-uninterruptible child may survive SIGKILL. Resolve its device/kernel
-problem and verify exit, or reboot if recovery is impossible. Logged group
-numbers are diagnostic; they do not authorize later signals after reuse.
-Restart alone does not prove that the previous recorder or provider exited.
-
-### Accelerator quarantine
-
-The resource retains its original grant until teardown and acknowledgement
-succeed. An acknowledgement-lock deadline keeps the descriptor and can retry.
-Any acknowledgement failure that closes the descriptor is permanent: a later
-no-op release cannot become proof. Status, doctor and shutdown keep reporting
-that quarantine and accelerator admission remains closed.
-
-To clear a permanent quarantine, first stop **all cooperating providers** and
-prove all their owned jobs and descendants have exited. If that cannot be
-established, reboot before recovery. With those providers kept stopped, an
-administrator must remove/reset the shared namespace **and its sibling
-anchor together**, then restart the cooperating providers against the same
-fresh namespace. The default directory is
-`/run/user/<effective-uid>/kilix-device-leases-v1`; its sibling anchor is
-`.kilix-device-leases-v1.lease-v1.anchor`. For a configured private namespace,
-the anchor is `.<directory-name>.lease-v1.anchor` in its parent directory.
-Do not delete just the registry record or reset state while any provider may
-still own work. Voice never performs this administrative reset. The external
-lease component is unchanged.
-
-## Run from source
-
-```bash
-git clone https://github.com/itsmygithubacct/kilix-voice.git
-cd kilix-voice
-make test        # offline: no microphone, no model, no audio, no network
-./kilix-tts      # read-aloud settings
-./kilix-stt      # dictation settings and level meter
-```
-
-Both TUIs also work as plain CLIs:
-
-Through the Kilix launcher, these foreground sessions lazily install their
-runtime and model, present the model's first-use terms, and reuse verified
-weights on subsequent launches:
-
-```bash
-kilix tts --interactive --tier neural
-kilix tts --interactive --download-pocket
-kilix tts --interactive --download-qwen qwen3-tts-0.6b-customvoice
-kilix tts --interactive --download-qwen qwen3-tts-0.6b-base --synthetic-reference
-kilix tts --interactive --download-qwen qwen3-tts-1.7b-voicedesign --description 'A warm clear voice'
-```
-
-The Base session uses a generated eSpeak reference. VoiceDesign accepts
-`/description TEXT` to change the voice. All sessions support `/save FILE.wav`.
-Direct Qwen sessions default to CPU; `--device cuda:0` explicitly chooses the
-optional GPU runtime. These foreground sessions do not change daemon defaults.
-The native Pocket Q8 research variant is excluded.
-
-```bash
-./kilix-tts --print
-./kilix-tts --set wpm=200
-./kilix-tts --models
-./kilix-tts --install piper-en-us-kristin-medium
-./kilix-tts --speak "Hello from Kilix"
-./kilix-tts --speak "Hello from Kristin" \
-  --model piper-en-us-kristin-medium
-printf '%s\n' "Text from an agent" | \
-  ./kilix-tts --speak - --model mbrola --voice us1 --rate 200
-./kilix-tts --speak - --model espeak --voice en-us \
-  --output kilix-test.wav < examples/tts-export-test.txt
-./kilix-tts --speak - --model espeak --save kilix-test.mp3 \
-  < examples/tts-export-test.txt
-./kilix-stt --models
-./kilix-stt --models --json
-./kilix-stt --install lgraph-en-us --default lgraph-en-us
-./kilix-stt --set stt_submit=confirm
-```
-
-`kilix-tts --speak` returns as soon as `kilix-voiced` accepts the turn; speech
-continues in the background and a new turn replaces it. `--model espeak`,
-`--model mbrola`, `--model piper-en-us-kristin-medium`, and
-`--model qwen3-tts-0.6b-customvoice` are the registered local model families. A request
-may also override the voice and one of the shared WPM presets without changing
-the saved read-aloud settings. Model IDs are catalogued: callers cannot supply
-an executable, model path, URL, or download action. An explicit MBROLA request
-fails if its voice is unavailable; the longstanding saved MBROLA preference
-keeps its eSpeak fallback. Use `--speak -` for strict UTF-8 standard input.
-Piper supports `en_US-kristin-medium` and `kilix-female-02` through CPU-only
-inference. The 0.2.2 default is `kilix-female-02` checkpoint 80. With engine
-`piper`, an unset voice or a saved generic eSpeak name selects that voice for
-Avatar and other callers that omit a voice/model override. An explicit model
-remains exact, including Kristin.
-Female-02 requires the named-voice provider and its checksum-pinned local export;
-use `kilix-piper-tts install kilix-female-02 --model-file FILE --config-file FILE`.
-Unavailable named voices fail clearly without speaking through another model.
-`--install piper-en-us-kristin-medium` is a separate explicit
-network action delegated to the checksum-pinned `kilix-piper-tts` catalog;
-listing models, opening the TUI, and speaking with other engines never
-download it.
-Qwen is an explicit candidate only: `--model qwen3-tts-0.6b-customvoice`
-requires the `kilix-qwen-tts` client executable from Kilix's managed
-`voice/qwen-client/current` generation, the daemon's `PATH`, or
-`KILIX_QWEN_TTS`, and a running local provider with that model
-installed through `kilix-content`
-and its licence receipt. It does not fetch weights or start a provider.
-Its default named voice is `Vivian`; `--voice` selects a provider voice ID,
-and `--rate` is unsupported. It is not a saved default or a release-qualified
-runtime yet.
-When running from a source checkout, start `./kilix-voiced` first; the main
-`kilix speak` wrapper starts an installed daemon on demand.
-
-`--output FILE` (also spelled `--save FILE`) renders the same conditioned text
-directly to a new `.wav` or `.mp3` file instead of playing it. Export does not
-need the daemon and never opens an audio device. The suffix selects the format;
-MP3 encoding stays local through `ffmpeg` or `lame`. Output is mode 0600 and an
-existing file is never overwritten implicitly. The self-describing paragraph
-in `examples/tts-export-test.txt` exercises arbitrary UTF-8 stdin, selection,
-synthesis, and both containers.
-
-Opening `kilix-stt` only lists local state; it never downloads a model. On the
-Models tab, `i` hands the terminal to Kilix's checksum-pinned lazy installer,
-Enter pairs the selected model with its matching recognizer, and `s` saves the
-default. The catalog is `small-en-us` and `lgraph-en-us` for the runnable Vosk
-engine, plus `vibevoice-asr-bitnet`, whose shared weights are installed through
-Kilix Bonsai. `kilix stt --install vibevoice-asr-bitnet` pulls those weights and
-then builds the pinned VibeASR.cpp runtime (`kilix voice vibeasr`, needs a C/C++
-toolchain and cmake). VibeVoice is multilingual and more accurate on natural
-speech than Vosk, but it transcribes the whole turn when it ends: there are no
-live partials, and a turn takes roughly its own length again to transcribe on
-four threads. Decoding is greedy, so the same audio gives the same text. The
-turn's audio is written to a private temporary WAV under the voice session
-directory and removed as soon as transcription finishes.
-
-`whisper-small-en` is Whisper small English through the pinned
-`kilix-whisper-stt` provider (faster-whisper, int8 on the CPU). On the
-reference dictation it made about a third of the Vosk small model's errors
-and answered in about a second per sentence. It is the model sizer's default
-on a machine with AVX2, 8 logical CPUs and 16 GiB of RAM.
-
-`whistle` selects Cactus Whistle through a pinned local Needle 3 native
-library on Linux x86-64 (glibc). `kilix stt --install whistle` shows the
-weight licence through Kilix Content and installs the native runtime;
-`kilix stt --default whistle` selects it explicitly. It is an optional
-engine; installing it does not replace the saved default or the model
-sizer's Whisper recommendation.
-
-Whistle dictation is English, without keyword bias. Turns up to 30 seconds
-use whole-clip decoding; longer turns use the native streaming decoder
-and can take substantially longer. The provider returns text at the end of
-the turn, keeps model bytes bound to capture consent, and performs no
-network requests. The native runtime chooses its own thread count.
-The normal dictation deadline still applies: long turns can time out on
-slower CPUs. Prefer Whisper for long dictation.
-
-```sh
-kilix stt --install whisper-small-en
-```
-
-The command above runs kilix-content's `kilix models install
-faster-whisper-small-en`, which shows the licence and takes the typed agreement
-before anything is fetched. It then installs the provider (`kilix voice
-whisper`). Weights that are already installed are not fetched again. Like
-VibeVoice, Whisper transcribes the turn when it ends. Its provider is started
-at the beginning of each turn, so the model loads while you speak.
-
-`kilix stt --setup-default [--result FILE]` is the first-run setup that Kilix 95
-offers. It:
-
-1. asks the model sizer which model suits this computer, falling back to
-   `small-en-us` when the sizer cannot answer;
-2. shows the plan and asks to go ahead;
-3. runs the licence screen and the install;
-4. asks permission for dictation to use the microphone, and records the
-   consent;
-5. makes the model the dictation default;
-6. names the dictation hotkey (Ctrl+Shift+D).
-
-With `--result FILE` it writes `{"status": "ready"|"declined"|"failed", "model":
-ID, "detail": TEXT}` atomically when it ends. It exits 0, 1 or 2 to match that
-status.
-
-`voicelib.models` is the canonical in-process catalog. Cross-process consumers
-use `kilix-stt --models --json`, whose `kilix.speech.models/v1` document
-reports immutable catalog metadata, local installed/default state, and the
-common install-and-default argv without opening the network. Installation
-remains a separate explicit action. This versioned CLI document is the 0.1.9
-compatibility boundary for the terminal chrome and desktop surfaces; consumers
-must reject an unknown schema rather than guessing at fields.
-
-`make install PREFIX=/path` creates a self-contained runtime: the three
-commands land in `bin/`, while their exact `voicelib` package and `VERSION`
-land in `lib/kilix-voice/`. Installed commands therefore do not depend on the
-source checkout or an ambient `PYTHONPATH`. `make uninstall PREFIX=/path`
-removes that exact runtime and refuses to remove files changed since install.
-
-## Release history
-
-For foreground prompt/play/replay sessions, offline resident Qwen auditions,
-and first-use Qwen downloads, see [Interactive TTS](docs/interactive-tts.md).
-`kilix-tts --tiers` lists hardware-aware choices. In an interactive terminal,
-`kilix-tts --interactive --tier neural` starts Piper Kristin and installs its
-weights on first selection after showing the licence and waiting for a keypress.
-On a fresh Kilix installation, `kilix tts --interactive --tier neural` also
-installs the pinned Piper runtime on demand. Neither listing nor selecting a
-different tier starts a Piper download.
-`kilix tts --interactive --tier qwen-cpu` lazily installs a locked CPU runtime
-on x86_64 Debian, then offers the catalogued 0.6B model after its first-use
-licence notice. On eligible hardware, `kilix tts --interactive --tier qwen-gpu`
-also lazily installs a locked CUDA/FlashAttention runtime; neither tier is an
-automatic install or fallback.
-`kilix tts --interactive --tier qwen-base-gpu` shares that GPU runtime but
-uses separately catalogued 0.6B Base weights and a fixed synthetic eSpeak
-reference; it never clones a person's voice.
-`python3 bench/tts_reply.py --output new-result.json` measures cold and warm
-Piper prompt-to-playable-audio reply time through the Kilix provider path.
-The new first-use tests also require a 0.2.2 `kilix-content` source tree; pass
-`CONTENT_SRC=/path/to/kilix-content/src` alongside `LICENSE_SRC` when testing
-separate release worktrees.
-
-- **0.1.6** — add the isolated persistent Piper provider contract, explicit
-  pinned Kristin installation, cancellable neural speech, and WAV/MP3 export
-  through the existing arbitrary-text CLI.
-- **0.1.5** — render arbitrary speech to private, no-overwrite WAV or MP3
-  files, with the daemon's conditioning and model-selection semantics.
-- **0.1.4** — add arbitrary-text/stdin speech, safe per-request TTS
-  model/voice/rate selection, model discovery, and acknowledgement-loss stop
-  compensation to `kilix-tts`.
-- **0.1.3** — centralize the speech-model catalog and publish its download-free
-  `kilix.speech.models/v1` JSON control-plane contract.
-- **0.1.2** — expose asynchronous synthesis/playback failures through daemon
-  status so detached read-aloud errors remain visible in Kilix.
-- **0.1.1** — make installed runtimes self-contained by packaging `voicelib`
-  and add an install-path execution regression test.
-- **0.1.0** — initial local read-aloud and click-to-talk dictation engine.
-
-## Settings
-
-Kilix Voice does not have its own configuration file. It reads and writes the
-shared GPU Terminal settings file — the same one Kilix, Kilix 95, and Pleb use
-— so the tab-bar buttons, these TUIs, `kilix settings`, and Kilix 95's Settings
-app can never disagree with each other:
-
-```
-~/.local/gpu_terminal/settings.conf
-```
-
-Models and the recognition library live under `~/.local/gpu_terminal/kilix/data/voice/`,
-and runtime sockets under `~/.local/gpu_terminal/kilix/session/voice/`. Both are
-private to your user.
+Kilix Voice is one of the repositories behind
+[Plebian-OS](https://github.com/itsmygithubacct/plebian-os#readme), a Debian
+install whose desktop is [Kilix](https://github.com/itsmygithubacct/kilix#readme)
+running the [Kilix 95](https://github.com/itsmygithubacct/kilix-95#readme)
+desktop through [Pleb](https://github.com/itsmygithubacct/pleb#readme).
+It is pinned in the release manifest and installed for the desktop user at
+first boot. The map of every repository and how it ships is on the
+[components page](https://github.com/itsmygithubacct/plebian-os/blob/main/docs/components.md).
 
 ## Licence
 
 GPL-3.0. See [LICENSE](LICENSE).
-
-Desktop startup voice uses `kilix tts --prepare-system-voice` in a terminal for
-explicit first-use setup, then `kilix tts --system-voice --speak hello` with a
-pipe held open by the desktop. The latter is offline: it requires installed
-weights and their covering receipt, speaks once, and keeps Piper warm until
-stdin closes or the desktop terminates it. `--speak ''` preloads silently.
-
-### Document reading and Kristin opt-in
-
-Kilix 95 provides **Start → Programs → Document Reader** for TXT, Markdown and
-PDF files, with passage progress, Play, Pause/Resume, Stop, Previous and Next.
-It owns playback independently of the voice daemon. Pause resumes at the start
-of the current passage. PDFs require `pdftotext` (`poppler-utils`); scanned pages
-need OCR. Input is bounded to 16 MiB per file and 8 MiB of extracted UTF-8 text.
-
-To explicitly install Kristin and choose it as the shared read-aloud default:
-
-```sh
-kilix tts --enable-kristin
-```
-
-This requires a terminal, presents the voice download notice, and saves the
-preference only after installation succeeds. It does not enable startup speech.
-The desktop's **Use Kristin for read-aloud…** button runs this same opt-in.
-
-`--reader-session FILE` is the desktop bridge: newline-delimited JSON status on
-stdout, with private single-byte stdin commands (`p` play/resume, `a` pause,
-`s` stop/reset, `n` next, `b` previous, `q` quit). EOF stops its owned playback.
-Opening a session only loads text; speech starts on `p`. The current shared
-voice is read for each passage. No model is downloaded by opening a document.
-
-### Avatar-owned turns
-
-The optional `owned-speech/v1` and `owned-dictation/v1` capabilities add
-owner-scoped speech status/stop and press-to-talk recording. Speech utterance
-IDs are idempotent, bounded to 128 retained results, and expire after five seconds
-without an owner heartbeat. Microphone turns expire after three seconds without
-a heartbeat. Releasing press-to-talk closes capture immediately and drains the
-buffer before producing the final transcript. Continuous input uses a per-turn
-silence interval, defaulting to three seconds. These operations retain the
-normal consent, resource, deadline, cancellation and job-outcome checks.
-
-Owned speech never replaces other audio: `owned-speak` is refused as `busy`
-while anything is speaking or listening, including a legacy `speak`. Preserve
-the returned `turn` (`speak-<daemon instance>-<n>`); `owned-stop` needs it and
-the same owner, so a stale stop — including one kept across a daemon restart —
-cannot silence a successor. Poll `owned-status` at least once per second: it
-renews the lease, while global `status` does not. It reports `preparing`,
-`speaking`, `completed`, `cancelled` (stopped by `owned-stop` or `stop-speech`),
-`superseded` (a legacy `speak` replaced it), `expired` (the lease or request
-deadline ran out), `failed` or `unknown`, with any reason in `detail`.
-`playing` describes the active playback process, not sample-accurate timing.
-
-Repeating an identical `owned-speak` while its result is retained returns that
-result without replaying audio; reusing an utterance token for different text
-or options is refused as `malformed`. After a lost acknowledgement, reconcile
-through `owned-status`. Never replay an `unknown` utterance automatically: the
-result may have aged out or the daemon may have restarted. Owner tokens
-coordinate same-user clients; they are not protection against other code
-running under that UID.
-
-`owned-speech-volume/v1` adds an optional integer `volume` (0–100) to
-`owned-speak`. It attaches gain to that turn only. Send `owned-volume` with the
-same `owner`, current `turn`, and `volume` to adjust speech already playing;
-the reply's `applied` is false for a stale or mismatched turn. These updates
-renew the speech lease. They never change another turn or the system mixer.
-Repeating an utterance still uses its original admission options, even after
-its playback volume changes.
-
-Conversation gain is applied to small PCM blocks before every supported output
-backend, without resynthesis. Standard output queues are kept short; custom
-sinks may buffer longer. Unscoped speech keeps its existing gain. Avatar's
-0–100% preference is separate from the system-announcement path, which retains
-its configurable 0–20% cap, and from intro/outro music.
-
-### Model sizing
-
-Both tools ask the shared `plebian-model-sizer` provider for read-only resource
-recommendations:
-
-```sh
-./kilix-tts --recommend
-./kilix-stt --recommend --json
-```
-
-Press **n** in the read-aloud settings, or on dictation's Models tab, for the
-same report; dictation then shows each model's resource verdict. Results are
-advisory: selecting, saving defaults and installing stay explicit actions, and
-`--recommend` refuses to combine with any of them. Exit 0 means a valid report,
-which may have an empty shortlist; provider failures exit 1 and incompatible
-options exit 2.
-
-Install `plebian-model-sizer` 0.2.0 or newer, or set `PLEBIAN_MODEL_SIZER` to its
-executable; a source checkout also finds the sibling `kilix-system-monitor`
-launcher. Voice exchanges bounded JSON with it (15-second timeout, 1 MiB reply
-limit) and fetches no model, opens no audio device and writes no settings.
-Candidates are ranked by memory cost, not speech quality, and nothing is
-selected or qualified by the report.
