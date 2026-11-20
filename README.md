@@ -423,6 +423,9 @@ land in `lib/kilix-voice/`. Installed commands therefore do not depend on the
 source checkout or an ambient `PYTHONPATH`. `make uninstall PREFIX=/path`
 removes that exact runtime and refuses to remove files changed since install.
 
+The Debian package installs that same runtime with prefix `/usr`. It does
+not include dictation models. `make install` is unchanged.
+
 ## Release history
 
 For foreground prompt/play/replay sessions, offline resident Qwen auditions,

@@ -1,0 +1,7 @@
+kilix-voice (0.1.6+packaging1) UNRELEASED; urgency=medium
+
+  * Install the three commands under /usr/bin and their library under
+    /usr/lib/kilix-voice. Dictation models stay a first-use download.
+    Developer installs are unchanged.
+
+ -- itsmygithubacct <itsmygithubacct@users.noreply.github.com>  Fri, 20 Nov 2026 06:19:57 +0000

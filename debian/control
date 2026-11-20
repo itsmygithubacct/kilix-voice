@@ -1,0 +1,21 @@
+Source: kilix-voice
+Section: sound
+Priority: optional
+Maintainer: itsmygithubacct <itsmygithubacct@users.noreply.github.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.2
+Homepage: https://github.com/itsmygithubacct/kilix-voice
+Vcs-Git: https://github.com/itsmygithubacct/kilix-voice.git
+Vcs-Browser: https://github.com/itsmygithubacct/kilix-voice
+Rules-Requires-Root: no
+
+Package: kilix-voice
+Architecture: all
+Depends: python3, espeak-ng, ${misc:Depends}
+Description: read-aloud and dictation commands
+ Kilix Voice speaks text and can take dictation. This package installs
+ kilix-tts, kilix-stt and kilix-voiced, plus the library they import.
+ Read-aloud uses espeak-ng. Dictation models are not included; they stay
+ a first-use download.
+ .
+ The commands are in /usr/bin and the library is in /usr/lib/kilix-voice.
